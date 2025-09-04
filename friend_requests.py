@@ -8,6 +8,7 @@ from db import get_individual_spam_filter, is_already_sent, add_sent_id, get_act
 from collections import defaultdict
 import time
 from dateutil import parser
+import urllib.parse
 
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -34,9 +35,22 @@ stop_markup = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Stop Requests", callback_data="stop")]
 ])
 
-async def fetch_users(session, token):
+async def fetch_users(session, token, user_id=None):
     """Fetch users from the API for friend requests"""
-    url = "https://api.meeff.com/user/explore/v2?lng=-112.0613784790039&unreachableUserIds=&lat=33.437198638916016&locale=en"
+    # Get unreachable user IDs to ensure fresh results
+    unreachable_ids = ""
+    if user_id:
+        # Get already sent IDs to mark them as unreachable
+        sent_ids = get_already_sent_ids(user_id, "request")
+        if sent_ids:
+            # Limit to last 100 IDs to avoid URL length issues
+            recent_ids = list(sent_ids)[-100:] if len(sent_ids) > 100 else list(sent_ids)
+            unreachable_ids = ",".join(recent_ids)
+    
+    # URL encode the unreachable IDs parameter
+    encoded_unreachable = urllib.parse.quote(unreachable_ids)
+    url = f"https://api.meeff.com/user/explore/v2?lng=-112.0613784790039&unreachableUserIds={encoded_unreachable}&lat=33.437198638916016&locale=en"
+    
     headers = {"meeff-access-token": token, "Connection": "keep-alive"}
     try:
         async with session.get(url, headers=headers) as response:
@@ -266,7 +280,7 @@ async def run_requests(user_id, bot, target_channel_id):
 
                 # Fetch users
                 try:
-                    users = await fetch_users(session, token)
+                    users = await fetch_users(session, token, user_id)
                     state["batch_index"] += 1
                     
                     if not users or len(users) == 0:
@@ -376,7 +390,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id):
             async with aiohttp.ClientSession() as session:
                 while state["running"]:
                     try:
-                        users = await fetch_users(session, token)
+                        users = await fetch_users(session, token, user_id)
                         
                         if users is None:
                             token_status[name] = (added_count, filtered_count, "Rate limited")
@@ -396,7 +410,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id):
                         
                         # Use the shared process_users function with token_status
                         limit_reached, batch_added, batch_filtered = await process_users(
-                            session, users, token, user_id, bot, target_channel_id, 
+                            session, users, token, user_id, bot, target_channel_id,
                             token_name=name, token_status=token_status
                         )
                         

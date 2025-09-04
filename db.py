@@ -696,6 +696,19 @@ def get_already_sent_ids(telegram_user_id, category):
         return set(records_doc["data"][category])
     return set()
 
+def clear_sent_ids(telegram_user_id, category):
+    """Clear all sent IDs for a specific category - useful for testing fresh fetches"""
+    if not _ensure_user_collection_exists(telegram_user_id):
+        return False
+    
+    user_db = _get_user_collection(telegram_user_id)
+    user_db.update_one(
+        {"type": "sent_records"},
+        {"$unset": {f"data.{category}": ""}},
+        upsert=True
+    )
+    return True
+
 # Record that we've sent a message/request to a target
 def add_sent_id(telegram_user_id, category, target_id):
     """Record a target_id as sent for a user and category."""
