@@ -8,7 +8,7 @@ from db import get_individual_spam_filter, is_already_sent, add_sent_id, get_act
 from collections import defaultdict
 import time
 from dateutil import parser
-import random
+
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -34,20 +34,9 @@ stop_markup = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Stop Requests", callback_data="stop")]
 ])
 
-US_LOCATIONS = [
-    {"lat": 40.7128, "lng": -74.0060},   # New York
-    {"lat": 34.0522, "lng": -118.2437},  # Los Angeles
-    {"lat": 41.8781, "lng": -87.6298},   # Chicago
-    {"lat": 29.7604, "lng": -95.3698},   # Houston
-    {"lat": 25.7617, "lng": -80.1918},   # Miami
-]
-
-
-
 async def fetch_users(session, token):
     """Fetch users from the API for friend requests"""
-    loc = random.choice(US_LOCATIONS)  # pick a random US city each batch
-    url = f"https://api.meeff.com/user/explore/v2?lng={loc['lng']}&lat={loc['lat']}&unreachableUserIds=&locale=en"
+    url = "https://api.meeff.com/user/explore/v2?lng=-112.0613784790039&unreachableUserIds=&lat=33.437198638916016&locale=en"
     headers = {"meeff-access-token": token, "Connection": "keep-alive"}
     try:
         async with session.get(url, headers=headers) as response:
