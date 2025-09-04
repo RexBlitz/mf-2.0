@@ -13,6 +13,8 @@ import urllib.parse
 # Initialize logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
+# Filter rotation to force fresh data
+filter_rotation_state = {}
 
 # ✅ Speed configuration 
 PER_USER_DELAY = 2     # Delay between each user added
@@ -35,21 +37,66 @@ stop_markup = InlineKeyboardMarkup(inline_keyboard=[
     [InlineKeyboardButton(text="Stop Requests", callback_data="stop")]
 ])
 
+async def force_filter_refresh(session, token, user_id):
+    """Force API to refresh by slightly modifying filters"""
+    from db import get_user_filters, set_user_filters
+    
+    # Get current filters or use defaults
+    current_filters = get_user_filters(user_id, token) or {
+        "filterGenderType": 7,  # All genders
+        "filterBirthYearFrom": 1979,
+        "filterBirthYearTo": 2006,
+        "filterDistance": 510,
+        "filterLanguageCodes": "",
+        "filterNationalityBlock": 0,
+        "filterNationalityCode": "",
+        "locale": "en"
+    }
+    
+    # Get or initialize rotation state for this user
+    if user_id not in filter_rotation_state:
+        filter_rotation_state[user_id] = {"distance_toggle": 0}
+    
+    # Rotate distance slightly to force refresh (510 <-> 509)
+    rotation = filter_rotation_state[user_id]
+    if rotation["distance_toggle"] == 0:
+        current_filters["filterDistance"] = 509
+        rotation["distance_toggle"] = 1
+    else:
+        current_filters["filterDistance"] = 510
+        rotation["distance_toggle"] = 0
+    
+    # Apply the filter update
+    url = "https://api.meeff.com/user/updateFilter/v1"
+    headers = {
+        'User-Agent': "okhttp/4.12.0",
+        'Accept-Encoding': "gzip",
+        'meeff-access-token': token,
+        'content-type': "application/json; charset=utf-8"
+    }
+    
+    try:
+        async with session.post(url, json=current_filters, headers=headers) as response:
+            if response.status == 200:
+                # Store updated filters
+                set_user_filters(user_id, token, current_filters)
+                logging.info(f"Filter refreshed for user {user_id}, distance: {current_filters['filterDistance']}")
+                return True
+            else:
+                logging.error(f"Failed to update filter: {response.status}")
+                return False
+    except Exception as e:
+        logging.error(f"Error updating filter: {e}")
+        return False
 async def fetch_users(session, token, user_id=None):
     """Fetch users from the API for friend requests"""
-    # Get unreachable user IDs to ensure fresh results
-    unreachable_ids = ""
+    # Force filter refresh to get fresh active users
     if user_id:
-        # Get already sent IDs to mark them as unreachable
-        sent_ids = get_already_sent_ids(user_id, "request")
-        if sent_ids:
-            # Limit to last 100 IDs to avoid URL length issues
-            recent_ids = list(sent_ids)[-100:] if len(sent_ids) > 100 else list(sent_ids)
-            unreachable_ids = ",".join(recent_ids)
+        await force_filter_refresh(session, token, user_id)
+        # Small delay to let the filter update take effect
+        await asyncio.sleep(0.5)
     
-    # URL encode the unreachable IDs parameter
-    encoded_unreachable = urllib.parse.quote(unreachable_ids)
-    url = f"https://api.meeff.com/user/explore/v2?lng=-112.0613784790039&unreachableUserIds={encoded_unreachable}&lat=33.437198638916016&locale=en"
+    url = "https://api.meeff.com/user/explore/v2?lng=-112.0613784790039&lat=33.437198638916016&locale=en"
     
     headers = {"meeff-access-token": token, "Connection": "keep-alive"}
     try:
