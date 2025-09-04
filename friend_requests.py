@@ -43,9 +43,8 @@ async def force_filter_refresh(session, token, user_id):
     
     # Get current filters or use defaults
     current_filters = get_user_filters(user_id, token) or {
-        "filterGenderType": 7,  # All genders
-        "filterBirthYearFrom": 1979,
-        "filterBirthYearTo": 2006,
+        "filterGenderType": 5,  #  
+        "filterBirthYearTo": 2006,                                                
         "filterDistance": 510,
         "filterLanguageCodes": "",
         "filterNationalityBlock": 0,
