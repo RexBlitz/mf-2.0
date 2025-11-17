@@ -271,6 +271,9 @@ async def delete_token(telegram_user_id, token):
     if (await get_current_account(telegram_user_id)) == token:
         await set_current_account(telegram_user_id, None)
     await user_db.update_one({"type": "info_cards"}, {"$unset": {f"data.{token}": ""}})
+    
+    # NEW: Re-organize batches after deletion to fix index corruption
+    await auto_reorganize_batches_after_deletion(telegram_user_id)
 
 async def cleanup_duplicate_emails(telegram_user_id):
     """Remove duplicate email entries, keeping only the latest token for each email"""
@@ -610,6 +613,53 @@ async def get_batch_by_name(telegram_user_id: int, batch_name: str):
         if batch["name"] == batch_name:
             return batch
     return None
+
+async def auto_reorganize_batches_after_deletion(user_id: int):
+    """
+    Clears all existing batches and re-creates them based on the new token indices
+    after a deletion event. It attempts to preserve batch filters/status.
+    This corrects index corruption and removes empty batches.
+    """
+    user_db = _get_user_collection(user_id)
+    tokens = await get_tokens(user_id)
+    
+    # 1. Get current batches to preserve filters/status
+    old_batches = await get_batches(user_id)
+    batch_metadata = {
+        batch["name"]: {
+            "filter": batch.get("filter_nationality", ""),
+            "active": batch.get("active", True)
+        } 
+        for batch in old_batches
+    }
+
+    # 2. Re-create all batches based on current indices
+    new_batches = {}
+    for index, token in enumerate(tokens):
+        # Calculate the batch number (0-9 is Batch 1, 10-19 is Batch 2, etc.)
+        batch_number = (index // 10) + 1
+        batch_name = f"Batch {batch_number}"
+        
+        if batch_name not in new_batches:
+            # Initialize new batch data, attempting to restore old metadata
+            metadata = batch_metadata.get(batch_name, {"active": True, "filter": ""})
+            
+            new_batches[batch_name] = {
+                "name": batch_name,
+                "token_indices": [],
+                "active": metadata["active"],
+                "filter_nationality": metadata["filter"]
+            }
+            
+        new_batches[batch_name]["token_indices"].append(index)
+
+    # 3. Replace the entire 'items' array with the new, corrected list of batches
+    new_items_list = list(new_batches.values())
+    await user_db.update_one(
+        {"type": "batches"},
+        {"$set": {"items": new_items_list}},
+        upsert=True
+    )
 
 # REMOVED auto_organize_batches as it's replaced by automated logic
 
