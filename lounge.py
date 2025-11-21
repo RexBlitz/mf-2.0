@@ -16,12 +16,11 @@ BASE_HEADERS = {
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
 async def fetch_lounge_users(session: aiohttp.ClientSession, token: str, user_id: int) -> List[Dict]:
     """Fetch users from lounge with a persistent session using simplified headers."""
-    # --- SIMPLIFIED HEADERS ---
     headers = BASE_HEADERS.copy()
     headers['meeff-access-token'] = token
-    # --------------------------
     
     try:
         async with session.get(LOUNGE_URL, params={'locale': "en"}, headers=headers, timeout=10) as response:
@@ -37,14 +36,8 @@ async def fetch_lounge_users(session: aiohttp.ClientSession, token: str, user_id
 async def open_chatroom_and_send(
     session: aiohttp.ClientSession, token: str, target_meeff_id: str, message: str, telegram_user_id: int
 ) -> bool:
-    """
-    Atomically opens a chatroom and sends one or more comma-separated messages
-    using simplified headers.
-    """
-    # --- SIMPLIFIED HEADERS ---
     headers = BASE_HEADERS.copy()
     headers['meeff-access-token'] = token
-    # --------------------------
     
     # 1. Open Chatroom
     chatroom_id = None
@@ -70,7 +63,6 @@ async def open_chatroom_and_send(
     messages_to_send = [msg.strip() for msg in message.split(',') if msg.strip()]
     
     if not messages_to_send:
-        logger.warning(f"Message for {target_meeff_id} was empty after splitting.")
         return False
 
     any_message_sent = False
@@ -79,10 +71,9 @@ async def open_chatroom_and_send(
             payload = {"chatRoomId": chatroom_id, "message": msg_part, "locale": "en"}
             async with session.post(SEND_MESSAGE_URL, json=payload, headers=headers, timeout=10) as response:
                 if response.status == 200:
-                    logger.info(f"Sent message part {i+1}/{len(messages_to_send)} to {target_meeff_id}")
                     any_message_sent = True 
                 else:
-                    logger.warning(f"Failed to send message part {i+1} to {target_meeff_id} (Status: {response.status})")
+                    logger.warning(f"Failed to send message part {i+1} to {target_meeff_id}")
             
             if i < len(messages_to_send) - 1:
                 await asyncio.sleep(0.5)
@@ -96,7 +87,6 @@ async def process_lounge_batch(
     session: aiohttp.ClientSession, token: str, users: List[Dict], message: str,
     sent_ids: Set[str], processing_ids: Set[str], lock: asyncio.Lock, user_id: int
 ) -> tuple[int, int, List[str]]:
-    """Processes a batch of users, passing the user_id ."""
     tasks = []
     users_to_process = []
     filtered_count = 0
@@ -128,12 +118,14 @@ async def process_lounge_batch(
             
     return len(successful_ids), filtered_count, successful_ids
 
-
+# -------------------------------------------------------------------------
+# FIX APPLIED IN THIS FUNCTION
+# -------------------------------------------------------------------------
 async def send_lounge(
     token: str, message: str, status_message: types.Message,
     bot, chat_id: int, spam_enabled: bool, user_id: int
 ) -> None:
-    """Sends a message to all users in the lounge for a single account, re-fetching until empty."""
+    """Sends a message to all users in the lounge for a single account."""
     total_sent = 0
     total_filtered = 0
     sent_ids = await is_already_sent(chat_id, "lounge", None, bulk=True) if spam_enabled else set()
@@ -156,17 +148,20 @@ async def send_lounge(
             
             users = await fetch_lounge_users(session, token, user_id)
             
+            # 1. Normal empty check
             if not users:
-                await update_status(
-                    f"✅ <b>Lounge Completed:</b> No more users found.\n"
-                    f"Total Sent: {total_sent} | Total Filtered: {total_filtered}"
-                )
+                await update_status(f"✅ <b>Lounge Completed:</b> No more users.\nSent: {total_sent} | Filtered: {total_filtered}")
                 break
 
             batch_sent, batch_filtered, successful_ids = await process_lounge_batch(
                 session, token, users, message, sent_ids, processing_ids, lock, user_id
             )
             
+            # 2. CRITICAL FIX: If users were found but ALL were filtered/failed, stop the loop.
+            if batch_sent == 0 and batch_filtered > 0:
+                await update_status(f"✅ <b>Lounge Completed:</b> All remaining users filtered.\nSent: {total_sent} | Filtered: {total_filtered + batch_filtered}")
+                break
+
             total_sent += batch_sent
             total_filtered += batch_filtered
             
@@ -174,14 +169,16 @@ async def send_lounge(
                 await bulk_add_sent_ids(chat_id, "lounge", successful_ids)
                 sent_ids.update(successful_ids)
             
+            # If we sent 0 and filtered 0 (rare empty batch case), just wait
             await asyncio.sleep(2)
 
-
+# -------------------------------------------------------------------------
+# MULTI-ACCOUNT VERSION (Ensuring Logic is Same)
+# -------------------------------------------------------------------------
 async def send_lounge_all_tokens(
     tokens_data: List[Dict], message: str, status_message: types.Message,
     bot, chat_id: int, spam_enabled: bool, user_id: int
 ) -> None:
-    """Processes lounge messaging concurrently for all tokens with proper deduplication and re-fetching."""
     token_status = {
         td["token"]: {
             "name": td.get("name", f"Acc {i+1}"),
@@ -198,20 +195,18 @@ async def send_lounge_all_tokens(
 
     async def _worker(token_data: Dict):
         token = token_data.get("token")
-        
         async with aiohttp.ClientSession() as session:
-            # Loop for this specific worker/token
             while True:
                 token_status[token]["status"] = "Fetching"
                 users = await fetch_lounge_users(session, token, user_id)
                 
-                # If no users are found from the API, this worker's job is done.
+                # Exit if API return empty
                 if not users:
                     if token_status[token]["sent"] == 0:
                         token_status[token]["status"] = "No users"
                     else:
                         token_status[token]["status"] = "Done"
-                    break # Exit the loop for this worker
+                    break 
 
                 token_status[token]["status"] = "Processing"
                 
@@ -227,20 +222,17 @@ async def send_lounge_all_tokens(
                     if spam_enabled and successful_ids:
                         await bulk_add_sent_ids(chat_id, "lounge", successful_ids)
                 
-                # FIX #1: This check stops the infinite loop once all users are processed.
-                if users and batch_sent == 0:
-                    if token_status[token]["sent"] == 0:
-                        token_status[token]["status"] = "No users"
-                    else:
-                        token_status[token]["status"] = "Done"
-                    break # Exit the while True loop for this account.
+                # CRITICAL FIX: Exit if we found users but couldn't send to ANY (all duplicates)
+                if batch_sent == 0 and batch_filtered > 0:
+                    token_status[token]["status"] = "Done (Filtered)"
+                    break
                 
                 await asyncio.sleep(2)
 
     async def _refresh_ui():
         last_message = ""
         while running:
-            lines = ["🧾 <b>AIO Lounge Status</b>", "<pre>Account   | Sent | Filtered | State</pre>"]
+            lines = ["🧾 <b>AIO Lounge Status</b>", "<pre>Account    | Sent | Filtered | State</pre>"]
             for status in token_status.values():
                 name = status['name']
                 display_name = name[:10].ljust(10) if len(name) <= 10 else name[:9] + '…'
@@ -254,11 +246,8 @@ async def send_lounge_all_tokens(
                         text=current_message, parse_mode="HTML"
                     )
                     last_message = current_message
-                except Exception as e:
-                    if "message is not modified" not in str(e):
-                        logger.error(f"UI refresh error: {e}")
-            
-            # FIX #2: Slower refresh rate to avoid Telegram flood errors.
+                except Exception:
+                    pass
             await asyncio.sleep(3)
 
     ui_task = asyncio.create_task(_refresh_ui())
@@ -266,13 +255,12 @@ async def send_lounge_all_tokens(
     await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     running = False
-    await asyncio.sleep(1.1) # Wait a moment for the UI task to stop
+    await asyncio.sleep(1.1)
     ui_task.cancel()
 
     total_sent = sum(s["sent"] for s in token_status.values())
     
-    # Final status update after everything is complete
-    final_lines = [f"✅ <b>AIO Lounge Completed</b> (Total Sent: {total_sent})", "<pre>Account   | Sent | Filtered | State</pre>"]
+    final_lines = [f"✅ <b>AIO Lounge Completed</b> (Total Sent: {total_sent})", "<pre>Account    | Sent | Filtered | State</pre>"]
     for status in token_status.values():
         name = status['name']
         display_name = name[:10].ljust(10) if len(name) <= 10 else name[:9] + '…'
