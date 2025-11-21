@@ -695,7 +695,7 @@ async def callback_handler(callback_query: CallbackQuery):
         await callback_query.message.edit_text(f"<b>{prompts[data]}:</b>", parse_mode="HTML")
     elif data == "db_view":
         collections = await list_all_collections()
-        text = "\n\n".join([f"<b>{i}.</b> <code>{html.escape(c['collection_name'])}</code>\n  Accounts: {c['summary'].get('tokens_count', 0)}" for i, c in enumerate(collections[:10], 1)]) or "No Collections Found."
+        text = "\n\n".join([f"<b>{i}.</b> <code>{html.escape(c['collection_name'])}</code>\n  Accounts: {c['summary'].get('tokens_count', 0)}" for i, c in enumerate(collections[:10], 1)]) or "No Collections Found."
         await callback_query.message.edit_text(text, reply_markup=get_db_settings_menu(), parse_mode="HTML")
     elif data in ("unsub_current", "unsub_all"):
         confirm_text, count = ("current account", 1) if data == "unsub_current" else (f"all {len(await get_active_tokens(user_id))} active accounts", -1)
@@ -782,10 +782,53 @@ async def callback_handler(callback_query: CallbackQuery):
     elif data == "noop_page":
         await callback_query.answer("You are on this page.")
     
+    # --- SPAM FILTER MANAGEMENT ---
+    elif data == "spam_filter_menu":
+        await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
+    
+    elif data.startswith("toggle_spam_"):
+        filter_type = data.split("_")[-1]
+        if filter_type == "all":
+            new_status = not any((await get_all_spam_filters(user_id)).values())
+            for ft in ["chatroom", "request", "lounge"]: 
+                await set_individual_spam_filter(user_id, ft, new_status)
+        else:
+            new_status = not await get_individual_spam_filter(user_id, filter_type)
+            await set_individual_spam_filter(user_id, filter_type, new_status)
+        # Refresh the spam filter menu to show updated status
+        await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
+    
+    # --- SPAM CLEAR LOGIC ---
+    elif data == "noop_count":
+        await callback_query.answer("This is the count of spam-filtered IDs.")
+        
+    elif data.startswith("confirm_clear_spam_"):
+        category = data.split("_")[-1]
+        await callback_query.message.edit_text(
+            f"<b>Confirm:</b> Are you sure you want to clear all <b>{category}</b> spam records?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Yes, Clear", callback_data=f"clear_spam_{category}"),
+                    InlineKeyboardButton(text="Cancel", callback_data="spam_filter_menu")
+                ]
+            ]),
+            parse_mode="HTML"
+        )
+        
+    elif data.startswith("clear_spam_"):
+        category = data.split("_")[-1]
+        await clear_spam_records(user_id, category)
+        await callback_query.answer(f"{category.capitalize()} spam records cleared.")
+        # Refresh the menu
+        await callback_query.message.edit_text(
+            "<b>Spam Filter Settings</b>",
+            reply_markup=await get_spam_filter_menu(user_id),
+            parse_mode="HTML"
+        )
+    
     # --- BATCH MANAGEMENT ---
     elif data == "batch_management":
         await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
-    # Removed auto_organize_batches logic
     
     elif data.startswith("view_batch_"):
         batch_name = data.replace("view_batch_", "")
@@ -868,34 +911,6 @@ async def callback_handler(callback_query: CallbackQuery):
                 await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
             else:
                 await callback_query.answer("Failed to update filter.", show_alert=True)
-
-    # --- SPAM CLEAR LOGIC ---
-    elif data == "noop_count":
-        await callback_query.answer("This is the count of spam-filtered IDs.")
-        
-    elif data.startswith("confirm_clear_spam_"):
-        category = data.split("_")[-1]
-        await callback_query.message.edit_text(
-            f"<b>Confirm:</b> Are you sure you want to clear all <b>{category}</b> spam records?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Yes, Clear", callback_data=f"clear_spam_{category}"),
-                    InlineKeyboardButton(text="Cancel", callback_data="spam_filter_menu")
-                ]
-            ]),
-            parse_mode="HTML"
-        )
-        
-    elif data.startswith("clear_spam_"):
-        category = data.split("_")[-1]
-        await clear_spam_records(user_id, category)
-        await callback_query.answer(f"{category.capitalize()} spam records cleared.")
-        # Refresh the menu
-        await callback_query.message.edit_text(
-            "<b>Spam Filter Settings</b>",
-            reply_markup=await get_spam_filter_menu(user_id),
-            parse_mode="HTML"
-        )
 
     elif data == "back_to_menu":
         await callback_query.message.edit_text("<b>Meeff Bot Dashboard</b>", reply_markup=start_markup, parse_mode="HTML")
