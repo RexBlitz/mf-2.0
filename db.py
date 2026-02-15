@@ -693,3 +693,184 @@ async def remove_pending_account(user_id: int, email: str):
         {"$pull": {"accounts": {"email": email}}},
         upsert=True
     )
+
+
+# --- Automation Settings ---
+
+async def get_automation_settings(user_id: int) -> dict:
+    """Get automation settings for a user."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "automation_settings"})
+    if doc:
+        return {
+            "enabled": doc.get("enabled", False),
+            "lounge_message": doc.get("lounge_message", ""),
+            "chatroom_message": doc.get("chatroom_message", ""),
+            "selected_accounts": doc.get("selected_accounts", "all"),  # "all" or list of indices
+        }
+    return {
+        "enabled": False,
+        "lounge_message": "",
+        "chatroom_message": "",
+        "selected_accounts": "all",
+    }
+
+
+async def set_automation_enabled(user_id: int, enabled: bool):
+    """Toggle automation on/off."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_settings"},
+        {"$set": {"enabled": enabled}},
+        upsert=True
+    )
+
+
+async def set_automation_lounge_message(user_id: int, message: str):
+    """Set the lounge message for automation."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_settings"},
+        {"$set": {"lounge_message": message}},
+        upsert=True
+    )
+
+
+async def set_automation_chatroom_message(user_id: int, message: str):
+    """Set the chatroom message for automation."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_settings"},
+        {"$set": {"chatroom_message": message}},
+        upsert=True
+    )
+
+
+async def set_automation_accounts(user_id: int, accounts):
+    """Set which accounts to use for automation. 'all' or list of token indices."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_settings"},
+        {"$set": {"selected_accounts": accounts}},
+        upsert=True
+    )
+
+
+async def get_automation_log(user_id: int) -> list:
+    """Get automation activity log entries (last 20)."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "automation_log"})
+    if doc:
+        entries = doc.get("entries", [])
+        return entries[-20:]  # Return last 20 entries
+    return []
+
+
+async def add_automation_log(user_id: int, entry: str):
+    """Add an entry to the automation log."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    log_entry = {
+        "text": entry,
+        "time": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+    }
+    await user_db.update_one(
+        {"type": "automation_log"},
+        {"$push": {"entries": {"$each": [log_entry], "$slice": -50}}},
+        upsert=True
+    )
+
+
+async def set_automation_last_request_time(user_id: int, token: str):
+    """Record when a request cycle was last run for a token."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_timers"},
+        {"$set": {f"request_times.{token}": datetime.datetime.utcnow()}},
+        upsert=True
+    )
+
+
+async def get_automation_last_request_time(user_id: int, token: str):
+    """Get when a request cycle was last run for a token."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "automation_timers"})
+    if doc:
+        return doc.get("request_times", {}).get(token)
+    return None
+
+
+async def set_automation_add_time(user_id: int, token: str, person_id: str):
+    """Record when a person was added (for scheduling lounge/chatroom follow-ups)."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_timers"},
+        {"$set": {f"add_times.{token}.{person_id}": datetime.datetime.utcnow()}},
+        upsert=True
+    )
+
+
+async def get_automation_pending_followups(user_id: int) -> dict:
+    """Get all pending follow-up timers."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "automation_timers"})
+    if doc:
+        return {
+            "request_times": doc.get("request_times", {}),
+            "add_times": doc.get("add_times", {}),
+            "lounge_sent": doc.get("lounge_sent", {}),
+            "chatroom_sent": doc.get("chatroom_sent", {}),
+        }
+    return {"request_times": {}, "add_times": {}, "lounge_sent": {}, "chatroom_sent": {}}
+
+
+async def mark_lounge_sent(user_id: int, token: str, person_id: str, wave: int):
+    """Mark that a lounge message wave was sent. wave: 1=20min, 2=1hr, 3=3hr"""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_timers"},
+        {"$set": {f"lounge_sent.{token}.{person_id}.wave_{wave}": datetime.datetime.utcnow()}},
+        upsert=True
+    )
+
+
+async def get_lounge_sent_waves(user_id: int, token: str, person_id: str) -> dict:
+    """Get which lounge waves have been sent for a person."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "automation_timers"})
+    if doc:
+        return doc.get("lounge_sent", {}).get(token, {}).get(person_id, {})
+    return {}
+
+
+async def mark_chatroom_sent(user_id: int, token: str, person_id: str):
+    """Mark that a chatroom message was sent for a person."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "automation_timers"},
+        {"$set": {f"chatroom_sent.{token}.{person_id}": datetime.datetime.utcnow()}},
+        upsert=True
+    )
+
+
+async def is_chatroom_sent(user_id: int, token: str, person_id: str) -> bool:
+    """Check if chatroom message was already sent for a person."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "automation_timers"})
+    if doc:
+        return person_id in doc.get("chatroom_sent", {}).get(token, {})
+    return False
