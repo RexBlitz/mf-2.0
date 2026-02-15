@@ -133,13 +133,10 @@ async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
         batch_name = batch.get("name", "Unnamed")
         is_active = batch.get("active", True)
         status = "ON" if is_active else "OFF"
-        filter_nat = batch.get("filter_nationality", "")
-        filter_label = filter_nat if filter_nat else "All"
 
         buttons.append([
             InlineKeyboardButton(text=f"{batch_name}", callback_data=f"view_batch_{batch_name}"),
-            InlineKeyboardButton(text=status, callback_data=f"toggle_batch_{batch_name}"),
-            InlineKeyboardButton(text=f"[{filter_label}]", callback_data=f"batch_filter_{batch_name}")
+            InlineKeyboardButton(text=status, callback_data=f"toggle_batch_{batch_name}")
         ])
 
     # Removed manual Reorganize button
@@ -689,7 +686,14 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
 
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="batch_management")])
+    # Add filter button
+    filter_nat = batch.get("filter_nationality", "")
+    filter_label = filter_nat if filter_nat else "All"
+    
+    buttons.append([
+        InlineKeyboardButton(text=f"Nationality: {filter_label}", callback_data=f"batch_filter_{batch_name}"),
+        InlineKeyboardButton(text="Back", callback_data="batch_management")
+    ])
 
     try:
         await callback_query.message.edit_text(f"<b>{html.escape(batch_name)} - Manage Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -1115,9 +1119,25 @@ async def callback_handler(callback_query: CallbackQuery):
         batch_name = data.replace("batch_filter_", "")
         batch = await get_batch_by_name(user_id, batch_name)
         current_filter = batch.get("filter_nationality", "") if batch else ""
+        
+        # Create custom filter menu with back button going to batch detail view
+        buttons = []
+        all_mark = "> " if not current_filter else "  "
+        buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_nat_all_{batch_name}")])
+
+        row = []
+        for i, (code, name) in enumerate(NATIONALITY_LIST):
+            mark = "> " if current_filter == code else ""
+            row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_nat_{code}_{batch_name}"))
+            if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
+                buttons.append(row)
+                row = []
+
+        buttons.append([InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")])
+        
         await callback_query.message.edit_text(
             f"<b>Set Filter for {batch_name}</b>\n\nCurrent: <b>{current_filter or 'All Countries'}</b>\nSelect nationality:",
-            reply_markup=get_batch_filter_menu(batch_name, current_filter),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode="HTML"
         )
 
