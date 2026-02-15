@@ -20,9 +20,13 @@ from db import (
     list_all_collections, get_collection_summary, connect_to_collection,
     rename_user_collection, transfer_to_user, get_current_collection_info,
     get_spam_record_count, clear_spam_records,
-    get_batches, create_batch, toggle_batch_status, set_batch_filter, get_batch_by_name, # auto_organize_batches removed
-    add_token_to_auto_batch 
+    get_batches, create_batch, toggle_batch_status, set_batch_filter, get_batch_by_name,
+    add_token_to_auto_batch,
+    get_automation_settings, set_automation_enabled,
+    set_automation_lounge_message, set_automation_chatroom_message,
+    set_automation_accounts, get_automation_log,
 )
+from automation import start_automation, stop_automation, is_automation_running
 # Make sure these other local modules are compatible if they also perform I/O
 from lounge import send_lounge, send_lounge_all_tokens
 from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
@@ -41,6 +45,7 @@ ACCOUNTS_PER_PAGE = 12 # New constant for pagination
 
 password_access: Dict[int, datetime] = {}
 db_operation_states: Dict[int, Dict[str, str]] = defaultdict(dict)
+automation_input_states: Dict[int, str] = {}  # user_id -> "set_lounge_msg" or "set_chatroom_msg"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -58,9 +63,13 @@ def has_valid_access(user_id: int) -> bool:
 async def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
     spam_filters = await get_all_spam_filters(user_id)
     any_spam_on = any(spam_filters.values())
+    auto_settings = await get_automation_settings(user_id)
+    auto_running = is_automation_running(user_id)
+    auto_status = "ON" if auto_settings["enabled"] and auto_running else "OFF"
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Manage Accounts", callback_data="manage_accounts|0"), InlineKeyboardButton(text="Meeff Filters", callback_data="show_filters")],
         [InlineKeyboardButton(text="Batch Management", callback_data="batch_management")],
+        [InlineKeyboardButton(text=f"Automation: {auto_status}", callback_data="automation_menu")],
         [InlineKeyboardButton(text=f"Spam Filters: {'ON' if any_spam_on else 'OFF'}", callback_data="spam_filter_menu")],
         [InlineKeyboardButton(text="DB Settings", callback_data="db_settings"), InlineKeyboardButton(text="Back", callback_data="back_to_menu")]
     ])
@@ -125,12 +134,12 @@ async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
         is_active = batch.get("active", True)
         status = "ON" if is_active else "OFF"
         filter_nat = batch.get("filter_nationality", "")
-        nat_display = f" ({filter_nat})" if filter_nat else " (All)"
+        filter_label = filter_nat if filter_nat else "All"
 
         buttons.append([
-            InlineKeyboardButton(text=f"{batch_name}{nat_display}", callback_data=f"view_batch_{batch_name}"),
+            InlineKeyboardButton(text=f"{batch_name}", callback_data=f"view_batch_{batch_name}"),
             InlineKeyboardButton(text=status, callback_data=f"toggle_batch_{batch_name}"),
-            InlineKeyboardButton(text="Filter", callback_data=f"batch_filter_{batch_name}")
+            InlineKeyboardButton(text=f"[{filter_label}]", callback_data=f"batch_filter_{batch_name}")
         ])
 
     # Removed manual Reorganize button
@@ -141,21 +150,26 @@ async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
 
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_batch_filter_menu(batch_name: str) -> InlineKeyboardMarkup:
-    countries = [
-        ("RU", "Russia"), ("UA", "Ukraine"), ("BY", "Belarus"), ("IR", "Iran"), ("PH", "Philippines"),
-        ("PK", "Pakistan"), ("US", "USA"), ("IN", "India"), ("DE", "Germany"), ("FR", "France"),
-        ("BR", "Brazil"), ("CN", "China"), ("JP", "Japan"), ("KR", "Korea"), ("CA", "Canada"),
-        ("AU", "Australia"), ("IT", "Italy"), ("ES", "Spain"), ("ZA", "South Africa"), ("TR", "Turkey")
-    ]
+NATIONALITY_LIST = [
+    ("RU", "Russia"), ("UA", "Ukraine"), ("BY", "Belarus"), ("IR", "Iran"), ("PH", "Philippines"),
+    ("PK", "Pakistan"), ("US", "USA"), ("IN", "India"), ("DE", "Germany"), ("FR", "France"),
+    ("BR", "Brazil"), ("CN", "China"), ("JP", "Japan"), ("KR", "Korea"), ("CA", "Canada"),
+    ("AU", "Australia"), ("IT", "Italy"), ("ES", "Spain"), ("ZA", "South Africa"), ("TR", "Turkey"),
+    ("GB", "UK"), ("MX", "Mexico"), ("EG", "Egypt"), ("SA", "Saudi Arabia"), ("ID", "Indonesia"),
+    ("TH", "Thailand"), ("VN", "Vietnam"), ("MY", "Malaysia"), ("SG", "Singapore"), ("BD", "Bangladesh")
+]
 
+def get_batch_filter_menu(batch_name: str, current_filter: str = "") -> InlineKeyboardMarkup:
     buttons = []
-    buttons.append([InlineKeyboardButton(text="All Countries", callback_data=f"batch_nat_all_{batch_name}")])
+
+    all_mark = "> " if not current_filter else "  "
+    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_nat_all_{batch_name}")])
 
     row = []
-    for i, (code, name) in enumerate(countries):
-        row.append(InlineKeyboardButton(text=code, callback_data=f"batch_nat_{code}_{batch_name}"))
-        if len(row) == 4 or i == len(countries) - 1:
+    for i, (code, name) in enumerate(NATIONALITY_LIST):
+        mark = "> " if current_filter == code else ""
+        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_nat_{code}_{batch_name}"))
+        if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
             buttons.append(row)
             row = []
 
@@ -501,6 +515,31 @@ async def handle_new_token(message: Message):
     if message.from_user.is_bot: return
     if await signup_message_handler(message): return
 
+    # --- Automation input states ---
+    auto_state = automation_input_states.get(user_id)
+    if auto_state and message.text:
+        text = message.text.strip()
+        if auto_state == "set_lounge_msg":
+            await set_automation_lounge_message(user_id, text)
+            automation_input_states.pop(user_id, None)
+            auto_settings = await get_automation_settings(user_id)
+            await message.reply(
+                f"<b>Lounge message set:</b>\n<code>{html.escape(text)}</code>",
+                parse_mode="HTML",
+                reply_markup=await get_automation_detail_menu(user_id)
+            )
+            return
+        elif auto_state == "set_chatroom_msg":
+            await set_automation_chatroom_message(user_id, text)
+            automation_input_states.pop(user_id, None)
+            await message.reply(
+                f"<b>Chatroom message set:</b>\n<code>{html.escape(text)}</code>",
+                parse_mode="HTML",
+                reply_markup=await get_automation_detail_menu(user_id)
+            )
+            return
+        automation_input_states.pop(user_id, None)
+
     state = db_operation_states.get(user_id)
     if state:
         operation, text = state.get("operation"), message.text.strip()
@@ -660,6 +699,56 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
 
 # -----------------------------------------------------------------------------------------------
 
+# --- Automation Menu ---
+async def get_automation_detail_menu(user_id: int) -> InlineKeyboardMarkup:
+    settings = await get_automation_settings(user_id)
+    running = is_automation_running(user_id)
+    enabled = settings["enabled"] and running
+
+    lounge_msg = settings.get("lounge_message", "") or "Not set"
+    chatroom_msg = settings.get("chatroom_message", "") or "Not set"
+    selected = settings.get("selected_accounts", "all")
+    acc_display = "All Accounts" if selected == "all" else f"{len(selected)} accounts"
+
+    status_icon = "ON" if enabled else "OFF"
+
+    buttons = [
+        [InlineKeyboardButton(text=f"Automation: {status_icon}", callback_data="toggle_automation")],
+        [InlineKeyboardButton(text=f"Lounge Msg: {lounge_msg[:25]}{'...' if len(lounge_msg) > 25 else ''}", callback_data="auto_set_lounge")],
+        [InlineKeyboardButton(text=f"Chatroom Msg: {chatroom_msg[:25]}{'...' if len(chatroom_msg) > 25 else ''}", callback_data="auto_set_chatroom")],
+        [InlineKeyboardButton(text=f"Accounts: {acc_display}", callback_data="auto_select_accounts")],
+        [InlineKeyboardButton(text="View Log", callback_data="auto_view_log")],
+        [InlineKeyboardButton(text="Back", callback_data="settings_menu")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def get_automation_status_text(user_id: int) -> str:
+    settings = await get_automation_settings(user_id)
+    running = is_automation_running(user_id)
+    enabled = settings["enabled"] and running
+
+    lounge_msg = settings.get("lounge_message", "") or "<i>Not set</i>"
+    chatroom_msg = settings.get("chatroom_message", "") or "<i>Not set</i>"
+    selected = settings.get("selected_accounts", "all")
+    acc_display = "All Active Accounts" if selected == "all" else f"{len(selected)} selected"
+
+    status = "RUNNING" if enabled else "STOPPED"
+
+    text = (
+        f"<b>Automation Settings</b>\n\n"
+        f"<b>Status:</b> {status}\n"
+        f"<b>Accounts:</b> {acc_display}\n\n"
+        f"<b>Schedule:</b>\n"
+        f"  - Friend requests every 24h\n"
+        f"  - Lounge msg at 20min, 1hr, 3hr after add\n"
+        f"  - Chatroom msg 5min after each lounge\n\n"
+        f"<b>Lounge Message:</b>\n<code>{html.escape(lounge_msg) if lounge_msg != '<i>Not set</i>' else lounge_msg}</code>\n\n"
+        f"<b>Chatroom Message:</b>\n<code>{html.escape(chatroom_msg) if chatroom_msg != '<i>Not set</i>' else chatroom_msg}</code>"
+    )
+    return text
+
+
 @router.callback_query()
 async def callback_handler(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
@@ -782,6 +871,136 @@ async def callback_handler(callback_query: CallbackQuery):
     elif data == "noop_page":
         await callback_query.answer("You are on this page.")
     
+    # --- AUTOMATION MANAGEMENT ---
+    elif data == "automation_menu":
+        text = await get_automation_status_text(user_id)
+        await callback_query.message.edit_text(text, reply_markup=await get_automation_detail_menu(user_id), parse_mode="HTML")
+
+    elif data == "toggle_automation":
+        settings = await get_automation_settings(user_id)
+        running = is_automation_running(user_id)
+
+        if settings["enabled"] and running:
+            # Turn OFF
+            await set_automation_enabled(user_id, False)
+            stop_automation(user_id)
+            await callback_query.answer("Automation stopped.")
+        else:
+            # Turn ON - validate messages are set
+            if not settings.get("lounge_message"):
+                return await callback_query.answer("Set a lounge message first!", show_alert=True)
+            if not settings.get("chatroom_message"):
+                return await callback_query.answer("Set a chatroom message first!", show_alert=True)
+            await set_automation_enabled(user_id, True)
+            start_automation(user_id, bot)
+            await callback_query.answer("Automation started!")
+
+        text = await get_automation_status_text(user_id)
+        await callback_query.message.edit_text(text, reply_markup=await get_automation_detail_menu(user_id), parse_mode="HTML")
+
+    elif data == "auto_set_lounge":
+        automation_input_states[user_id] = "set_lounge_msg"
+        await callback_query.message.edit_text(
+            "<b>Set Lounge Message</b>\n\nType the message you want to auto-send in lounge:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="automation_menu")]])
+        )
+
+    elif data == "auto_set_chatroom":
+        automation_input_states[user_id] = "set_chatroom_msg"
+        await callback_query.message.edit_text(
+            "<b>Set Chatroom Message</b>\n\nType the message you want to auto-send in chatroom:",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="automation_menu")]])
+        )
+
+    elif data == "auto_select_accounts":
+        tokens = await get_tokens(user_id)
+        settings = await get_automation_settings(user_id)
+        selected = settings.get("selected_accounts", "all")
+
+        buttons = [
+            [InlineKeyboardButton(
+                text=f"{'> ' if selected == 'all' else ''}All Accounts",
+                callback_data="auto_acc_all"
+            )]
+        ]
+        for i, tok in enumerate(tokens):
+            is_selected = selected == "all" or (isinstance(selected, list) and i in selected)
+            mark = ">" if is_selected else " "
+            name = html.escape(tok.get("name", f"Account {i+1}")[:20])
+            buttons.append([InlineKeyboardButton(text=f"{mark} {name}", callback_data=f"auto_acc_toggle_{i}")])
+
+        buttons.append([InlineKeyboardButton(text="Back", callback_data="automation_menu")])
+        await callback_query.message.edit_text(
+            "<b>Select Automation Accounts</b>\n\nChoose which accounts to automate:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+
+    elif data == "auto_acc_all":
+        await set_automation_accounts(user_id, "all")
+        await callback_query.answer("All accounts selected!")
+        text = await get_automation_status_text(user_id)
+        await callback_query.message.edit_text(text, reply_markup=await get_automation_detail_menu(user_id), parse_mode="HTML")
+
+    elif data.startswith("auto_acc_toggle_"):
+        try:
+            idx = int(data.replace("auto_acc_toggle_", ""))
+        except ValueError:
+            return await callback_query.answer("Invalid.", show_alert=True)
+
+        settings = await get_automation_settings(user_id)
+        selected = settings.get("selected_accounts", "all")
+
+        if selected == "all":
+            # Switch to individual selection, start with just this one
+            tokens = await get_tokens(user_id)
+            new_selected = [idx]
+        else:
+            new_selected = list(selected)
+            if idx in new_selected:
+                new_selected.remove(idx)
+            else:
+                new_selected.append(idx)
+            if not new_selected:
+                new_selected = "all"
+
+        await set_automation_accounts(user_id, new_selected)
+        # Refresh the account selection menu
+        tokens = await get_tokens(user_id)
+        re_settings = await get_automation_settings(user_id)
+        re_selected = re_settings.get("selected_accounts", "all")
+        buttons = [
+            [InlineKeyboardButton(
+                text=f"{'> ' if re_selected == 'all' else ''}All Accounts",
+                callback_data="auto_acc_all"
+            )]
+        ]
+        for i, tok in enumerate(tokens):
+            is_sel = re_selected == "all" or (isinstance(re_selected, list) and i in re_selected)
+            mark = ">" if is_sel else " "
+            name = html.escape(tok.get("name", f"Account {i+1}")[:20])
+            buttons.append([InlineKeyboardButton(text=f"{mark} {name}", callback_data=f"auto_acc_toggle_{i}")])
+        buttons.append([InlineKeyboardButton(text="Back", callback_data="automation_menu")])
+        await callback_query.message.edit_text(
+            "<b>Select Automation Accounts</b>\n\nChoose which accounts to automate:",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+
+    elif data == "auto_view_log":
+        log_entries = await get_automation_log(user_id)
+        if log_entries:
+            log_text = "\n".join([f"<code>{e['time']}</code> {html.escape(e['text'])}" for e in log_entries[-15:]])
+        else:
+            log_text = "<i>No automation activity yet.</i>"
+        await callback_query.message.edit_text(
+            f"<b>Automation Log</b>\n\n{log_text}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Refresh", callback_data="auto_view_log"), InlineKeyboardButton(text="Back", callback_data="automation_menu")]]),
+            parse_mode="HTML"
+        )
+
     # --- SPAM FILTER MANAGEMENT ---
     elif data == "spam_filter_menu":
         await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
@@ -894,7 +1113,13 @@ async def callback_handler(callback_query: CallbackQuery):
 
     elif data.startswith("batch_filter_"):
         batch_name = data.replace("batch_filter_", "")
-        await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
+        batch = await get_batch_by_name(user_id, batch_name)
+        current_filter = batch.get("filter_nationality", "") if batch else ""
+        await callback_query.message.edit_text(
+            f"<b>Set Filter for {batch_name}</b>\n\nCurrent: <b>{current_filter or 'All Countries'}</b>\nSelect nationality:",
+            reply_markup=get_batch_filter_menu(batch_name, current_filter),
+            parse_mode="HTML"
+        )
 
     elif data.startswith("batch_nat_"):
         parts = data.split("_")
