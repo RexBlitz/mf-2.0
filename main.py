@@ -24,7 +24,8 @@ from db import (
     add_token_to_auto_batch,
     get_automation_settings, set_automation_enabled,
     set_automation_lounge_message, set_automation_chatroom_message,
-    set_automation_accounts, get_automation_log,
+    set_automation_accounts, get_automation_log, add_automation_log,
+    set_automation_last_request_time, set_automation_add_time, get_user_filters,
 )
 from automation import start_automation, stop_automation, is_automation_running
 # Make sure these other local modules are compatible if they also perform I/O
@@ -694,6 +695,120 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
 
 # -----------------------------------------------------------------------------------------------
 
+# --- Automation Run Action ---
+async def run_automation_action(user_id: int, token_list: list):
+    """Execute friend requests + lounge + chatroom messages immediately for selected accounts."""
+    settings = await get_automation_settings(user_id)
+    lounge_msg = settings.get("lounge_message", "")
+    chatroom_msg = settings.get("chatroom_message", "")
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            for token_obj in token_list:
+                token = token_obj["token"]
+                token_name = token_obj.get("name", "Unknown")
+                
+                # Discover users
+                filters = await get_user_filters(user_id, token) or {}
+                user_ids = await _discover_users_for_automation(session, token, filters)
+                
+                if not user_ids:
+                    await add_automation_log(user_id, f"[{token_name}] No users discovered")
+                    continue
+                
+                sent_count = 0
+                for person_id in user_ids:
+                    # Send friend request
+                    success = await _send_friend_request_for_automation(session, token, person_id)
+                    if success:
+                        sent_count += 1
+                        await set_automation_add_time(user_id, token, person_id)
+                        
+                        # Send lounge message after 5 seconds
+                        await asyncio.sleep(5)
+                        ok = await _send_lounge_for_automation(session, token, person_id, lounge_msg)
+                        if ok:
+                            await add_automation_log(user_id, f"[{token_name}] Sent lounge -> {person_id[:8]}...")
+                            
+                            # Send chatroom message 5 seconds after lounge
+                            await asyncio.sleep(5)
+                            ok2 = await _send_chatroom_for_automation(session, token, person_id, chatroom_msg)
+                            if ok2:
+                                await add_automation_log(user_id, f"[{token_name}] Sent chatroom -> {person_id[:8]}...")
+                    else:
+                        break
+                    
+                    await asyncio.sleep(1)
+                
+                await set_automation_last_request_time(user_id, token)
+                if sent_count > 0:
+                    await add_automation_log(user_id, f"[{token_name}] Action cycle: {sent_count} requests sent")
+                
+                await asyncio.sleep(2)
+    except Exception as e:
+        await add_automation_log(user_id, f"Action error: {str(e)[:80]}")
+
+
+async def _discover_users_for_automation(session: aiohttp.ClientSession, token: str, filters: dict = None) -> list:
+    """Discover users (same as automation.py helper)."""
+    url = "https://api.meeff.com/user/explore/v2/"
+    headers = {"meeff-access-token": token, "Connection": "keep-alive", "User-Agent": "okhttp/5.0.0-alpha.14"}
+    params = {"locale": "en"}
+    if filters and filters.get("filterNationalityCode"):
+        params["filterNationalityCode"] = filters["filterNationalityCode"]
+    try:
+        async with session.get(url, headers=headers, params=params) as resp:
+            data = await resp.json(content_type=None)
+            if data.get("errorCode"):
+                return []
+            users = data.get("result", {}).get("users", [])
+            return [u.get("_id") for u in users if u.get("_id")]
+    except Exception:
+        return []
+
+
+async def _send_friend_request_for_automation(session: aiohttp.ClientSession, token: str, person_id: str) -> bool:
+    """Send a friend request."""
+    url = f"https://api.meeff.com/user/undoableAnswer/v5/?userId={person_id}&isOkay=1"
+    headers = {"meeff-access-token": token, "Connection": "keep-alive", "User-Agent": "okhttp/5.0.0-alpha.14"}
+    try:
+        async with session.get(url, headers=headers) as resp:
+            data = await resp.json(content_type=None)
+            if data.get("errorCode") == "LikeExceeded":
+                return False
+            if data.get("errorCode"):
+                return False
+            return True
+    except Exception:
+        return False
+
+
+async def _send_lounge_for_automation(session: aiohttp.ClientSession, token: str, person_id: str, message: str) -> bool:
+    """Send a lounge message."""
+    url = "https://api.meeff.com/lounge/create/v1/"
+    headers = {"meeff-access-token": token, "Content-Type": "application/json", "User-Agent": "okhttp/5.0.0-alpha.14"}
+    payload = {"targetUserId": person_id, "content": message, "locale": "en"}
+    try:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            data = await resp.json(content_type=None)
+            return not data.get("errorCode")
+    except Exception:
+        return False
+
+
+async def _send_chatroom_for_automation(session: aiohttp.ClientSession, token: str, person_id: str, message: str) -> bool:
+    """Send a chatroom message."""
+    url = "https://api.meeff.com/chatroom/send/v1/"
+    headers = {"meeff-access-token": token, "Content-Type": "application/json", "User-Agent": "okhttp/5.0.0-alpha.14"}
+    payload = {"targetUserId": person_id, "content": message, "locale": "en"}
+    try:
+        async with session.post(url, headers=headers, json=payload) as resp:
+            data = await resp.json(content_type=None)
+            return not data.get("errorCode")
+    except Exception:
+        return False
+
+
 # --- Automation Menu ---
 async def get_automation_detail_menu(user_id: int) -> InlineKeyboardMarkup:
     settings = await get_automation_settings(user_id)
@@ -703,7 +818,13 @@ async def get_automation_detail_menu(user_id: int) -> InlineKeyboardMarkup:
     lounge_msg = settings.get("lounge_message", "") or "Not set"
     chatroom_msg = settings.get("chatroom_message", "") or "Not set"
     selected = settings.get("selected_accounts", "all")
-    acc_display = "All Accounts" if selected == "all" else f"{len(selected)} accounts"
+    
+    if selected == "all":
+        acc_display = "All Accounts"
+    elif selected == "active_only":
+        acc_display = "Active Only"
+    else:
+        acc_display = f"{len(selected)} Selected"
 
     status_icon = "ON" if enabled else "OFF"
 
@@ -712,6 +833,7 @@ async def get_automation_detail_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text=f"Lounge Msg: {lounge_msg[:25]}{'...' if len(lounge_msg) > 25 else ''}", callback_data="auto_set_lounge")],
         [InlineKeyboardButton(text=f"Chatroom Msg: {chatroom_msg[:25]}{'...' if len(chatroom_msg) > 25 else ''}", callback_data="auto_set_chatroom")],
         [InlineKeyboardButton(text=f"Accounts: {acc_display}", callback_data="auto_select_accounts")],
+        [InlineKeyboardButton(text="Run Action Now", callback_data="auto_run_action")],
         [InlineKeyboardButton(text="View Log", callback_data="auto_view_log")],
         [InlineKeyboardButton(text="Back", callback_data="settings_menu")],
     ]
@@ -910,7 +1032,6 @@ async def callback_handler(callback_query: CallbackQuery):
         )
 
     elif data == "auto_select_accounts":
-        tokens = await get_tokens(user_id)
         settings = await get_automation_settings(user_id)
         selected = settings.get("selected_accounts", "all")
 
@@ -918,17 +1039,20 @@ async def callback_handler(callback_query: CallbackQuery):
             [InlineKeyboardButton(
                 text=f"{'> ' if selected == 'all' else ''}All Accounts",
                 callback_data="auto_acc_all"
+            )],
+            [InlineKeyboardButton(
+                text=f"{'> ' if selected == 'active_only' else ''}All Active Accounts",
+                callback_data="auto_acc_active"
+            )],
+            [InlineKeyboardButton(
+                text="Choose Manually",
+                callback_data="auto_acc_manual"
             )]
         ]
-        for i, tok in enumerate(tokens):
-            is_selected = selected == "all" or (isinstance(selected, list) and i in selected)
-            mark = ">" if is_selected else " "
-            name = html.escape(tok.get("name", f"Account {i+1}")[:20])
-            buttons.append([InlineKeyboardButton(text=f"{mark} {name}", callback_data=f"auto_acc_toggle_{i}")])
 
         buttons.append([InlineKeyboardButton(text="Back", callback_data="automation_menu")])
         await callback_query.message.edit_text(
-            "<b>Select Automation Accounts</b>\n\nChoose which accounts to automate:",
+            "<b>Select Automation Accounts</b>\n\nWhich accounts to use for automation?",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode="HTML"
         )
@@ -939,50 +1063,108 @@ async def callback_handler(callback_query: CallbackQuery):
         text = await get_automation_status_text(user_id)
         await callback_query.message.edit_text(text, reply_markup=await get_automation_detail_menu(user_id), parse_mode="HTML")
 
-    elif data.startswith("auto_acc_toggle_"):
+    elif data == "auto_acc_active":
+        await set_automation_accounts(user_id, "active_only")
+        await callback_query.answer("Active accounts selected!")
+        text = await get_automation_status_text(user_id)
+        await callback_query.message.edit_text(text, reply_markup=await get_automation_detail_menu(user_id), parse_mode="HTML")
+
+    elif data == "auto_acc_manual":
+        tokens = await get_tokens(user_id)
+        settings = await get_automation_settings(user_id)
+        selected = settings.get("selected_accounts", "all")
+        
+        buttons = []
+        for i, tok in enumerate(tokens):
+            is_selected = isinstance(selected, list) and i in selected
+            mark = "> " if is_selected else "  "
+            name = html.escape(tok.get("name", f"Account {i+1}")[:20])
+            active_status = "ON" if tok.get("active", True) else "OFF"
+            buttons.append([InlineKeyboardButton(text=f"{mark}{name} [{active_status}]", callback_data=f"auto_acc_toggle_manual_{i}")])
+        
+        buttons.append([InlineKeyboardButton(text="Done", callback_data="auto_acc_manual_done")])
+        buttons.append([InlineKeyboardButton(text="Back", callback_data="auto_select_accounts")])
+        await callback_query.message.edit_text(
+            "<b>Choose Accounts</b>\n\nSelect/deselect individual accounts:\n\n(> = selected)",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            parse_mode="HTML"
+        )
+
+    elif data.startswith("auto_acc_toggle_manual_"):
         try:
-            idx = int(data.replace("auto_acc_toggle_", ""))
+            idx = int(data.replace("auto_acc_toggle_manual_", ""))
         except ValueError:
             return await callback_query.answer("Invalid.", show_alert=True)
 
         settings = await get_automation_settings(user_id)
-        selected = settings.get("selected_accounts", "all")
-
-        if selected == "all":
-            # Switch to individual selection, start with just this one
-            tokens = await get_tokens(user_id)
-            new_selected = [idx]
+        selected = settings.get("selected_accounts", [])
+        
+        if not isinstance(selected, list):
+            selected = []
+        
+        if idx in selected:
+            selected.remove(idx)
         else:
-            new_selected = list(selected)
-            if idx in new_selected:
-                new_selected.remove(idx)
-            else:
-                new_selected.append(idx)
-            if not new_selected:
-                new_selected = "all"
-
-        await set_automation_accounts(user_id, new_selected)
-        # Refresh the account selection menu
+            selected.append(idx)
+        
+        await set_automation_accounts(user_id, selected if selected else "all")
+        
+        # Refresh the manual selection menu
         tokens = await get_tokens(user_id)
         re_settings = await get_automation_settings(user_id)
         re_selected = re_settings.get("selected_accounts", "all")
-        buttons = [
-            [InlineKeyboardButton(
-                text=f"{'> ' if re_selected == 'all' else ''}All Accounts",
-                callback_data="auto_acc_all"
-            )]
-        ]
+        
+        buttons = []
         for i, tok in enumerate(tokens):
-            is_sel = re_selected == "all" or (isinstance(re_selected, list) and i in re_selected)
-            mark = ">" if is_sel else " "
+            is_sel = isinstance(re_selected, list) and i in re_selected
+            mark = "> " if is_sel else "  "
             name = html.escape(tok.get("name", f"Account {i+1}")[:20])
-            buttons.append([InlineKeyboardButton(text=f"{mark} {name}", callback_data=f"auto_acc_toggle_{i}")])
-        buttons.append([InlineKeyboardButton(text="Back", callback_data="automation_menu")])
+            active_status = "ON" if tok.get("active", True) else "OFF"
+            buttons.append([InlineKeyboardButton(text=f"{mark}{name} [{active_status}]", callback_data=f"auto_acc_toggle_manual_{i}")])
+        
+        buttons.append([InlineKeyboardButton(text="Done", callback_data="auto_acc_manual_done")])
+        buttons.append([InlineKeyboardButton(text="Back", callback_data="auto_select_accounts")])
         await callback_query.message.edit_text(
-            "<b>Select Automation Accounts</b>\n\nChoose which accounts to automate:",
+            "<b>Choose Accounts</b>\n\nSelect/deselect individual accounts:\n\n(> = selected)",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
             parse_mode="HTML"
         )
+
+    elif data == "auto_acc_manual_done":
+        text = await get_automation_status_text(user_id)
+        await callback_query.message.edit_text(text, reply_markup=await get_automation_detail_menu(user_id), parse_mode="HTML")
+
+
+
+    elif data == "auto_run_action":
+        settings = await get_automation_settings(user_id)
+        
+        # Validate messages are set
+        if not settings.get("lounge_message"):
+            return await callback_query.answer("Set a lounge message first!", show_alert=True)
+        if not settings.get("chatroom_message"):
+            return await callback_query.answer("Set a chatroom message first!", show_alert=True)
+        
+        await callback_query.answer("Starting automation cycle...")
+        
+        # Get the tokens to use based on selection
+        selected = settings.get("selected_accounts", "all")
+        if selected == "all":
+            token_list = await get_active_tokens(user_id)
+        elif selected == "active_only":
+            token_list = await get_active_tokens(user_id)
+        else:
+            all_tokens = await get_tokens(user_id)
+            token_list = []
+            for idx in selected:
+                if isinstance(idx, int) and 0 <= idx < len(all_tokens):
+                    tok = all_tokens[idx]
+                    if tok.get("active", True):
+                        token_list.append(tok)
+        
+        # Run immediately in background
+        asyncio.create_task(run_automation_action(user_id, token_list))
+        await add_automation_log(user_id, "Manual action triggered: sending requests & messages")
 
     elif data == "auto_view_log":
         log_entries = await get_automation_log(user_id)
