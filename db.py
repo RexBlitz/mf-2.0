@@ -874,3 +874,81 @@ async def is_chatroom_sent(user_id: int, token: str, person_id: str) -> bool:
     if doc:
         return person_id in doc.get("chatroom_sent", {}).get(token, {})
     return False
+
+
+# --- Batch Account Nationality Filters ---
+
+async def set_batch_account_filter(telegram_user_id: int, batch_name: str, token_index: int, nationality_code: str):
+    """Set nationality filter for a specific account within a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    
+    # Initialize batch_account_filters doc if it doesn't exist
+    await user_db.update_one(
+        {"type": "batch_account_filters"},
+        {"$set": {f"{batch_name}.{token_index}": nationality_code}},
+        upsert=True
+    )
+
+
+async def get_batch_account_filter(telegram_user_id: int, batch_name: str, token_index: int) -> str:
+    """Get nationality filter for a specific account within a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    
+    doc = await user_db.find_one({"type": "batch_account_filters"})
+    if doc and batch_name in doc:
+        return doc[batch_name].get(str(token_index), "")
+    return ""
+
+
+async def get_all_batch_account_filters(telegram_user_id: int, batch_name: str) -> dict:
+    """Get all account filters for a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    
+    doc = await user_db.find_one({"type": "batch_account_filters"})
+    if doc and batch_name in doc:
+        return doc[batch_name]
+    return {}
+
+
+# --- Blocked Users ---
+
+async def block_user(user_id: int, blocked_meeff_id: str):
+    """Add a user to the block list (block_meeff_id format: "meeff_id")"""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "blocked_users"},
+        {"$addToSet": {"blocked_ids": blocked_meeff_id}},
+        upsert=True
+    )
+
+
+async def unblock_user(user_id: int, blocked_meeff_id: str):
+    """Remove a user from the block list"""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.update_one(
+        {"type": "blocked_users"},
+        {"$pull": {"blocked_ids": blocked_meeff_id}},
+        upsert=True
+    )
+
+
+async def get_blocked_users(user_id: int) -> set:
+    """Get all blocked user IDs as a set"""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    doc = await user_db.find_one({"type": "blocked_users"})
+    if doc:
+        return set(doc.get("blocked_ids", []))
+    return set()
+
+
+async def clear_blocked_users(user_id: int):
+    """Clear all blocked users"""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    await user_db.delete_one({"type": "blocked_users"})
