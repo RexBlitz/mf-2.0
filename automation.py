@@ -293,3 +293,4 @@ def is_automation_running(user_id: int) -> bool:
     if user_id in automation_tasks:
         return not automation_tasks[user_id].done()
     return False
+ 
