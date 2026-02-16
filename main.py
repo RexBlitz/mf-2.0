@@ -1370,7 +1370,7 @@ async def callback_handler(callback_query: CallbackQuery):
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
-            token_filters = (await get_all_user_filters(user_id)).get(tok['token'], {})
+                    token_filters = (await get_all_user_filters(user_id)).get(tok['token'], {})
                     current_nat = token_filters.get("filterNationalityCode", "")
                     
                     # Get full country name for display
