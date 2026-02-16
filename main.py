@@ -674,10 +674,6 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
 
         token_filters = all_filters.get(tok['token'], {})
         nationality_code = token_filters.get("filterNationalityCode", "")
-        
-        # Get full country name
-        nationality_name = next((name for code, name in NATIONALITY_LIST if code == nationality_code), None)
-        nation_display = nationality_name or "All"
 
         account_name = html.escape(tok['name'][:20])
         display_name = f"{account_name}"
@@ -686,7 +682,7 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
         buttons.append([
             InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text=f"Nation: {nation_display}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
 
@@ -1212,13 +1208,10 @@ async def callback_handler(callback_query: CallbackQuery):
         # Get the tokens to use based on selection
         selected = settings.get("selected_accounts", "all")
         if selected == "all":
-            # All accounts including inactive
-            token_list = await get_tokens(user_id)
-        elif selected == "active_only":
-            # Only active accounts
             token_list = await get_active_tokens(user_id)
-        elif isinstance(selected, list) and selected:
-            # Manually selected accounts (must be active)
+        elif selected == "active_only":
+            token_list = await get_active_tokens(user_id)
+        else:
             all_tokens = await get_tokens(user_id)
             token_list = []
             for idx in selected:
@@ -1230,9 +1223,6 @@ async def callback_handler(callback_query: CallbackQuery):
                             token_list.append(tok)
                 except (ValueError, TypeError):
                     pass
-        else:
-            # Default to all active
-            token_list = await get_active_tokens(user_id)
         
         # Run immediately with status message
         asyncio.create_task(run_automation_action(user_id, token_list, callback_query.message))
@@ -1373,40 +1363,36 @@ async def callback_handler(callback_query: CallbackQuery):
                     token_filters = (await get_all_user_filters(user_id)).get(tok['token'], {})
                     current_nat = token_filters.get("filterNationalityCode", "")
                     
-                    # Get full country name for display
-                    current_nat_name = next((name for code, name in NATIONALITY_LIST if code == current_nat), None)
-                    current_display = current_nat_name or "All Countries"
-                    
                     # Create nationality menu
                     buttons = []
                     all_mark = "> " if not current_nat else "  "
-                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_acc_nat|all|{batch_name}|{global_index}")])
+                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_acc_nat_all|{batch_name}|{global_index}")])
                     
                     row = []
                     for i, (code, name) in enumerate(NATIONALITY_LIST):
                         mark = "> " if current_nat == code else ""
-                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_acc_nat|{code}|{batch_name}|{global_index}"))
+                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_acc_nat_{code}|{batch_name}|{global_index}"))
                         if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
                             buttons.append(row)
                             row = []
                     
                     buttons.append([InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")])
                     await callback_query.message.edit_text(
-                        f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_display}</b>\nSelect nationality:",
+                        f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
                         parse_mode="HTML"
                     )
             except (ValueError, IndexError):
                 await callback_query.answer("Invalid account.", show_alert=True)
 
-    elif data.startswith("batch_acc_nat|"):
+    elif data.startswith("batch_acc_nat_"):
         # Handle account nationality selection
         parts = data.split("|")
-        if len(parts) >= 4:
-            nat_code = parts[1]
-            batch_name = parts[2]
+        if len(parts) >= 3:
+            nat_code = parts[0].replace("batch_acc_nat_", "")
+            batch_name = parts[1]
             try:
-                global_index = int(parts[3])
+                global_index = int(parts[2])
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
@@ -1414,13 +1400,11 @@ async def callback_handler(callback_query: CallbackQuery):
                     if nat_code == "all":
                         # Remove nationality filter (set to empty)
                         await set_individual_spam_filter(user_id, tok['token'], "", None)
-                        nat_display = "All Countries"
                     else:
                         # Set nationality filter
                         await set_individual_spam_filter(user_id, tok['token'], nat_code, None)
-                        nat_display = next((name for code, name in NATIONALITY_LIST if code == nat_code), nat_code)
                     
-                    await callback_query.answer(f"Filter set to {nat_display}")
+                    await callback_query.answer(f"Filter set to {nat_code or 'All'}")
                     
                     # Refresh the batch view
                     batch = await get_batch_by_name(user_id, batch_name)
