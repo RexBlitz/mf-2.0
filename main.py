@@ -1278,6 +1278,7 @@ async def set_bot_commands():
         ("send_chat_all", "Send chatroom message to all accounts"), ("invoke", "Remove disabled accounts"),
         ("skip", "Unsubscribe from chats"), ("settings", "Bot settings"),
         ("add", "Add a person by ID"), ("signup", "Create a Meeff account"),
+        ("automation", "Automation settings"), ("block", "Block user from meeff"),
         ("password", "Enter password for access")]]
     await bot.set_my_commands(commands)
 
