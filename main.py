@@ -681,9 +681,7 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
         # Use '|' delimiter to avoid ambiguity with underscores inside batch names
         buttons.append([
             InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}")
-        ])
-        buttons.append([
+            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
             InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
@@ -1217,10 +1215,14 @@ async def callback_handler(callback_query: CallbackQuery):
             all_tokens = await get_tokens(user_id)
             token_list = []
             for idx in selected:
-                if isinstance(idx, int) and 0 <= idx < len(all_tokens):
-                    tok = all_tokens[idx]
-                    if tok.get("active", True):
-                        token_list.append(tok)
+                try:
+                    idx = int(idx) if not isinstance(idx, int) else idx
+                    if 0 <= idx < len(all_tokens):
+                        tok = all_tokens[idx]
+                        if tok.get("active", True):
+                            token_list.append(tok)
+                except (ValueError, TypeError):
+                    pass
         
         # Run immediately with status message
         asyncio.create_task(run_automation_action(user_id, token_list, callback_query.message))
