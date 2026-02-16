@@ -676,12 +676,15 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
         nationality_code = token_filters.get("filterNationalityCode", "")
 
         account_name = html.escape(tok['name'][:20])
-        display_name = f"{account_name} ({nationality_code})" if nationality_code else account_name
+        display_name = f"{account_name}"
 
         # Use '|' delimiter to avoid ambiguity with underscores inside batch names
         buttons.append([
             InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}")
+        ])
+        buttons.append([
+            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
 
@@ -696,25 +699,62 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
 # -----------------------------------------------------------------------------------------------
 
 # --- Automation Run Action ---
-async def run_automation_action(user_id: int, token_list: list):
+async def run_automation_action(user_id: int, token_list: list, message_obj=None):
     """Execute friend requests + lounge + chatroom messages immediately for selected accounts."""
     settings = await get_automation_settings(user_id)
     lounge_msg = settings.get("lounge_message", "")
     chatroom_msg = settings.get("chatroom_message", "")
     
+    status_text = f"<b>Automation Cycle Started</b>\n\nProcessing {len(token_list)} account(s)...\n\n"
+    
     try:
+        # Send initial status
+        if message_obj:
+            try:
+                status_msg = await message_obj.edit_text(status_text, parse_mode="HTML")
+            except:
+                status_msg = None
+        else:
+            status_msg = None
+        
         async with aiohttp.ClientSession() as session:
-            for token_obj in token_list:
+            total_sent = 0
+            for account_idx, token_obj in enumerate(token_list, 1):
                 token = token_obj["token"]
                 token_name = token_obj.get("name", "Unknown")
                 
+                status_text += f"<b>[{account_idx}/{len(token_list)}] {html.escape(token_name)}</b>\n"
+                
                 # Discover users
                 filters = await get_user_filters(user_id, token) or {}
+                filter_nat = filters.get("filterNationalityCode", "")
+                filter_display = f" (Filter: {filter_nat})" if filter_nat else " (All)"
+                
+                status_text += f"Discovering users{filter_display}...\n"
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(status_text, parse_mode="HTML")
+                    except:
+                        pass
+                
                 user_ids = await _discover_users_for_automation(session, token, filters)
                 
                 if not user_ids:
+                    status_text += f"❌ No users found\n\n"
                     await add_automation_log(user_id, f"[{token_name}] No users discovered")
+                    if status_msg:
+                        try:
+                            await status_msg.edit_text(status_text, parse_mode="HTML")
+                        except:
+                            pass
                     continue
+                
+                status_text += f"✓ Found {len(user_ids)} user(s)\n"
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(status_text, parse_mode="HTML")
+                    except:
+                        pass
                 
                 sent_count = 0
                 for person_id in user_ids:
@@ -722,6 +762,7 @@ async def run_automation_action(user_id: int, token_list: list):
                     success = await _send_friend_request_for_automation(session, token, person_id)
                     if success:
                         sent_count += 1
+                        total_sent += 1
                         await set_automation_add_time(user_id, token, person_id)
                         
                         # Send lounge message after 5 seconds
@@ -741,11 +782,32 @@ async def run_automation_action(user_id: int, token_list: list):
                     await asyncio.sleep(1)
                 
                 await set_automation_last_request_time(user_id, token)
+                status_text += f"Sent: {sent_count} requests\n\n"
+                if status_msg:
+                    try:
+                        await status_msg.edit_text(status_text, parse_mode="HTML")
+                    except:
+                        pass
+                
                 if sent_count > 0:
                     await add_automation_log(user_id, f"[{token_name}] Action cycle: {sent_count} requests sent")
                 
                 await asyncio.sleep(2)
+        
+        status_text += f"\n<b>✓ Automation Complete</b>\nTotal Requests: <b>{total_sent}</b>"
+        if status_msg:
+            try:
+                await status_msg.edit_text(status_text, parse_mode="HTML")
+            except:
+                pass
+        
     except Exception as e:
+        status_text += f"\n<b>❌ Error:</b> {str(e)[:60]}"
+        if status_msg:
+            try:
+                await status_msg.edit_text(status_text, parse_mode="HTML")
+            except:
+                pass
         await add_automation_log(user_id, f"Action error: {str(e)[:80]}")
 
 
@@ -1145,8 +1207,6 @@ async def callback_handler(callback_query: CallbackQuery):
         if not settings.get("chatroom_message"):
             return await callback_query.answer("Set a chatroom message first!", show_alert=True)
         
-        await callback_query.answer("Starting automation cycle...")
-        
         # Get the tokens to use based on selection
         selected = settings.get("selected_accounts", "all")
         if selected == "all":
@@ -1162,8 +1222,8 @@ async def callback_handler(callback_query: CallbackQuery):
                     if tok.get("active", True):
                         token_list.append(tok)
         
-        # Run immediately in background
-        asyncio.create_task(run_automation_action(user_id, token_list))
+        # Run immediately with status message
+        asyncio.create_task(run_automation_action(user_id, token_list, callback_query.message))
         await add_automation_log(user_id, "Manual action triggered: sending requests & messages")
 
     elif data == "auto_view_log":
@@ -1287,6 +1347,68 @@ async def callback_handler(callback_query: CallbackQuery):
             await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
         else:
             await callback_query.answer("Failed to toggle batch status.", show_alert=True)
+
+    elif data.startswith("batch_acc_filter|"):
+        # Individual account nationality filter within a batch
+        parts = data.split("|")
+        if len(parts) >= 3:
+            batch_name = parts[1]
+            try:
+                global_index = int(parts[2])
+                tokens = await get_tokens(user_id)
+                if 0 <= global_index < len(tokens):
+                    tok = tokens[global_index]
+                    token_filters = (await get_all_user_filters(user_id)).get(tok['token'], {})
+                    current_nat = token_filters.get("filterNationalityCode", "")
+                    
+                    # Create nationality menu
+                    buttons = []
+                    all_mark = "> " if not current_nat else "  "
+                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_acc_nat_all|{batch_name}|{global_index}")])
+                    
+                    row = []
+                    for i, (code, name) in enumerate(NATIONALITY_LIST):
+                        mark = "> " if current_nat == code else ""
+                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_acc_nat_{code}|{batch_name}|{global_index}"))
+                        if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
+                            buttons.append(row)
+                            row = []
+                    
+                    buttons.append([InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")])
+                    await callback_query.message.edit_text(
+                        f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                        parse_mode="HTML"
+                    )
+            except (ValueError, IndexError):
+                await callback_query.answer("Invalid account.", show_alert=True)
+
+    elif data.startswith("batch_acc_nat_"):
+        # Handle account nationality selection
+        parts = data.split("|")
+        if len(parts) >= 3:
+            nat_code = parts[0].replace("batch_acc_nat_", "")
+            batch_name = parts[1]
+            try:
+                global_index = int(parts[2])
+                tokens = await get_tokens(user_id)
+                if 0 <= global_index < len(tokens):
+                    tok = tokens[global_index]
+                    
+                    if nat_code == "all":
+                        # Remove nationality filter (set to empty)
+                        await set_individual_spam_filter(user_id, tok['token'], "", None)
+                    else:
+                        # Set nationality filter
+                        await set_individual_spam_filter(user_id, tok['token'], nat_code, None)
+                    
+                    await callback_query.answer(f"Filter set to {nat_code or 'All'}")
+                    
+                    # Refresh the batch view
+                    batch = await get_batch_by_name(user_id, batch_name)
+                    await show_batch_accounts_menu(callback_query, batch_name)
+            except (ValueError, IndexError):
+                await callback_query.answer("Invalid account.", show_alert=True)
 
     elif data.startswith("batch_filter_"):
         batch_name = data.replace("batch_filter_", "")
