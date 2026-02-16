@@ -720,7 +720,7 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
         buttons.append([
             InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text=f"{nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
 
