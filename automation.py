@@ -17,7 +17,7 @@ from db import (
 )
 from lounge import send_lounge, send_lounge_all_tokens
 from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
-from requests import run_requests, process_all_tokens
+from friend_requests import run_requests, process_all_tokens
 
 logger = logging.getLogger(__name__)
 
