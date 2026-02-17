@@ -131,12 +131,16 @@ async def update_ui(user_id, force_new=False):
 
     try:
         await msg.edit_text(text, parse_mode="HTML")
-    except Exception:
-        if bot:
-            try:
-                new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
-                status_messages[user_id] = new_msg
-            except: pass
+    except Exception as e:
+        err = str(e).lower()
+        if "not modified" in err:
+            return
+        if "message to edit not found" in err or "message_id_invalid" in err:
+            if bot:
+                try:
+                    new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
+                    status_messages[user_id] = new_msg
+                except: pass
 
 def reset_ui(user_id):
     ui_stats_state[user_id] = {}
