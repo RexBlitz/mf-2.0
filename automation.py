@@ -1,5 +1,9 @@
 """
-Automation Module - Sequential Processing with Daily UI Refresh.
+Automation Module - Sequential Processing (One-by-One) with Cumulative UI.
+- Runs one account at a time.
+- 24h Cycle + Follow-up Waves (20m, 1h, 6h).
+- Persistent Row-based UI.
+- Fixed: Stop Crash & Double Message issues.
 """
 
 import asyncio
@@ -24,15 +28,15 @@ logger = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
 monitor_task: asyncio.Task = None
-status_messages: Dict[int, object] = {} # Stores the Message object
-user_bots: Dict[int, object] = {}       # Stores the Bot object per user
+status_messages: Dict[int, object] = {} # Stores Message object
+user_bots: Dict[int, object] = {}       # Stores Bot object
 
-# Stores the LIVE UI rows: { user_id: { token: "Account 1: Sent 5..." } }
+# Stores the LIVE UI rows: { user_id: { token: "Account 1: Sent 5 | Filtered 0" } }
 ui_rows_state: Dict[int, Dict[str, str]] = {}
 ui_totals_state: Dict[int, Dict[str, int]] = {}
 
 # --- TIMINGS ---
-PER_USER_DELAY = 0.5  # Fast
+PER_USER_DELAY = 0.5  # Fast Speed
 PER_BATCH_DELAY = 1
 
 BASE_HEADERS = {
@@ -40,7 +44,7 @@ BASE_HEADERS = {
     'Accept-Encoding': "gzip",
 }
 
-# --- API HELPERS (Same as before) ---
+# --- API HELPERS ---
 
 async def _discover_users(session: aiohttp.ClientSession, token: str, filters: dict = None) -> List[Dict]:
     url = "https://api.meeff.com/user/explore/v2/"
@@ -68,6 +72,7 @@ async def _send_msg(session, token, person_id, msg, type="lounge"):
     headers = {**BASE_HEADERS, 'meeff-access-token': token, 'Content-Type': "application/json"}
     try:
         if type == "chat":
+            # Open Room
             async with session.post("https://api.meeff.com/chatroom/open/v2", headers=headers, json={"waitingRoomId": person_id, "locale": "en"}, timeout=10) as resp:
                 if resp.status == 412: return "DISABLED"
                 if resp.status != 200: return False
@@ -86,7 +91,8 @@ async def _send_msg(session, token, person_id, msg, type="lounge"):
 async def update_ui(user_id, force_new=False):
     """
     Updates the UI.
-    If 'force_new' is True OR if editing fails (message deleted), it sends a NEW message.
+    If 'force_new' is True OR if we don't have a message yet, sends a NEW one.
+    Otherwise, edits the existing one.
     """
     rows = ui_rows_state.get(user_id, {})
     totals = ui_totals_state.get(user_id, {"sent": 0, "filtered": 0})
@@ -99,22 +105,22 @@ async def update_ui(user_id, force_new=False):
     bot = user_bots.get(user_id)
     msg = status_messages.get(user_id)
 
-    # If we need a new message or don't have one yet
+    # 1. Send NEW message if forced or missing
     if force_new or not msg:
         if bot:
             try:
                 new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
-                status_messages[user_id] = new_msg # Update reference
+                status_messages[user_id] = new_msg 
             except Exception as e:
                 logger.error(f"Failed to send new status: {e}")
         return
 
-    # Try to edit existing
+    # 2. Edit EXISTING message
     try:
         await msg.edit_text(text, parse_mode="HTML")
     except Exception as e:
-        # If edit fails (message deleted/too old), send a new one
-        if bot:
+        # If edit fails (e.g. message deleted), recover by sending a new one
+        if "message is not modified" not in str(e) and bot:
             try:
                 new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
                 status_messages[user_id] = new_msg
@@ -158,15 +164,10 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
             should_run_requests = True
 
     if should_run_requests:
-        # === NEW DAY DETECTED ===
-        # Reset UI counts and send a FRESH message for visibility
-        if not ui_totals_state.get(user_id, {}).get("sent", 0): 
-             # Only reset if we haven't already started a run for another account in this loop
-             pass 
-        
-        # Force a new message if it's the first account starting a new day
+        # Update Row to "Sending..."
         add_to_ui_row(user_id, token, name, 0, 0, "Sending Requests...")
-        await update_ui(user_id, force_new=True) # <--- SENDS NEW MESSAGE HERE
+        # REMOVED force_new=True to prevent double messages. It will just edit the "Checking..." message.
+        await update_ui(user_id) 
         
         await run_requests_task(user_id, token_obj, session)
         
@@ -184,7 +185,10 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
     lounge_msg = settings.get("lounge_message")
     chat_msg = settings.get("chatroom_message")
     
-    if not lounge_msg or not chat_msg: return
+    if not lounge_msg or not chat_msg: 
+        add_to_ui_row(user_id, token, name, 0, 0, "No Msg Set")
+        await update_ui(user_id)
+        return
 
     now = datetime.utcnow()
     messages_sent = 0
@@ -286,7 +290,7 @@ async def run_requests_task(user_id, token_obj, session):
 async def monitor_loop(user_id: int):
     logger.info(f"Sequential Monitor Started for {user_id}")
     
-    # Send initial status message if we have the bot
+    # Send the INITIAL status message
     await update_ui(user_id, force_new=True)
     
     while True:
@@ -323,7 +327,6 @@ async def run_automation_action(user_id: int, status_msg):
     global monitor_task
     
     status_messages[user_id] = status_msg
-    # We don't have 'bot' here usually, but status_msg has .bot
     if status_msg and hasattr(status_msg, 'bot'):
         user_bots[user_id] = status_msg.bot
 
@@ -331,7 +334,6 @@ async def run_automation_action(user_id: int, status_msg):
     
     if monitor_task and not monitor_task.done(): monitor_task.cancel()
     
-    # Clear UI for fresh manual run
     reset_ui(user_id)
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
@@ -339,7 +341,7 @@ def start_automation(user_id: int, bot):
     """Called from Main / Startup."""
     global monitor_task
     
-    user_bots[user_id] = bot # Store bot for sending messages later
+    user_bots[user_id] = bot
     asyncio.create_task(set_automation_enabled(user_id, True))
     
     if monitor_task and not monitor_task.done(): return
@@ -347,6 +349,7 @@ def start_automation(user_id: int, bot):
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def stop_automation(user_id: int):
+    """Safe stop function."""
     global monitor_task
     asyncio.create_task(set_automation_enabled(user_id, False))
     
@@ -354,9 +357,14 @@ def stop_automation(user_id: int):
         monitor_task.cancel()
         monitor_task = None
     
-    msg = status_messages.get(user_id)
-    if msg:
-        asyncio.create_task(msg.edit_text("🛑 <b>Automation Stopped</b>", parse_mode="HTML"))
+    # SAFE ASYNC EDIT WRAPPER
+    async def _safe_stop_msg():
+        msg = status_messages.get(user_id)
+        if msg:
+            try: await msg.edit_text("🛑 <b>Automation Stopped</b>", parse_mode="HTML")
+            except: pass
+    
+    asyncio.create_task(_safe_stop_msg())
 
 def is_automation_running(user_id: int) -> bool:
     global monitor_task
