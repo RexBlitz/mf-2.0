@@ -1,19 +1,29 @@
-"""Automation Module - Continuous batches, live updates, and filtered counts."""
+"""Automation Module - 24h Cycle with Targeted Follow-ups & Database Persistence."""
 
 import asyncio
 import aiohttp
 import logging
-from typing import List, Dict
+import time
+from typing import List, Dict, Set
 
 from db import (
     get_automation_settings, get_active_tokens, get_tokens, 
     get_user_filters, bulk_add_sent_ids, is_already_sent,
-    get_blocked_users, add_automation_log, get_individual_spam_filter
+    get_blocked_users, add_automation_log, get_individual_spam_filter,
+    set_automation_enabled, is_automation_running as db_is_running
 )
 from filters import apply_filter_for_account
 
 logger = logging.getLogger(__name__)
-automation_enabled = {}
+
+# --- GLOBAL STATE ---
+automation_tasks: Dict[int, asyncio.Task] = {}
+automation_status_msgs: Dict[int, object] = {}
+
+# --- TIMINGS (Original Fast Speed) ---
+PER_USER_DELAY = 0.5  #
+PER_BATCH_DELAY = 1
+EMPTY_BATCH_DELAY = 2
 
 BASE_HEADERS = {
     'User-Agent': "okhttp/5.1.0",
@@ -23,16 +33,9 @@ BASE_HEADERS = {
 # --- DISCOVERY & API HELPERS ---
 
 async def _discover_users(session: aiohttp.ClientSession, token: str, filters: dict = None) -> List[Dict]:
-    """Discover users (Continuous Fetching Mode)."""
     url = "https://api.meeff.com/user/explore/v2/"
     headers = {**BASE_HEADERS, 'meeff-access-token': token}
-    
-    params = {
-        "lng": "71.9140141", 
-        "unreachableUserIds": "", 
-        "lat": "29.6264544", 
-        "locale": "en"
-    }
+    params = {"lng": "71.9140141", "unreachableUserIds": "", "lat": "29.6264544", "locale": "en"}
     
     if filters and filters.get("filterNationalityCode"):
         params["filterNationalityCode"] = filters["filterNationalityCode"]
@@ -81,279 +84,234 @@ async def _send_chatroom_msg(session, token, person_id, message):
     except: return False
 
 # --- LIVE STATUS UPDATER ---
-async def update_live_status(status_msg, header, current_acc_info, total_sent, total_filtered, recent_log):
-    """Updates Telegram message with live stats including filtered count."""
+async def update_live_status(status_msg, header, sub_header, details):
+    """Updates Telegram message with live stats."""
+    if not status_msg: return
     try:
-        text = (
-            f"{header}\n"
-            f"📊 <b>Sent:</b> {total_sent} | <b>Filtered:</b> {total_filtered}\n\n"
-            f"{current_acc_info}\n"
-            f"📝 {recent_log}"
-        )
+        text = f"{header}\n\n{sub_header}\n{details}"
         await status_msg.edit_text(text, parse_mode="HTML")
     except Exception:
         pass
 
-# --- CORE AUTOMATION FUNCTIONS ---
+# --- AUTOMATION CYCLE ENGINE ---
 
-async def run_auto_requests(user_id: int, status_msg, token_list: List[Dict]):
-    """1. Friend Request Automation"""
-    total_sent = 0
-    total_filtered = 0
-    blocked_users = await get_blocked_users(user_id)
+async def automation_cycle(user_id: int):
+    """The 24h Cycle: Req -> 20m -> L/C -> 1h -> L/C -> 6h -> L/C -> Sleep."""
+    try:
+        status_msg = automation_status_msgs.get(user_id)
+        
+        while True:
+            cycle_start = time.time()
+            
+            # --- 1. SEND REQUESTS ---
+            successful_targets = await run_auto_requests(user_id, status_msg)
+            
+            if not successful_targets:
+                await update_live_status(status_msg, "⚠️ <b>Cycle Paused</b>", "No requests sent.", "Retrying in 1 hour...")
+                await asyncio.sleep(3600)
+                continue
+
+            # --- 2. WAIT 20 MINUTES ---
+            await wait_with_countdown(user_id, status_msg, 20 * 60, "Follow-up Wave 1 (20m)")
+
+            # --- 3. WAVE 1: LOUNGE -> CHAT ---
+            await run_target_lounge(user_id, status_msg, successful_targets, "Wave 1: Lounge")
+            await run_target_chat(user_id, status_msg, successful_targets, "Wave 1: Chat")
+
+            # --- 4. WAIT 1 HOUR ---
+            await wait_with_countdown(user_id, status_msg, 60 * 60, "Follow-up Wave 2 (1h)")
+
+            # --- 5. WAVE 2: LOUNGE -> CHAT ---
+            await run_target_lounge(user_id, status_msg, successful_targets, "Wave 2: Lounge")
+            await run_target_chat(user_id, status_msg, successful_targets, "Wave 2: Chat")
+
+            # --- 6. WAIT 6 HOURS ---
+            await wait_with_countdown(user_id, status_msg, 6 * 60 * 60, "Follow-up Wave 3 (6h)")
+
+            # --- 7. WAVE 3: LOUNGE -> CHAT ---
+            await run_target_lounge(user_id, status_msg, successful_targets, "Wave 3: Lounge")
+            await run_target_chat(user_id, status_msg, successful_targets, "Wave 3: Chat")
+
+            # --- 8. FINISH 24H CYCLE ---
+            elapsed = time.time() - cycle_start
+            remaining = (24 * 60 * 60) - elapsed
+            if remaining > 0:
+                await wait_with_countdown(user_id, status_msg, int(remaining), "Next Daily Cycle")
+
+    except asyncio.CancelledError:
+        logger.info(f"Automation stopped for {user_id}")
+    except Exception as e:
+        logger.error(f"Cycle Error: {e}")
+        if status_msg: await status_msg.edit_text(f"❌ <b>Error:</b> {str(e)[:50]}", parse_mode="HTML")
+
+async def wait_with_countdown(user_id, status_msg, seconds, phase_name):
+    """Sleeps with a countdown UI."""
+    end_time = time.time() + seconds
+    while time.time() < end_time:
+        if user_id not in automation_tasks: raise asyncio.CancelledError
+        
+        remaining = int(end_time - time.time())
+        m, s = divmod(remaining, 60)
+        h, m = divmod(m, 60)
+        
+        await update_live_status(
+            status_msg, 
+            "😴 <b>Automation Sleeping</b>", 
+            f"<b>Waiting For:</b> {phase_name}", 
+            f"⏳ Resuming in: {h}h {m}m {s}s"
+        )
+        await asyncio.sleep(min(remaining, 60))
+
+# --- WORKER FUNCTIONS ---
+
+async def run_auto_requests(user_id, status_msg) -> List[Dict]:
+    """Sends requests and returns list of {token, pid} for follow-ups."""
+    settings = await get_automation_settings(user_id)
+    token_list = await get_target_tokens(user_id, settings)
+    
+    total_sent, total_filtered = 0, 0
+    successful_targets = [] # Stores (token, pid) pairs
+    
+    blocked = await get_blocked_users(user_id)
     is_spam_on = await get_individual_spam_filter(user_id, "request")
     
-    header = f"📨 <b>Request Auto Started</b>\nAccounts: {len(token_list)}"
-    await update_live_status(status_msg, header, "🚀 Starting...", 0, 0, "")
+    header = f"📨 <b>Sending Requests</b>\nAccounts: {len(token_list)}"
 
     async with aiohttp.ClientSession() as session:
         for idx, token_obj in enumerate(token_list, 1):
-            if not is_automation_running(user_id): break
+            if user_id not in automation_tasks: break
             
             token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
-            acc_sent = 0
-            acc_filtered = 0
-            empty_batches = 0
-            
             await apply_filter_for_account(token, user_id)
             filters = await get_user_filters(user_id, token) or {}
             
-            # Continuous Batch Loop
+            acc_sent = 0
+            # Run batches until limit or empty
             while True:
-                if not is_automation_running(user_id): break
-                
-                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
-                await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "🔎 Fetching batch...")
+                if user_id not in automation_tasks: break
                 
                 users = await _discover_users(session, token, filters)
+                if not users: break 
                 
-                if not users:
-                    empty_batches += 1
-                    await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"🔸 Empty batch {empty_batches}/5")
-                    if empty_batches >= 5: break 
-                    await asyncio.sleep(2)
-                    continue
-                
-                empty_batches = 0
                 sent_ids = await is_already_sent(user_id, "request", None, bulk=True) if is_spam_on else set()
                 ids_to_save = []
                 limit_reached = False
-
+                
                 for user in users:
-                    if not is_automation_running(user_id): break
-                    
+                    if user_id not in automation_tasks: break
                     pid = user.get("_id")
-                    # Filter Logic
-                    if not pid or pid in blocked_users or pid in sent_ids:
-                        acc_filtered += 1
+                    if not pid or pid in blocked or pid in sent_ids:
                         total_filtered += 1
                         continue
                     
                     res = await _send_friend_request(session, token, pid)
-                    
                     if res == "LIMIT": 
-                        limit_reached = True
-                        break
+                        limit_reached = True; break
                     
                     if res == "OK":
-                        acc_sent += 1
-                        total_sent += 1
-                        sent_ids.add(pid)
-                        ids_to_save.append(pid)
+                        acc_sent += 1; total_sent += 1
+                        sent_ids.add(pid); ids_to_save.append(pid)
+                        successful_targets.append({"token": token, "pid": pid})
                         
-                        # Update UI
-                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
-                        if acc_sent % 2 == 0:
-                            await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"✅ Sent to ...{pid[-4:]}")
+                        if acc_sent % 5 == 0:
+                            await update_live_status(status_msg, header, f"Processing: {name}", f"⚡ Sent: {total_sent} | Filtered: {total_filtered}")
                         
-                        await asyncio.sleep(1.5)
-
+                        await asyncio.sleep(PER_USER_DELAY)
+                
                 if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "request", ids_to_save)
-                
-                if limit_reached:
-                    await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "⚠️ Limit Reached - Next Account")
-                    await asyncio.sleep(2)
-                    break 
-                
-                await asyncio.sleep(1)
+                if limit_reached: break
+                await asyncio.sleep(PER_BATCH_DELAY)
+            
+            if acc_sent > 0: await add_automation_log(user_id, f"[{name}] Requests: {acc_sent}")
 
-            if acc_sent > 0:
-                await add_automation_log(user_id, f"[{name}] Requests: {acc_sent}")
+    return successful_targets
 
-    final = f"📨 <b>Request Summary</b>\nSent: {total_sent} | Filtered: {total_filtered}\n✅ Done"
-    await status_msg.edit_text(final, parse_mode="HTML")
+async def run_target_lounge(user_id, status_msg, targets, phase_name):
+    """Sends Lounge messages to specific targets from previous request cycle."""
+    settings = await get_automation_settings(user_id)
+    msg = settings.get("lounge_message")
+    if not msg: return
 
-
-async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], message: str):
-    """2. Lounge Automation"""
-    total_sent = 0
-    total_filtered = 0
-    blocked_users = await get_blocked_users(user_id)
-    is_spam_on = await get_individual_spam_filter(user_id, "lounge")
+    header = f"📢 <b>{phase_name}</b>\nTargets: {len(targets)}"
+    sent_count = 0
     
-    header = f"📢 <b>Lounge Auto Started</b>\nAccounts: {len(token_list)}"
-    await update_live_status(status_msg, header, "🚀 Starting...", 0, 0, "")
-
     async with aiohttp.ClientSession() as session:
-        for idx, token_obj in enumerate(token_list, 1):
-            if not is_automation_running(user_id): break
+        for i, target in enumerate(targets):
+            if user_id not in automation_tasks: break
             
-            token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
-            acc_sent = 0
-            acc_filtered = 0
-            empty_batches = 0
-            
-            await apply_filter_for_account(token, user_id)
-            filters = await get_user_filters(user_id, token) or {}
-
-            while True:
-                if not is_automation_running(user_id): break
-                
-                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
-                await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "🔎 Fetching batch...")
-                
-                users = await _discover_users(session, token, filters)
-                
-                if not users:
-                    empty_batches += 1
-                    if empty_batches >= 3: break 
-                    await asyncio.sleep(2)
-                    continue
-
-                sent_ids = await is_already_sent(user_id, "lounge", None, bulk=True) if is_spam_on else set()
-                ids_to_save = []
-                
-                for user in users:
-                    if not is_automation_running(user_id): break
-                    
-                    pid = user.get("_id")
-                    if not pid or pid in blocked_users or pid in sent_ids:
-                        acc_filtered += 1
-                        total_filtered += 1
-                        continue
-                    
-                    if await _send_lounge_msg(session, token, pid, message):
-                        acc_sent += 1
-                        total_sent += 1
-                        sent_ids.add(pid)
-                        ids_to_save.append(pid)
-                        
-                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
-                        if acc_sent % 2 == 0:
-                            await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"✅ Msg to ...{pid[-4:]}")
-                        await asyncio.sleep(2.5)
-
-                if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "lounge", ids_to_save)
-                
-                await asyncio.sleep(1)
-
-            if acc_sent > 0: await add_automation_log(user_id, f"[{name}] Lounge: {acc_sent}")
-
-    final = f"📢 <b>Lounge Summary</b>\nSent: {total_sent} | Filtered: {total_filtered}\n✅ Done"
-    await status_msg.edit_text(final, parse_mode="HTML")
-
-
-async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], message: str):
-    """3. Chatroom Automation"""
-    total_sent = 0
-    total_filtered = 0
-    blocked_users = await get_blocked_users(user_id)
-    is_spam_on = await get_individual_spam_filter(user_id, "chatroom")
+            if await _send_lounge_msg(session, target['token'], target['pid'], msg):
+                sent_count += 1
+                if sent_count % 5 == 0:
+                    await update_live_status(status_msg, header, "Sending messages...", f"⚡ Sent: {sent_count}/{len(targets)}")
+                await asyncio.sleep(PER_USER_DELAY)
     
-    header = f"💬 <b>Chatroom Auto Started</b>\nAccounts: {len(token_list)}"
-    await update_live_status(status_msg, header, "🚀 Starting...", 0, 0, "")
+    await add_automation_log(user_id, f"{phase_name}: {sent_count} sent")
 
+async def run_target_chat(user_id, status_msg, targets, phase_name):
+    """Sends Chat messages to specific targets."""
+    settings = await get_automation_settings(user_id)
+    msg = settings.get("chatroom_message")
+    if not msg: return
+
+    header = f"💬 <b>{phase_name}</b>\nTargets: {len(targets)}"
+    sent_count = 0
+    
     async with aiohttp.ClientSession() as session:
-        for idx, token_obj in enumerate(token_list, 1):
-            if not is_automation_running(user_id): break
+        for i, target in enumerate(targets):
+            if user_id not in automation_tasks: break
             
-            token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
-            acc_sent = 0
-            acc_filtered = 0
-            empty_batches = 0
+            res = await _send_chatroom_msg(session, target['token'], target['pid'], msg)
+            if res and res != "DISABLED":
+                sent_count += 1
+                if sent_count % 5 == 0:
+                    await update_live_status(status_msg, header, "Sending messages...", f"⚡ Sent: {sent_count}/{len(targets)}")
             
-            await apply_filter_for_account(token, user_id)
-            filters = await get_user_filters(user_id, token) or {}
+            await asyncio.sleep(PER_USER_DELAY)
 
-            while True:
-                if not is_automation_running(user_id): break
-                
-                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
-                await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "🔎 Fetching batch...")
-                
-                users = await _discover_users(session, token, filters)
-                
-                if not users:
-                    empty_batches += 1
-                    if empty_batches >= 3: break 
-                    await asyncio.sleep(2)
-                    continue
+    await add_automation_log(user_id, f"{phase_name}: {sent_count} sent")
 
-                sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if is_spam_on else set()
-                ids_to_save = []
-                
-                for user in users:
-                    if not is_automation_running(user_id): break
-                    pid = user.get("_id")
-                    if not pid or pid in blocked_users or pid in sent_ids:
-                        acc_filtered += 1
-                        total_filtered += 1
-                        continue
-                    
-                    res = await _send_chatroom_msg(session, token, pid, message)
-                    if res == "DISABLED": continue
-                    if res:
-                        acc_sent += 1
-                        total_sent += 1
-                        sent_ids.add(pid)
-                        ids_to_save.append(pid)
-                        
-                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
-                        if acc_sent % 2 == 0:
-                            await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"✅ Msg to ...{pid[-4:]}")
-                        await asyncio.sleep(2.5)
+async def get_target_tokens(user_id, settings):
+    selected = settings.get("selected_accounts", "all")
+    if selected == "all": return await get_tokens(user_id)
+    if selected == "active_only": return await get_active_tokens(user_id)
+    all_toks = await get_tokens(user_id)
+    return [all_toks[i] for i in selected if 0 <= i < len(all_toks)]
 
-                if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "chatroom", ids_to_save)
-                
-                await asyncio.sleep(1)
+# --- CONTROL FUNCTIONS ---
 
-            if acc_sent > 0: await add_automation_log(user_id, f"[{name}] Chat: {acc_sent}")
+async def run_automation_action(user_id: int, status_msg):
+    """Entry point."""
+    automation_status_msgs[user_id] = status_msg
+    if user_id in automation_tasks: automation_tasks[user_id].cancel()
+    
+    # SAVE STATUS TO DB
+    await set_automation_enabled(user_id, True)
+    
+    task = asyncio.create_task(automation_cycle(user_id))
+    automation_tasks[user_id] = task
 
-    final = f"💬 <b>Chatroom Summary</b>\nSent: {total_sent} | Filtered: {total_filtered}\n✅ Done"
-    await status_msg.edit_text(final, parse_mode="HTML")
+def start_automation(user_id: int, bot):
+    """Starts automation (called from Main)."""
+    # Create the task loop
+    if user_id not in automation_tasks:
+        # Save ON state to DB
+        asyncio.create_task(set_automation_enabled(user_id, True))
+        
+        # NOTE: We don't have the original status message here if called from startup/command.
+        # It will be set when 'run_automation_action' is triggered or UI updates.
+        task = asyncio.create_task(automation_cycle(user_id))
+        automation_tasks[user_id] = task
 
-# --- DISPATCHER ---
+def stop_automation(user_id: int):
+    """Stops automation."""
+    # Save OFF state to DB
+    asyncio.create_task(set_automation_enabled(user_id, False))
+    
+    if user_id in automation_tasks:
+        automation_tasks[user_id].cancel()
+        del automation_tasks[user_id]
+        if user_id in automation_status_msgs:
+            asyncio.create_task(update_live_status(automation_status_msgs[user_id], "🛑 Stopped", "", ""))
 
-async def run_automation_action(user_id: int, status_msg, task_type: str = "request") -> None:
-    try:
-        settings = await get_automation_settings(user_id)
-        selected = settings.get("selected_accounts", "all")
-        if selected == "all": token_list = await get_tokens(user_id)
-        elif selected == "active_only": token_list = await get_active_tokens(user_id)
-        else:
-            all_tokens = await get_tokens(user_id)
-            token_list = [all_tokens[i] for i in selected if 0 <= i < len(all_tokens)]
-
-        if not token_list:
-            if status_msg: await status_msg.edit_text("❌ No accounts selected.", parse_mode="HTML")
-            return
-
-        if task_type == "request": await run_auto_requests(user_id, status_msg, token_list)
-        elif task_type == "lounge":
-            msg = settings.get("lounge_message")
-            if not msg: return await status_msg.edit_text("❌ Lounge msg not set.", parse_mode="HTML")
-            await run_auto_lounge(user_id, status_msg, token_list, msg)
-        elif task_type == "chat":
-            msg = settings.get("chatroom_message")
-            if not msg: return await status_msg.edit_text("❌ Chat msg not set.", parse_mode="HTML")
-            await run_auto_chat(user_id, status_msg, token_list, msg)
-        elif task_type == "all": await run_auto_requests(user_id, status_msg, token_list)
-
-    except Exception as e:
-        logger.error(f"Auto Error: {e}")
-        if status_msg: await status_msg.edit_text(f"❌ Error: {str(e)[:50]}", parse_mode="HTML")
-
-# --- CONTROL HELPERS ---
-def start_automation(user_id: int, bot): automation_enabled[user_id] = True
-def stop_automation(user_id: int): automation_enabled[user_id] = False
-def is_automation_running(user_id: int) -> bool: return automation_enabled.get(user_id, False)
+def is_automation_running(user_id: int) -> bool:
+    return user_id in automation_tasks
