@@ -36,6 +36,8 @@ from filters import (
 from allcountry import run_all_countries
 from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command
 from friend_requests import run_requests, process_all_tokens, user_states, stop_markup
+# --- NEW IMPORT ---
+from automation import start_automation
 
 # --- Configuration & Setup ---
 API_TOKEN = "7916536914:AAHwtvO8hfGl2U4xcfM1fAjMLNypPFEW5JQ"
@@ -968,9 +970,33 @@ async def set_bot_commands():
         ("password", "Enter password for access")]]
     await bot.set_my_commands(commands)
 
+async def resume_automation_tasks():
+    """Checks all users in DB and restarts automation if it was ON."""
+    try:
+        collections = await list_all_collections()
+        count = 0
+        for col in collections:
+            # Extract user_id from "user_12345"
+            try:
+                user_id = int(col['collection_name'].replace("user_", ""))
+                settings = await get_automation_settings(user_id)
+                if settings.get("enabled"):
+                    start_automation(user_id, bot)
+                    count += 1
+            except ValueError:
+                continue
+        if count > 0:
+            logger.info(f"♻️ Resumed automation for {count} users.")
+    except Exception as e:
+        logger.error(f"Failed to resume tasks: {e}")
+
 async def main():
     try:
         await set_bot_commands()
+        
+        # --- RESUME TASKS ---
+        await resume_automation_tasks()
+        
         dp.include_router(router)
         logger.info("Starting bot polling...")
         await dp.start_polling(bot)
