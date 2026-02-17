@@ -227,7 +227,6 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
         # Just update idle status if nothing happened
         current_row = ui_rows_state[user_id][token].split("(")[0].strip()
         ui_rows_state[user_id][token] = f"{current_row} (Idle)"
-        # Don't spam API with UI updates if nothing changed
         pass
 
 async def run_requests_task(user_id, token_obj, session):
@@ -340,6 +339,7 @@ async def monitor_loop(user_id: int):
 # --- CONTROL ---
 
 async def run_automation_action(user_id: int, status_msg):
+    global monitor_task
     status_messages[user_id] = status_msg
     await set_automation_enabled(user_id, True)
     
@@ -349,22 +349,21 @@ async def run_automation_action(user_id: int, status_msg):
     ui_rows_state[user_id] = {}
     ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
     
-    global monitor_task
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def start_automation(user_id: int, bot):
+    global monitor_task
     asyncio.create_task(set_automation_enabled(user_id, True))
     
     # Use existing task if running
-    global monitor_task
     if monitor_task and not monitor_task.done(): return
     
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def stop_automation(user_id: int):
+    global monitor_task
     asyncio.create_task(set_automation_enabled(user_id, False))
     
-    global monitor_task
     if monitor_task:
         monitor_task.cancel()
         monitor_task = None
@@ -374,4 +373,5 @@ def stop_automation(user_id: int):
         asyncio.create_task(msg.edit_text("🛑 <b>Automation Stopped</b>", parse_mode="HTML"))
 
 def is_automation_running(user_id: int) -> bool:
+    global monitor_task
     return monitor_task is not None and not monitor_task.done()
