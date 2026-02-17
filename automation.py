@@ -1,4 +1,4 @@
-"""Automation Module - Continuous batches per account with live updates."""
+"""Automation Module - Continuous batches, live updates, and filtered counts."""
 
 import asyncio
 import aiohttp
@@ -27,7 +27,6 @@ async def _discover_users(session: aiohttp.ClientSession, token: str, filters: d
     url = "https://api.meeff.com/user/explore/v2/"
     headers = {**BASE_HEADERS, 'meeff-access-token': token}
     
-    # Exact params from friend_requests.py
     params = {
         "lng": "71.9140141", 
         "unreachableUserIds": "", 
@@ -82,12 +81,12 @@ async def _send_chatroom_msg(session, token, person_id, message):
     except: return False
 
 # --- LIVE STATUS UPDATER ---
-async def update_live_status(status_msg, header, current_acc_info, total_sent, recent_log):
-    """Updates Telegram message with live stats."""
+async def update_live_status(status_msg, header, current_acc_info, total_sent, total_filtered, recent_log):
+    """Updates Telegram message with live stats including filtered count."""
     try:
         text = (
             f"{header}\n"
-            f"📊 <b>Total Sent:</b> {total_sent}\n\n"
+            f"📊 <b>Sent:</b> {total_sent} | <b>Filtered:</b> {total_filtered}\n\n"
             f"{current_acc_info}\n"
             f"📝 {recent_log}"
         )
@@ -98,13 +97,14 @@ async def update_live_status(status_msg, header, current_acc_info, total_sent, r
 # --- CORE AUTOMATION FUNCTIONS ---
 
 async def run_auto_requests(user_id: int, status_msg, token_list: List[Dict]):
-    """1. Friend Request Automation (Continuous Batching)"""
+    """1. Friend Request Automation"""
     total_sent = 0
+    total_filtered = 0
     blocked_users = await get_blocked_users(user_id)
     is_spam_on = await get_individual_spam_filter(user_id, "request")
     
     header = f"📨 <b>Request Auto Started</b>\nAccounts: {len(token_list)}"
-    await update_live_status(status_msg, header, "🚀 Starting...", 0, "")
+    await update_live_status(status_msg, header, "🚀 Starting...", 0, 0, "")
 
     async with aiohttp.ClientSession() as session:
         for idx, token_obj in enumerate(token_list, 1):
@@ -112,30 +112,29 @@ async def run_auto_requests(user_id: int, status_msg, token_list: List[Dict]):
             
             token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
             acc_sent = 0
+            acc_filtered = 0
             empty_batches = 0
             
-            # Apply Filter
             await apply_filter_for_account(token, user_id)
             filters = await get_user_filters(user_id, token) or {}
             
-            # === CONTINUOUS BATCH LOOP ===
+            # Continuous Batch Loop
             while True:
                 if not is_automation_running(user_id): break
                 
-                # Update Status: Fetching
-                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Requests Sent: {acc_sent}"
-                await update_live_status(status_msg, header, acc_info, total_sent, "🔎 Fetching batch...")
+                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
+                await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "🔎 Fetching batch...")
                 
                 users = await _discover_users(session, token, filters)
                 
                 if not users:
                     empty_batches += 1
-                    await update_live_status(status_msg, header, acc_info, total_sent, f"🔸 Empty batch {empty_batches}/5")
-                    if empty_batches >= 5: break # Move to next account after 5 empty tries
+                    await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"🔸 Empty batch {empty_batches}/5")
+                    if empty_batches >= 5: break 
                     await asyncio.sleep(2)
                     continue
                 
-                empty_batches = 0 # Reset if users found
+                empty_batches = 0
                 sent_ids = await is_already_sent(user_id, "request", None, bulk=True) if is_spam_on else set()
                 ids_to_save = []
                 limit_reached = False
@@ -144,7 +143,11 @@ async def run_auto_requests(user_id: int, status_msg, token_list: List[Dict]):
                     if not is_automation_running(user_id): break
                     
                     pid = user.get("_id")
-                    if not pid or pid in blocked_users or pid in sent_ids: continue
+                    # Filter Logic
+                    if not pid or pid in blocked_users or pid in sent_ids:
+                        acc_filtered += 1
+                        total_filtered += 1
+                        continue
                     
                     res = await _send_friend_request(session, token, pid)
                     
@@ -158,38 +161,38 @@ async def run_auto_requests(user_id: int, status_msg, token_list: List[Dict]):
                         sent_ids.add(pid)
                         ids_to_save.append(pid)
                         
-                        # LIVE UPDATE PER USER
-                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Requests Sent: {acc_sent}"
-                        if acc_sent % 2 == 0: # Update every 2nd user to prevent flood limits
-                            await update_live_status(status_msg, header, acc_info, total_sent, f"✅ Sent to ...{pid[-4:]}")
+                        # Update UI
+                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
+                        if acc_sent % 2 == 0:
+                            await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"✅ Sent to ...{pid[-4:]}")
                         
-                        await asyncio.sleep(1.5) # Speed control
+                        await asyncio.sleep(1.5)
 
                 if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "request", ids_to_save)
                 
                 if limit_reached:
-                    await update_live_status(status_msg, header, acc_info, total_sent, "⚠️ Limit Reached - Next Account")
+                    await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "⚠️ Limit Reached - Next Account")
                     await asyncio.sleep(2)
                     break 
                 
-                await asyncio.sleep(1) # Delay between batches
+                await asyncio.sleep(1)
 
-            # Log Account Completion
             if acc_sent > 0:
                 await add_automation_log(user_id, f"[{name}] Requests: {acc_sent}")
 
-    final = f"📨 <b>Request Summary</b>\nTotal Sent: {total_sent}\n✅ Done"
+    final = f"📨 <b>Request Summary</b>\nSent: {total_sent} | Filtered: {total_filtered}\n✅ Done"
     await status_msg.edit_text(final, parse_mode="HTML")
 
 
 async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], message: str):
-    """2. Lounge Automation (Continuous Batching)"""
+    """2. Lounge Automation"""
     total_sent = 0
+    total_filtered = 0
     blocked_users = await get_blocked_users(user_id)
     is_spam_on = await get_individual_spam_filter(user_id, "lounge")
     
     header = f"📢 <b>Lounge Auto Started</b>\nAccounts: {len(token_list)}"
-    await update_live_status(status_msg, header, "🚀 Starting...", 0, "")
+    await update_live_status(status_msg, header, "🚀 Starting...", 0, 0, "")
 
     async with aiohttp.ClientSession() as session:
         for idx, token_obj in enumerate(token_list, 1):
@@ -197,6 +200,7 @@ async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], mess
             
             token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
             acc_sent = 0
+            acc_filtered = 0
             empty_batches = 0
             
             await apply_filter_for_account(token, user_id)
@@ -205,8 +209,8 @@ async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], mess
             while True:
                 if not is_automation_running(user_id): break
                 
-                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Lounge Sent: {acc_sent}"
-                await update_live_status(status_msg, header, acc_info, total_sent, "🔎 Fetching batch...")
+                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
+                await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "🔎 Fetching batch...")
                 
                 users = await _discover_users(session, token, filters)
                 
@@ -223,7 +227,10 @@ async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], mess
                     if not is_automation_running(user_id): break
                     
                     pid = user.get("_id")
-                    if not pid or pid in blocked_users or pid in sent_ids: continue
+                    if not pid or pid in blocked_users or pid in sent_ids:
+                        acc_filtered += 1
+                        total_filtered += 1
+                        continue
                     
                     if await _send_lounge_msg(session, token, pid, message):
                         acc_sent += 1
@@ -231,9 +238,9 @@ async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], mess
                         sent_ids.add(pid)
                         ids_to_save.append(pid)
                         
-                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Lounge Sent: {acc_sent}"
+                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
                         if acc_sent % 2 == 0:
-                            await update_live_status(status_msg, header, acc_info, total_sent, f"✅ Msg to ...{pid[-4:]}")
+                            await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"✅ Msg to ...{pid[-4:]}")
                         await asyncio.sleep(2.5)
 
                 if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "lounge", ids_to_save)
@@ -242,18 +249,19 @@ async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], mess
 
             if acc_sent > 0: await add_automation_log(user_id, f"[{name}] Lounge: {acc_sent}")
 
-    final = f"📢 <b>Lounge Summary</b>\nTotal Sent: {total_sent}\n✅ Done"
+    final = f"📢 <b>Lounge Summary</b>\nSent: {total_sent} | Filtered: {total_filtered}\n✅ Done"
     await status_msg.edit_text(final, parse_mode="HTML")
 
 
 async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], message: str):
-    """3. Chatroom Automation (Continuous Batching)"""
+    """3. Chatroom Automation"""
     total_sent = 0
+    total_filtered = 0
     blocked_users = await get_blocked_users(user_id)
     is_spam_on = await get_individual_spam_filter(user_id, "chatroom")
     
     header = f"💬 <b>Chatroom Auto Started</b>\nAccounts: {len(token_list)}"
-    await update_live_status(status_msg, header, "🚀 Starting...", 0, "")
+    await update_live_status(status_msg, header, "🚀 Starting...", 0, 0, "")
 
     async with aiohttp.ClientSession() as session:
         for idx, token_obj in enumerate(token_list, 1):
@@ -261,6 +269,7 @@ async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], messag
             
             token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
             acc_sent = 0
+            acc_filtered = 0
             empty_batches = 0
             
             await apply_filter_for_account(token, user_id)
@@ -269,8 +278,8 @@ async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], messag
             while True:
                 if not is_automation_running(user_id): break
                 
-                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Chat Sent: {acc_sent}"
-                await update_live_status(status_msg, header, acc_info, total_sent, "🔎 Fetching batch...")
+                acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
+                await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, "🔎 Fetching batch...")
                 
                 users = await _discover_users(session, token, filters)
                 
@@ -286,7 +295,10 @@ async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], messag
                 for user in users:
                     if not is_automation_running(user_id): break
                     pid = user.get("_id")
-                    if not pid or pid in blocked_users or pid in sent_ids: continue
+                    if not pid or pid in blocked_users or pid in sent_ids:
+                        acc_filtered += 1
+                        total_filtered += 1
+                        continue
                     
                     res = await _send_chatroom_msg(session, token, pid, message)
                     if res == "DISABLED": continue
@@ -296,9 +308,9 @@ async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], messag
                         sent_ids.add(pid)
                         ids_to_save.append(pid)
                         
-                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Chat Sent: {acc_sent}"
+                        acc_info = f"<b>{idx}/{len(token_list)} {name}</b>\n⚡ Sent: {acc_sent} | Filtered: {acc_filtered}"
                         if acc_sent % 2 == 0:
-                            await update_live_status(status_msg, header, acc_info, total_sent, f"✅ Msg to ...{pid[-4:]}")
+                            await update_live_status(status_msg, header, acc_info, total_sent, total_filtered, f"✅ Msg to ...{pid[-4:]}")
                         await asyncio.sleep(2.5)
 
                 if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "chatroom", ids_to_save)
@@ -307,7 +319,7 @@ async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], messag
 
             if acc_sent > 0: await add_automation_log(user_id, f"[{name}] Chat: {acc_sent}")
 
-    final = f"💬 <b>Chatroom Summary</b>\nTotal Sent: {total_sent}\n✅ Done"
+    final = f"💬 <b>Chatroom Summary</b>\nSent: {total_sent} | Filtered: {total_filtered}\n✅ Done"
     await status_msg.edit_text(final, parse_mode="HTML")
 
 # --- DISPATCHER ---
