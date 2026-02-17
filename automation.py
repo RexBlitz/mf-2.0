@@ -2,8 +2,8 @@ import asyncio
 import logging
 from datetime import datetime
 
-# --- IMPORT BOTH SINGLE AND PARALLEL FUNCTIONS ---
-from friend_requests import run_requests, user_states
+# --- IMPORT ORIGINAL FUNCTIONS ---
+from friend_requests import process_all_tokens, run_requests, user_states
 from lounge import send_lounge, send_lounge_all_tokens
 from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
 
@@ -11,12 +11,13 @@ from chatroom import send_message_to_everyone, send_message_to_everyone_all_toke
 from db import (
     get_automation_settings, get_active_tokens, get_current_account,
     get_individual_spam_filter, get_automation_pending_followups, 
-    set_automation_last_request_time, add_automation_log, is_already_sent
+    set_automation_last_request_time, add_automation_log, is_already_sent,
+    set_automation_enabled
 )
 
 logger = logging.getLogger(__name__)
 
-# --- CONFIGURATION (Waves) ---
+# --- CONFIGURATION ---
 WAVES = [
     ("wave_1", True,  False, 15,  59),   # 15-59 min: Lounge
     ("wave_2", False, True,  16,  60),   # 16-60 min: Chatroom
@@ -27,17 +28,16 @@ WAVES = [
 # --- GLOBAL TASK ---
 monitor_task = None
 
-# --- DUMMY MESSAGE CLASS (Silent UI) ---
+# --- DUMMY MESSAGE CLASS (Silent UI Fix) ---
 class SilentMessage:
     def __init__(self, chat_id, bot): 
-        self.message_id = 0
+        self.message_id = 123456  # Fixed Dummy ID to prevent 'status_message_id' error
         self.chat = type('obj', (object,), {'id': chat_id})
         self.bot = bot
-    async def edit_text(self, text, parse_mode=None, reply_markup=None): pass
+    async def edit_text(self, *args, **kwargs): 
+        return self # Does nothing but prevents crashes
 
-# =============================================================================
-# STATUS CHECK (Fixes your ImportError)
-# =============================================================================
+# --- STATUS CHECK ---
 def is_automation_running(user_id: int) -> bool:
     global monitor_task
     return monitor_task is not None and not monitor_task.done()
@@ -46,17 +46,20 @@ def is_automation_running(user_id: int) -> bool:
 # MAIN MONITOR LOOP
 # =============================================================================
 async def monitor_loop(user_id, bot):
-    logger.info(f"Automation Monitor Started for {user_id}")
+    logger.info(f"🚀 Automation Monitor Started for {user_id}")
     waves_triggered = set() 
 
     while True:
         try:
             settings = await get_automation_settings(user_id)
-            if not settings.get("enabled"): break
+            if not settings.get("enabled"): 
+                logger.info(f"🚫 Automation Disabled for {user_id}")
+                break
             
             selected_mode = settings.get("selected_accounts", "all")
             db_data = await get_automation_pending_followups(user_id)
-            
+            dummy = SilentMessage(user_id, bot)
+
             # --- LOGIC 1: SINGLE ACCOUNT (Current) ---
             if selected_mode == "current":
                 token = await get_current_account(user_id)
@@ -68,20 +71,23 @@ async def monitor_loop(user_id, bot):
                 should_run = False
                 if not last_req: should_run = True
                 elif isinstance(last_req, str): last_req = datetime.fromisoformat(last_req)
+                
+                # 24h Check
                 if last_req and (datetime.utcnow() - last_req).total_seconds() > 86400: should_run = True
                 
                 if should_run:
+                    logger.info(f"Triggering Single Requests for {user_id}")
                     asyncio.create_task(run_requests(user_id, bot, -100))
                     await set_automation_last_request_time(user_id, token)
                     await add_automation_log(user_id, "Single Requests Triggered")
                     waves_triggered.clear()
                     continue
 
+                # Wave Logic
                 if last_req:
                     elapsed = (datetime.utcnow() - last_req).total_seconds() / 60
                     for wave, do_lng, do_chat, min_m, max_m in WAVES:
                         if min_m <= elapsed < max_m and wave not in waves_triggered:
-                            dummy = SilentMessage(user_id, bot)
                             if do_lng and settings.get("lounge_message"):
                                 spam = await get_individual_spam_filter(user_id, "lounge")
                                 asyncio.create_task(send_lounge(token, settings["lounge_message"], dummy, bot, user_id, spam, user_id))
@@ -91,7 +97,7 @@ async def monitor_loop(user_id, bot):
                                 asyncio.create_task(send_message_to_everyone(token, settings["chatroom_message"], user_id, spam, user_id, sent_ids, asyncio.Lock()))
                             waves_triggered.add(wave)
 
-            # --- LOGIC 2: PARALLEL ACCOUNTS (Active/All) ---
+            # --- LOGIC 2: PARALLEL ACCOUNTS (Active Only) ---
             else: 
                 active_tokens = await get_active_tokens(user_id)
                 if not active_tokens:
@@ -110,7 +116,7 @@ async def monitor_loop(user_id, bot):
                 if last_req and (datetime.utcnow() - last_req).total_seconds() > 86400: should_run = True
 
                 if should_run:
-                    dummy = SilentMessage(user_id, bot)
+                    logger.info(f"Triggering Parallel Requests for {user_id}")
                     asyncio.create_task(process_all_tokens(user_id, active_tokens, bot, -100, dummy))
                     for t in active_tokens:
                         await set_automation_last_request_time(user_id, t["token"])
@@ -122,7 +128,6 @@ async def monitor_loop(user_id, bot):
                     elapsed = (datetime.utcnow() - last_req).total_seconds() / 60
                     for wave, do_lng, do_chat, min_m, max_m in WAVES:
                         if min_m <= elapsed < max_m and wave not in waves_triggered:
-                            dummy = SilentMessage(user_id, bot)
                             if do_lng and settings.get("lounge_message"):
                                 spam = await get_individual_spam_filter(user_id, "lounge")
                                 asyncio.create_task(send_lounge_all_tokens(active_tokens, settings["lounge_message"], dummy, bot, user_id, spam, user_id))
@@ -133,7 +138,7 @@ async def monitor_loop(user_id, bot):
 
             await asyncio.sleep(60)
         except Exception as e:
-            logger.error(f"Automation Error: {e}")
+            logger.error(f"❌ Automation Error: {e}")
             await asyncio.sleep(60)
 
 # =============================================================================
@@ -153,5 +158,6 @@ def stop_automation(user_id):
         monitor_task = None
 
 async def run_automation_action(user_id, status_msg):
+    await set_automation_enabled(user_id, True)
     start_automation(user_id, status_msg.bot)
-    await status_msg.edit_text("🔄 <b>Automation Running...</b>", parse_mode="HTML")
+    await status_msg.edit_text("🔄 <b>Automation Triggered!</b>\nCheck logs for activity.", parse_mode="HTML")
