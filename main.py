@@ -732,50 +732,30 @@ async def callback_handler(callback_query: CallbackQuery):
         elif data == "auto_select_accounts":
             settings = await get_automation_settings(user_id)
             selected = settings.get("selected_accounts", "all")
+            
+            mark_current = "✅ " if selected == "current" else ""
+            mark_active  = "✅ " if selected == "active_only" else ""
+
             buttons = [
-                [InlineKeyboardButton(text=f"{'> ' if selected == 'all' else ''}All Accounts", callback_data="auto_acc_all")],
-                [InlineKeyboardButton(text=f"{'> ' if selected == 'active_only' else ''}All Active Accounts", callback_data="auto_acc_active")],
-                [InlineKeyboardButton(text="Choose Manually", callback_data="auto_acc_manual")],
+                [InlineKeyboardButton(text=f"{mark_current}Current Account", callback_data="auto_acc_current")],
+                [InlineKeyboardButton(text=f"{mark_active}All Active Accounts", callback_data="auto_acc_active")],
                 [InlineKeyboardButton(text="Back", callback_data="back_to_automation")]
             ]
             await callback_query.message.edit_text("<b>Select Automation Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         
-        elif data == "auto_acc_all":
-            await set_automation_accounts(user_id, "all")
-            await callback_query.answer("All accounts selected!")
+       # --- OPTION 1: CURRENT ---
+        elif data == "auto_acc_current":
+            await set_automation_accounts(user_id, "current")
+            await callback_query.answer("Current account selected!")
+            callback_query.data = "auto_select_accounts"
+            await callback_handler(callback_query)
         
+       # --- OPTION 2: ALL ACTIVE ---
         elif data == "auto_acc_active":
             await set_automation_accounts(user_id, "active_only")
             await callback_query.answer("Active accounts selected!")
-        
-        elif data == "auto_acc_manual":
-            tokens = await get_tokens(user_id)
-            settings = await get_automation_settings(user_id)
-            selected = settings.get("selected_accounts", "all")
-            buttons = []
-            for i, tok in enumerate(tokens):
-                is_selected = isinstance(selected, list) and i in selected
-                mark = "> " if is_selected else "  "
-                name = html.escape(tok.get("name", f"Account {i+1}")[:20])
-                buttons.append([InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"auto_acc_toggle_manual_{i}")])
-            buttons.append([InlineKeyboardButton(text="Done", callback_data="auto_acc_manual_done")])
-            buttons.append([InlineKeyboardButton(text="Back", callback_data="auto_select_accounts")])
-            await callback_query.message.edit_text("<b>Choose Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-        
-        elif data.startswith("auto_acc_toggle_manual_"):
-            try:
-                idx = int(data.replace("auto_acc_toggle_manual_", ""))
-                settings = await get_automation_settings(user_id)
-                selected = settings.get("selected_accounts", [])
-                if not isinstance(selected, list): selected = []
-                if idx in selected: selected.remove(idx)
-                else: selected.append(idx)
-                await set_automation_accounts(user_id, selected if selected else "all")
-                await callback_query.answer("Updated.")
-            except ValueError: await callback_query.answer("Invalid.", show_alert=True)
-        
-        elif data == "auto_acc_manual_done":
-            await callback_query.answer("Accounts updated!")
+            callback_query.data = "auto_select_accounts"
+            await callback_handler(callback_query)
         
         elif data == "auto_run_action":
             status_msg = await callback_query.message.edit_text("<b>Starting automation...</b>", parse_mode="HTML")
