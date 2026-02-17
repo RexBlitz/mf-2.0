@@ -1,9 +1,8 @@
 """
-Automation Module - Sequential Processing (One-by-One) with Cumulative UI.
+Automation Module - Sequential Processing with Multi-Message Support (Comma Split).
 - Runs one account at a time.
-- 24h Cycle + Follow-up Waves (20m, 1h, 6h).
-- Persistent Row-based UI.
-- Fixed: Stop Crash & Double Message issues.
+- 24h Cycle + Follow-up Waves.
+- Feature: Splits messages by comma (",") and sends them sequentially.
 """
 
 import asyncio
@@ -28,16 +27,16 @@ logger = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
 monitor_task: asyncio.Task = None
-status_messages: Dict[int, object] = {} # Stores Message object
-user_bots: Dict[int, object] = {}       # Stores Bot object
+status_messages: Dict[int, object] = {} 
+user_bots: Dict[int, object] = {}       
 
-# Stores the LIVE UI rows: { user_id: { token: "Account 1: Sent 5 | Filtered 0" } }
-ui_rows_state: Dict[int, Dict[str, str]] = {}
-ui_totals_state: Dict[int, Dict[str, int]] = {}
+# COMPLEX STATE: Stores all stats per user -> per token
+ui_stats_state: Dict[int, Dict[str, Dict]] = {}
 
 # --- TIMINGS ---
-PER_USER_DELAY = 0.5  # Fast Speed
+PER_USER_DELAY = 0.5 
 PER_BATCH_DELAY = 1
+MULTI_MSG_DELAY = 1.5 # Delay between comma-separated parts
 
 BASE_HEADERS = {
     'User-Agent': "okhttp/5.1.0",
@@ -66,93 +65,127 @@ async def _send_friend_request(session, token, person_id):
             return "FAIL" if data.get("errorCode") else "OK"
     except: return "FAIL"
 
-async def _send_msg(session, token, person_id, msg, type="lounge"):
-    if not msg: return False
-    url = "https://api.meeff.com/lounge/create/v1/" if type == "lounge" else "https://api.meeff.com/chat/send/v2"
+async def _send_msg(session, token, person_id, raw_msg, type="lounge"):
+    """
+    Sends messages. If comma (,) is present, splits and sends multiple messages.
+    """
+    if not raw_msg: return False
+    
+    # Split message by comma, strip whitespace, and filter empty strings
+    messages = [m.strip() for m in raw_msg.split(',') if m.strip()]
+    if not messages: return False
+
     headers = {**BASE_HEADERS, 'meeff-access-token': token, 'Content-Type': "application/json"}
+    success = True
+
     try:
         if type == "chat":
-            # Open Room
+            # 1. Open Room (Only ONCE per person)
             async with session.post("https://api.meeff.com/chatroom/open/v2", headers=headers, json={"waitingRoomId": person_id, "locale": "en"}, timeout=10) as resp:
                 if resp.status == 412: return "DISABLED"
                 if resp.status != 200: return False
                 cid = (await resp.json()).get("chatRoom", {}).get("_id")
                 if not cid: return False
-            payload = {"chatRoomId": cid, "message": msg, "locale": "en"}
-        else:
-            payload = {"targetUserId": person_id, "content": msg, "locale": "en"}
+            
+            # 2. Send parts loop
+            for msg_part in messages:
+                payload = {"chatRoomId": cid, "message": msg_part, "locale": "en"}
+                async with session.post("https://api.meeff.com/chat/send/v2", headers=headers, json=payload, timeout=10) as resp:
+                    if resp.status != 200: success = False
+                await asyncio.sleep(MULTI_MSG_DELAY) # Wait between parts
 
-        async with session.post(url, headers=headers, json=payload, timeout=10) as resp:
-            return resp.status == 200 or not (await resp.json()).get("errorCode")
+        else:
+            # Lounge Logic (Send separate create requests)
+            url = "https://api.meeff.com/lounge/create/v1/"
+            for msg_part in messages:
+                payload = {"targetUserId": person_id, "content": msg_part, "locale": "en"}
+                async with session.post(url, headers=headers, json=payload, timeout=10) as resp:
+                    data = await resp.json()
+                    if data.get("errorCode"): success = False
+                await asyncio.sleep(MULTI_MSG_DELAY) # Wait between parts
+
+        return success
     except: return False
 
-# --- INTELLIGENT UI MANAGER ---
+# --- DETAILED UI MANAGER ---
+
+def init_account_stats(user_id, token, name):
+    if user_id not in ui_stats_state: ui_stats_state[user_id] = {}
+    if token not in ui_stats_state[user_id]:
+        ui_stats_state[user_id][token] = {
+            'name': name,
+            'req_s': 0, 'req_f': 0,
+            'lng_s': 0, 'lng_f': 0,
+            'chat_s': 0, 'chat_f': 0,
+            'status': 'Checking...'
+        }
+
+def update_account_stats(user_id, token, updates: dict, status=None):
+    if user_id in ui_stats_state and token in ui_stats_state[user_id]:
+        stats = ui_stats_state[user_id][token]
+        for k, v in updates.items():
+            if k in stats:
+                stats[k] += v
+        if status:
+            stats['status'] = status
 
 async def update_ui(user_id, force_new=False):
-    """
-    Updates the UI.
-    If 'force_new' is True OR if we don't have a message yet, sends a NEW one.
-    Otherwise, edits the existing one.
-    """
-    rows = ui_rows_state.get(user_id, {})
-    totals = ui_totals_state.get(user_id, {"sent": 0, "filtered": 0})
-    
+    if user_id not in ui_stats_state or not ui_stats_state[user_id]: return
+
+    # 1. Build Rows
     text = "🔄 <b>Friend Request Automation</b>\n\n"
-    for token, row_text in rows.items():
-        text += f"{row_text}\n"
-    text += f"\n-------\n<b>Total Sent: {totals['sent']}</b> | <b>Total Filtered: {totals['filtered']}</b>"
     
+    total_req_s, total_req_f = 0, 0
+    total_lng_s, total_lng_f = 0, 0
+    total_chat_s, total_chat_f = 0, 0
+
+    for token, stats in ui_stats_state[user_id].items():
+        total_req_s += stats['req_s']; total_req_f += stats['req_f']
+        total_lng_s += stats['lng_s']; total_lng_f += stats['lng_f']
+        total_chat_s += stats['chat_s']; total_chat_f += stats['chat_f']
+
+        text += f"<b>{stats['name']}</b> ({stats['status']})\n"
+        text += f"Req: {stats['req_s']} / {stats['req_f']} | Lng: {stats['lng_s']} / {stats['lng_f']} | Chat: {stats['chat_s']} / {stats['chat_f']}\n\n"
+
+    # 2. Footer
+    text += "-------\n"
+    text += f"<b>Total Request:</b> Sent: {total_req_s} | Filtered: {total_req_f}\n"
+    text += f"<b>Total Lounge:</b> Sent: {total_lng_s} | Filtered: {total_lng_f}\n"
+    text += f"<b>Total Chatroom:</b> Sent: {total_chat_s} | Filtered: {total_chat_f}"
+
+    # 3. Send/Edit
     bot = user_bots.get(user_id)
     msg = status_messages.get(user_id)
 
-    # 1. Send NEW message if forced or missing
     if force_new or not msg:
         if bot:
             try:
                 new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
                 status_messages[user_id] = new_msg 
-            except Exception as e:
-                logger.error(f"Failed to send new status: {e}")
+            except Exception: pass
         return
 
-    # 2. Edit EXISTING message
     try:
         await msg.edit_text(text, parse_mode="HTML")
-    except Exception as e:
-        # If edit fails (e.g. message deleted), recover by sending a new one
-        if "message is not modified" not in str(e) and bot:
+    except Exception:
+        if bot:
             try:
                 new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
                 status_messages[user_id] = new_msg
             except: pass
 
-def add_to_ui_row(user_id, token, name, sent, filtered, status="Running"):
-    if user_id not in ui_rows_state: ui_rows_state[user_id] = {}
-    row = f"<b>{name}:</b> Sent {sent} | Filtered {filtered}"
-    if status: row += f" ({status})"
-    ui_rows_state[user_id][token] = row
-
-def update_totals(user_id, new_sent=0, new_filtered=0):
-    if user_id not in ui_totals_state: ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
-    ui_totals_state[user_id]["sent"] += new_sent
-    ui_totals_state[user_id]["filtered"] += new_filtered
-
 def reset_ui(user_id):
-    """Clears the UI counts for a new day."""
-    ui_rows_state[user_id] = {}
-    ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
+    ui_stats_state[user_id] = {}
 
 # --- SEQUENTIAL PROCESSOR ---
 
 async def process_account_sequence(user_id: int, token_obj: dict, settings: dict, session: aiohttp.ClientSession, db_data: dict):
     token = token_obj["token"]
-    name = token_obj.get("name", "Acc")[:10]
+    name = token_obj.get("name", "Acc")[:15]
     
-    if user_id not in ui_rows_state or token not in ui_rows_state[user_id]:
-        add_to_ui_row(user_id, token, name, 0, 0, "Checking...")
-        await update_ui(user_id)
+    init_account_stats(user_id, token, name)
 
-    # 1. CHECK REQUEST CYCLE (24 Hours)
+    # 1. CHECK REQUEST CYCLE
     last_req_str = db_data.get("request_times", {}).get(token)
     should_run_requests = False
     
@@ -164,21 +197,18 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
             should_run_requests = True
 
     if should_run_requests:
-        # Update Row to "Sending..."
-        add_to_ui_row(user_id, token, name, 0, 0, "Sending Requests...")
-        # REMOVED force_new=True to prevent double messages. It will just edit the "Checking..." message.
-        await update_ui(user_id) 
+        update_account_stats(user_id, token, {}, "Sending Requests...")
+        await update_ui(user_id)
         
         await run_requests_task(user_id, token_obj, session)
         
         await set_automation_last_request_time(user_id, token)
         
-        current_row = ui_rows_state[user_id][token].split("(")[0].strip()
-        ui_rows_state[user_id][token] = f"{current_row} (Waiting 20m)"
+        update_account_stats(user_id, token, {}, "Requests Done")
         await update_ui(user_id)
         return
 
-    # 2. CHECK FOLLOW-UPS (Waves)
+    # 2. CHECK FOLLOW-UPS
     added_users = db_data.get("add_times", {}).get(token, {})
     lounge_history = db_data.get("lounge_sent", {}).get(token, {})
     
@@ -186,7 +216,7 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
     chat_msg = settings.get("chatroom_message")
     
     if not lounge_msg or not chat_msg: 
-        add_to_ui_row(user_id, token, name, 0, 0, "No Msg Set")
+        update_account_stats(user_id, token, {}, "No Msg Set")
         await update_ui(user_id)
         return
 
@@ -207,25 +237,32 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
             wave_to_run = 3
         
         if wave_to_run > 0:
-            current_row = ui_rows_state[user_id].get(token, "").split("(")[0].strip()
-            ui_rows_state[user_id][token] = f"{current_row} (Wave {wave_to_run})"
+            update_account_stats(user_id, token, {}, f"Sending Wave {wave_to_run}")
             if messages_sent % 5 == 0: await update_ui(user_id)
 
+            # Send Lounge (Supports multi-message)
             if await _send_msg(session, token, pid, lounge_msg, "lounge"):
+                update_account_stats(user_id, token, {'lng_s': 1})
                 await asyncio.sleep(2)
-                await _send_msg(session, token, pid, chat_msg, "chat")
+                
+                # Send Chat (Supports multi-message)
+                if await _send_msg(session, token, pid, chat_msg, "chat"):
+                    update_account_stats(user_id, token, {'chat_s': 1})
+                else:
+                    update_account_stats(user_id, token, {'chat_f': 1})
+                
                 await mark_lounge_sent(user_id, token, pid, wave_to_run)
                 messages_sent += 1
                 await asyncio.sleep(PER_USER_DELAY)
+            else:
+                update_account_stats(user_id, token, {'lng_f': 1})
 
     if messages_sent > 0:
         await add_automation_log(user_id, f"[{name}] Follow-ups: {messages_sent} sent")
-        current_row = ui_rows_state[user_id][token].split("(")[0].strip()
-        ui_rows_state[user_id][token] = f"{current_row} (Idle)"
+        update_account_stats(user_id, token, {}, "Requests Done") 
         await update_ui(user_id)
     else:
-        current_row = ui_rows_state[user_id][token].split("(")[0].strip()
-        ui_rows_state[user_id][token] = f"{current_row} (Idle)"
+        update_account_stats(user_id, token, {}, "Requests Done")
 
 async def run_requests_task(user_id, token_obj, session):
     token = token_obj["token"]
@@ -238,8 +275,6 @@ async def run_requests_task(user_id, token_obj, session):
     await apply_filter_for_account(token, user_id)
     filters = await get_user_filters(user_id, token) or {}
     
-    session_sent = 0
-    session_filtered = 0
     ids_to_save = []
     
     while True:
@@ -250,8 +285,7 @@ async def run_requests_task(user_id, token_obj, session):
         for user in users:
             pid = user.get("_id")
             if pid in blocked or pid in sent_ids:
-                session_filtered += 1
-                update_totals(user_id, new_filtered=1)
+                update_account_stats(user_id, token, {'req_f': 1})
                 continue
             
             res = await _send_friend_request(session, token, pid)
@@ -259,16 +293,11 @@ async def run_requests_task(user_id, token_obj, session):
                 limit_hit = True; break
             
             if res == "OK":
-                session_sent += 1
-                update_totals(user_id, new_sent=1)
-                
+                update_account_stats(user_id, token, {'req_s': 1})
                 sent_ids.add(pid)
                 ids_to_save.append(pid)
                 await set_automation_add_time(user_id, token, pid)
-                
-                add_to_ui_row(user_id, token, name, session_sent, session_filtered, "Running")
                 await update_ui(user_id)
-                
                 await asyncio.sleep(PER_USER_DELAY)
         
         if is_spam_on and ids_to_save:
@@ -276,21 +305,19 @@ async def run_requests_task(user_id, token_obj, session):
             ids_to_save = []
             
         if limit_hit: 
-            add_to_ui_row(user_id, token, name, session_sent, session_filtered, "Limit Reached")
+            update_account_stats(user_id, token, {}, "Limit Reached")
             await update_ui(user_id)
             break
             
         await asyncio.sleep(PER_BATCH_DELAY)
 
-    if session_sent > 0:
-        await add_automation_log(user_id, f"[{name}] Requests: {session_sent}")
+    if ui_stats_state[user_id][token]['req_s'] > 0:
+        await add_automation_log(user_id, f"[{name}] Requests: {ui_stats_state[user_id][token]['req_s']}")
 
 # --- MAIN MONITOR LOOP ---
 
 async def monitor_loop(user_id: int):
-    logger.info(f"Sequential Monitor Started for {user_id}")
-    
-    # Send the INITIAL status message
+    logger.info(f"Monitor Started for {user_id}")
     await update_ui(user_id, force_new=True)
     
     while True:
@@ -323,47 +350,34 @@ async def monitor_loop(user_id: int):
 # --- CONTROL ---
 
 async def run_automation_action(user_id: int, status_msg):
-    """Called from Manual Trigger."""
     global monitor_task
-    
     status_messages[user_id] = status_msg
     if status_msg and hasattr(status_msg, 'bot'):
         user_bots[user_id] = status_msg.bot
-
     await set_automation_enabled(user_id, True)
-    
     if monitor_task and not monitor_task.done(): monitor_task.cancel()
-    
     reset_ui(user_id)
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def start_automation(user_id: int, bot):
-    """Called from Main / Startup."""
     global monitor_task
-    
     user_bots[user_id] = bot
     asyncio.create_task(set_automation_enabled(user_id, True))
-    
     if monitor_task and not monitor_task.done(): return
-    
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def stop_automation(user_id: int):
-    """Safe stop function."""
     global monitor_task
     asyncio.create_task(set_automation_enabled(user_id, False))
-    
     if monitor_task:
         monitor_task.cancel()
         monitor_task = None
     
-    # SAFE ASYNC EDIT WRAPPER
     async def _safe_stop_msg():
         msg = status_messages.get(user_id)
         if msg:
             try: await msg.edit_text("🛑 <b>Automation Stopped</b>", parse_mode="HTML")
             except: pass
-    
     asyncio.create_task(_safe_stop_msg())
 
 def is_automation_running(user_id: int) -> bool:
