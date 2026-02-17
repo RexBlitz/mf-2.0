@@ -1,7 +1,7 @@
 """
 Automation Module
 =================
-Simply calls the original functions
+Simply calls the original functions. No custom logic.
 """
 
 import asyncio
@@ -195,7 +195,7 @@ async def run_requests_task(user_id: int, token_obj: dict) -> tuple[int, int]:
 # MAIN PROCESSOR
 # =============================================================================
 
-async def process_account(user_id: int, token_obj: dict, settings: dict, target_tokens: List[dict]):
+async def process_account(user_id: int, token_obj: dict, settings: dict, target_tokens: List[dict], force_run: bool = False):
     token  = token_obj["token"]
     name   = token_obj.get("name", "Acc")[:15]
     bot    = user_bots.get(user_id)
@@ -208,19 +208,38 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
 
     # ── REQUESTS (24h gate) ────────────────────────────────────────────────
     last_req_str = db_data.get("request_times", {}).get(token)
-    should_req   = not last_req_str
+    should_req   = force_run or not last_req_str
     if not should_req:
         last_req   = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
         should_req = (datetime.utcnow() - last_req).total_seconds() > 24 * 3600
 
     if should_req:
-        update_account_stats(user_id, token, {}, "Sending Requests...")
-        await update_ui(user_id)
-        req_sent, req_filt = await run_requests_task(user_id, token_obj)
-        update_account_stats(user_id, token, {'req_s': req_sent, 'req_f': req_filt}, "Requests Done")
-        await set_automation_last_request_time(user_id, token)
-        await update_ui(user_id)
-        await add_automation_log(user_id, f"[{name}] Requests: {req_sent} sent, {req_filt} filtered")
+        if is_all:
+            # All active → parallel
+            update_account_stats(user_id, token, {}, "Sending Requests...")
+            await update_ui(user_id)
+            tasks = [run_requests_task(user_id, t) for t in target_tokens]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for t_obj, result in zip(target_tokens, results):
+                t_tok  = t_obj["token"]
+                t_name = t_obj.get("name", "Acc")[:15]
+                init_account_stats(user_id, t_tok, t_name)
+                if isinstance(result, tuple):
+                    s, f = result
+                    update_account_stats(user_id, t_tok, {'req_s': s, 'req_f': f}, "Requests Done")
+                    await set_automation_last_request_time(user_id, t_tok)
+                    await add_automation_log(user_id, f"[{t_name}] Requests: {s} sent, {f} filtered")
+            await update_ui(user_id)
+        else:
+            # Single token
+            update_account_stats(user_id, token, {}, "Sending Requests...")
+            await update_ui(user_id)
+            req_sent, req_filt = await run_requests_task(user_id, token_obj)
+            update_account_stats(user_id, token, {'req_s': req_sent, 'req_f': req_filt}, "Requests Done")
+            await set_automation_last_request_time(user_id, token)
+            await update_ui(user_id)
+            await add_automation_log(user_id, f"[{name}] Requests: {req_sent} sent, {req_filt} filtered")
+
         db_data = await get_automation_pending_followups(user_id)
 
     # ── WAVES ──────────────────────────────────────────────────────────────
@@ -237,7 +256,7 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
 
         for wave_key, do_lounge, do_chat, min_m, max_m in WAVES:
             if elapsed_mins < min_m or elapsed_mins >= max_m: continue
-            if await _is_wave_done(db_data, token, pid, wave_key): continue
+            if not force_run and await _is_wave_done(db_data, token, pid, wave_key): continue
 
             # LOUNGE
             if do_lounge and lounge_msg and bot:
@@ -317,7 +336,7 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
 # MONITOR LOOP
 # =============================================================================
 
-async def monitor_loop(user_id: int):
+async def monitor_loop(user_id: int, force_run: bool = False):
     logger.info(f"Monitor started for {user_id}")
 
     bot = user_bots.get(user_id)
@@ -347,9 +366,10 @@ async def monitor_loop(user_id: int):
 
             for token_obj in target_tokens:
                 if not (await get_automation_settings(user_id)).get("enabled"): break
-                await process_account(user_id, token_obj, settings, target_tokens)
+                await process_account(user_id, token_obj, settings, target_tokens, force_run=force_run)
 
             await update_ui(user_id)
+            force_run = False  # only bypass on first cycle
             await asyncio.sleep(60)
 
         except asyncio.CancelledError:
@@ -371,7 +391,7 @@ async def run_automation_action(user_id: int, status_msg):
     await set_automation_enabled(user_id, True)
     if monitor_task and not monitor_task.done(): monitor_task.cancel()
     reset_ui(user_id)
-    monitor_task = asyncio.create_task(monitor_loop(user_id))
+    monitor_task = asyncio.create_task(monitor_loop(user_id, force_run=True))
 
 def start_automation(user_id: int, bot):
     global monitor_task
