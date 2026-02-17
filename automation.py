@@ -7,12 +7,6 @@ Single token  → send_lounge(), send_message_to_everyone()
 All tokens    → send_lounge_all_tokens(), send_message_to_everyone_all_tokens()
 Requests      → run_requests_task() per token
 
-Schedule (per added user):
-  24h gate   → Friend Requests
-  +15 min    → Lounge        (wave_1_lounge)
-  +16 min    → Chatroom      (wave_1_chat)
-  +60 min    → Lounge        (wave_2_lounge)
-  +300 min   → Lounge+Chat   (wave_3_lounge)
 """
 
 import asyncio
@@ -22,6 +16,7 @@ from datetime import datetime
 from typing import List, Dict, Set
 
 from db import (
+    get_current_account,
     get_automation_settings, get_active_tokens, get_tokens,
     get_user_filters, bulk_add_sent_ids, is_already_sent,
     get_blocked_users, add_automation_log, get_individual_spam_filter,
@@ -210,7 +205,7 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
     name   = token_obj.get("name", "Acc")[:15]
     bot    = user_bots.get(user_id)
     msg    = status_messages.get(user_id)
-    is_all = settings.get("selected_accounts") == "all"
+    is_all = settings.get("selected_accounts") == "active_only"
 
     init_account_stats(user_id, token, name)
 
@@ -345,15 +340,15 @@ async def monitor_loop(user_id: int):
             settings = await get_automation_settings(user_id)
             if not settings.get("enabled"): break
 
-            selected   = settings.get("selected_accounts", "all")
+            selected   = settings.get("selected_accounts", "active_only")
             all_tokens = await get_tokens(user_id)
 
-            if selected == "all":
-                target_tokens = all_tokens
-            elif selected == "active_only":
+            if selected == "active_only":
                 target_tokens = await get_active_tokens(user_id)
             else:
-                target_tokens = [all_tokens[i] for i in selected if 0 <= i < len(all_tokens)]
+                # "current" or "all" → use current account only
+                current_token = await get_current_account(user_id)
+                target_tokens = [t for t in all_tokens if t["token"] == current_token] if current_token else []
 
             for token_obj in target_tokens:
                 if not (await get_automation_settings(user_id)).get("enabled"): break
