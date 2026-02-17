@@ -1,8 +1,5 @@
 """
-Automation Module - Sequential Processing (One-by-One) with Cumulative UI.
-- Runs one account at a time.
-- 24h Cycle + Follow-up Waves (20m, 1h, 6h).
-- Persistent Row-based UI.
+Automation Module - Sequential Processing with Daily UI Refresh.
 """
 
 import asyncio
@@ -27,14 +24,15 @@ logger = logging.getLogger(__name__)
 
 # --- GLOBAL STATE ---
 monitor_task: asyncio.Task = None
-status_messages: Dict[int, object] = {}
+status_messages: Dict[int, object] = {} # Stores the Message object
+user_bots: Dict[int, object] = {}       # Stores the Bot object per user
 
-# Stores the LIVE UI rows for each user: { user_id: { token: "Account 1: Sent 5 | Filtered 0" } }
+# Stores the LIVE UI rows: { user_id: { token: "Account 1: Sent 5..." } }
 ui_rows_state: Dict[int, Dict[str, str]] = {}
 ui_totals_state: Dict[int, Dict[str, int]] = {}
 
 # --- TIMINGS ---
-PER_USER_DELAY = 0.5  # Fast Speed
+PER_USER_DELAY = 0.5  # Fast
 PER_BATCH_DELAY = 1
 
 BASE_HEADERS = {
@@ -42,7 +40,7 @@ BASE_HEADERS = {
     'Accept-Encoding': "gzip",
 }
 
-# --- API HELPERS ---
+# --- API HELPERS (Same as before) ---
 
 async def _discover_users(session: aiohttp.ClientSession, token: str, filters: dict = None) -> List[Dict]:
     url = "https://api.meeff.com/user/explore/v2/"
@@ -70,7 +68,6 @@ async def _send_msg(session, token, person_id, msg, type="lounge"):
     headers = {**BASE_HEADERS, 'meeff-access-token': token, 'Content-Type': "application/json"}
     try:
         if type == "chat":
-            # Open Room
             async with session.post("https://api.meeff.com/chatroom/open/v2", headers=headers, json={"waitingRoomId": person_id, "locale": "en"}, timeout=10) as resp:
                 if resp.status == 412: return "DISABLED"
                 if resp.status != 200: return False
@@ -84,59 +81,67 @@ async def _send_msg(session, token, person_id, msg, type="lounge"):
             return resp.status == 200 or not (await resp.json()).get("errorCode")
     except: return False
 
-# --- UI MANAGER ---
+# --- INTELLIGENT UI MANAGER ---
 
-async def update_ui(user_id):
-    """Rebuilds the message from the current state rows."""
-    msg = status_messages.get(user_id)
-    if not msg: return
-
+async def update_ui(user_id, force_new=False):
+    """
+    Updates the UI.
+    If 'force_new' is True OR if editing fails (message deleted), it sends a NEW message.
+    """
     rows = ui_rows_state.get(user_id, {})
     totals = ui_totals_state.get(user_id, {"sent": 0, "filtered": 0})
     
-    # Build the message text
     text = "🔄 <b>Friend Request Automation</b>\n\n"
-    
-    # Add each account's row
     for token, row_text in rows.items():
         text += f"{row_text}\n"
-    
-    # Add Totals
     text += f"\n-------\n<b>Total Sent: {totals['sent']}</b> | <b>Total Filtered: {totals['filtered']}</b>"
     
+    bot = user_bots.get(user_id)
+    msg = status_messages.get(user_id)
+
+    # If we need a new message or don't have one yet
+    if force_new or not msg:
+        if bot:
+            try:
+                new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
+                status_messages[user_id] = new_msg # Update reference
+            except Exception as e:
+                logger.error(f"Failed to send new status: {e}")
+        return
+
+    # Try to edit existing
     try:
         await msg.edit_text(text, parse_mode="HTML")
-    except Exception:
-        pass
+    except Exception as e:
+        # If edit fails (message deleted/too old), send a new one
+        if bot:
+            try:
+                new_msg = await bot.send_message(user_id, text, parse_mode="HTML")
+                status_messages[user_id] = new_msg
+            except: pass
 
 def add_to_ui_row(user_id, token, name, sent, filtered, status="Running"):
-    """Updates a specific account's row in the UI."""
     if user_id not in ui_rows_state: ui_rows_state[user_id] = {}
-    
-    # Format: "Account 1: Sent 5 | Filtered 2 (Running)"
     row = f"<b>{name}:</b> Sent {sent} | Filtered {filtered}"
-    if status:
-        row += f" ({status})"
-    
+    if status: row += f" ({status})"
     ui_rows_state[user_id][token] = row
 
 def update_totals(user_id, new_sent=0, new_filtered=0):
-    """Updates the global totals."""
     if user_id not in ui_totals_state: ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
     ui_totals_state[user_id]["sent"] += new_sent
     ui_totals_state[user_id]["filtered"] += new_filtered
 
+def reset_ui(user_id):
+    """Clears the UI counts for a new day."""
+    ui_rows_state[user_id] = {}
+    ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
+
 # --- SEQUENTIAL PROCESSOR ---
 
 async def process_account_sequence(user_id: int, token_obj: dict, settings: dict, session: aiohttp.ClientSession, db_data: dict):
-    """
-    Checks logic for ONE account. 
-    If requests/messages need sending, it does it ALL right here (blocking the next account).
-    """
     token = token_obj["token"]
     name = token_obj.get("name", "Acc")[:10]
     
-    # Initialize UI Row if missing
     if user_id not in ui_rows_state or token not in ui_rows_state[user_id]:
         add_to_ui_row(user_id, token, name, 0, 0, "Checking...")
         await update_ui(user_id)
@@ -153,20 +158,22 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
             should_run_requests = True
 
     if should_run_requests:
-        # Update UI to Running
+        # === NEW DAY DETECTED ===
+        # Reset UI counts and send a FRESH message for visibility
+        if not ui_totals_state.get(user_id, {}).get("sent", 0): 
+             # Only reset if we haven't already started a run for another account in this loop
+             pass 
+        
+        # Force a new message if it's the first account starting a new day
         add_to_ui_row(user_id, token, name, 0, 0, "Sending Requests...")
-        await update_ui(user_id)
+        await update_ui(user_id, force_new=True) # <--- SENDS NEW MESSAGE HERE
         
         await run_requests_task(user_id, token_obj, session)
         
-        # Mark Complete in DB
         await set_automation_last_request_time(user_id, token)
         
-        # Update UI to Waiting
-        current_row = ui_rows_state[user_id][token]
-        # Strip the status and add "Waiting"
-        clean_row = current_row.split("(")[0].strip()
-        ui_rows_state[user_id][token] = f"{clean_row} (Waiting 20m)"
+        current_row = ui_rows_state[user_id][token].split("(")[0].strip()
+        ui_rows_state[user_id][token] = f"{current_row} (Waiting 20m)"
         await update_ui(user_id)
         return
 
@@ -177,22 +184,17 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
     lounge_msg = settings.get("lounge_message")
     chat_msg = settings.get("chatroom_message")
     
-    if not lounge_msg or not chat_msg: 
-        add_to_ui_row(user_id, token, name, 0, 0, "No Msg Set")
-        await update_ui(user_id)
-        return
+    if not lounge_msg or not chat_msg: return
 
     now = datetime.utcnow()
     messages_sent = 0
     
-    # Identify pending waves
     for pid, add_time_str in added_users.items():
         add_time = add_time_str if isinstance(add_time_str, datetime) else datetime.fromisoformat(str(add_time_str))
         elapsed_mins = (now - add_time).total_seconds() / 60
         user_history = lounge_history.get(pid, {})
         wave_to_run = 0
 
-        # Logic: 20m -> 1h -> 6h
         if elapsed_mins >= 20 and "wave_1" not in user_history and elapsed_mins < 120:
             wave_to_run = 1
         elif elapsed_mins >= 60 and "wave_2" not in user_history and elapsed_mins < 300:
@@ -201,36 +203,27 @@ async def process_account_sequence(user_id: int, token_obj: dict, settings: dict
             wave_to_run = 3
         
         if wave_to_run > 0:
-            # Update UI to Sending
             current_row = ui_rows_state[user_id].get(token, "").split("(")[0].strip()
-            ui_rows_state[user_id][token] = f"{current_row} (Sending Wave {wave_to_run})"
+            ui_rows_state[user_id][token] = f"{current_row} (Wave {wave_to_run})"
             if messages_sent % 5 == 0: await update_ui(user_id)
 
-            # Send Lounge
             if await _send_msg(session, token, pid, lounge_msg, "lounge"):
                 await asyncio.sleep(2)
-                # Send Chat
                 await _send_msg(session, token, pid, chat_msg, "chat")
-                
-                # Mark DB
                 await mark_lounge_sent(user_id, token, pid, wave_to_run)
                 messages_sent += 1
                 await asyncio.sleep(PER_USER_DELAY)
 
     if messages_sent > 0:
         await add_automation_log(user_id, f"[{name}] Follow-ups: {messages_sent} sent")
-        # Reset UI status to Idle
         current_row = ui_rows_state[user_id][token].split("(")[0].strip()
         ui_rows_state[user_id][token] = f"{current_row} (Idle)"
         await update_ui(user_id)
     else:
-        # Just update idle status if nothing happened
         current_row = ui_rows_state[user_id][token].split("(")[0].strip()
         ui_rows_state[user_id][token] = f"{current_row} (Idle)"
-        pass
 
 async def run_requests_task(user_id, token_obj, session):
-    """Sends requests for ONE account and updates its specific UI row."""
     token = token_obj["token"]
     name = token_obj.get("name", "Acc")[:10]
     
@@ -241,7 +234,6 @@ async def run_requests_task(user_id, token_obj, session):
     await apply_filter_for_account(token, user_id)
     filters = await get_user_filters(user_id, token) or {}
     
-    # These are session counts for the UI row
     session_sent = 0
     session_filtered = 0
     ids_to_save = []
@@ -270,7 +262,6 @@ async def run_requests_task(user_id, token_obj, session):
                 ids_to_save.append(pid)
                 await set_automation_add_time(user_id, token, pid)
                 
-                # LIVE UI UPDATE FOR THIS ACCOUNT
                 add_to_ui_row(user_id, token, name, session_sent, session_filtered, "Running")
                 await update_ui(user_id)
                 
@@ -290,18 +281,13 @@ async def run_requests_task(user_id, token_obj, session):
     if session_sent > 0:
         await add_automation_log(user_id, f"[{name}] Requests: {session_sent}")
 
-# --- MAIN MONITOR LOOP (One-by-One) ---
+# --- MAIN MONITOR LOOP ---
 
 async def monitor_loop(user_id: int):
-    """
-    Iterates through accounts ONE BY ONE.
-    Wait 60s only after checking ALL accounts.
-    """
     logger.info(f"Sequential Monitor Started for {user_id}")
     
-    # Initialize UI state
-    ui_rows_state[user_id] = {}
-    ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
+    # Send initial status message if we have the bot
+    await update_ui(user_id, force_new=True)
     
     while True:
         try:
@@ -314,19 +300,13 @@ async def monitor_loop(user_id: int):
             elif selected == "active_only": target_tokens = await get_active_tokens(user_id)
             else: target_tokens = [all_tokens[i] for i in selected if 0 <= i < len(all_tokens)]
             
-            # Fetch DB data once per cycle to be efficient
             db_data = await get_automation_pending_followups(user_id)
             
             async with aiohttp.ClientSession() as session:
-                # ONE BY ONE EXECUTION
                 for token_obj in target_tokens:
-                    # Check if disabled mid-loop
                     if not (await get_automation_settings(user_id)).get("enabled"): break
-                    
                     await process_account_sequence(user_id, token_obj, settings, session, db_data)
-                    # After processing Account A, loop immediately goes to Account B
             
-            # After checking all accounts, update UI one last time and wait
             await update_ui(user_id)
             await asyncio.sleep(60)
 
@@ -339,23 +319,29 @@ async def monitor_loop(user_id: int):
 # --- CONTROL ---
 
 async def run_automation_action(user_id: int, status_msg):
+    """Called from Manual Trigger."""
     global monitor_task
+    
     status_messages[user_id] = status_msg
+    # We don't have 'bot' here usually, but status_msg has .bot
+    if status_msg and hasattr(status_msg, 'bot'):
+        user_bots[user_id] = status_msg.bot
+
     await set_automation_enabled(user_id, True)
     
     if monitor_task and not monitor_task.done(): monitor_task.cancel()
     
-    # Reset UI State on manual run
-    ui_rows_state[user_id] = {}
-    ui_totals_state[user_id] = {"sent": 0, "filtered": 0}
-    
+    # Clear UI for fresh manual run
+    reset_ui(user_id)
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def start_automation(user_id: int, bot):
+    """Called from Main / Startup."""
     global monitor_task
+    
+    user_bots[user_id] = bot # Store bot for sending messages later
     asyncio.create_task(set_automation_enabled(user_id, True))
     
-    # Use existing task if running
     if monitor_task and not monitor_task.done(): return
     
     monitor_task = asyncio.create_task(monitor_loop(user_id))
