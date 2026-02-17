@@ -1,15 +1,18 @@
 """
 Automation Module - Self Contained
 ===================================
-All lounge + chatroom logic copied inline from lounge.py / chatroom.py.
-No external function calls that touch UI. One consistent status message.
+Per account (token), one by one:
 
-Schedule per added user:
-  +15 min  → Lounge msg        (wave_1_lounge)
-  +16 min  → Chatroom msg      (wave_1_chat)
-  +60 min  → Lounge msg        (wave_2_lounge)
-  +300 min → Lounge + Chatroom (wave_3_lounge)
-  24h gate → Friend Requests
+  24h gate   → Friend Requests
+  +15 min    → Lounge msg        (wave_1_lounge)
+  +16 min    → Chatroom msg      (wave_1_chat)
+  +60 min    → Lounge msg        (wave_2_lounge)
+  +300 min   → Lounge + Chatroom (wave_3_lounge)
+  Next day   → repeat
+
+Wave tracking is PER TOKEN (not per pid).
+Request time stored → waves fire relative to that time.
+All lounge/chatroom logic copied inline — no external UI interference.
 """
 
 import asyncio
@@ -56,13 +59,14 @@ CHAT_HEADERS_BASE = {
 }
 
 # --- URLS ---
-LOUNGE_DASHBOARD_URL  = "https://api.meeff.com/lounge/dashboard/v1"
-CHATROOM_OPEN_URL     = "https://api.meeff.com/chatroom/open/v2"
-CHAT_SEND_URL         = "https://api.meeff.com/chat/send/v2"
-CHATROOM_DASH_URL     = "https://api.meeff.com/chatroom/dashboard/v1"
-CHATROOM_MORE_URL     = "https://api.meeff.com/chatroom/more/v1"
+LOUNGE_DASHBOARD_URL = "https://api.meeff.com/lounge/dashboard/v1"
+CHATROOM_OPEN_URL    = "https://api.meeff.com/chatroom/open/v2"
+CHAT_SEND_URL        = "https://api.meeff.com/chat/send/v2"
+CHATROOM_DASH_URL    = "https://api.meeff.com/chatroom/dashboard/v1"
+CHATROOM_MORE_URL    = "https://api.meeff.com/chatroom/more/v1"
 
-# Wave schedule: (wave_key, do_lounge, do_chat, min_minutes, max_minutes)
+# Wave schedule per TOKEN:
+# (wave_key, do_lounge, do_chat, min_minutes_since_last_request, max_minutes)
 WAVES = [
     ("wave_1_lounge", True,  False, 15,  59),
     ("wave_1_chat",   False, True,  16,  60),
@@ -72,7 +76,7 @@ WAVES = [
 
 
 # =============================================================================
-# UI MANAGER (exact original)
+# UI MANAGER
 # =============================================================================
 
 def init_account_stats(user_id, token, name):
@@ -147,15 +151,52 @@ def reset_ui(user_id):
 
 
 # =============================================================================
-# LOUNGE LOGIC — copied from lounge.py, no UI calls inside
+# WAVE TRACKING — per token, stored in automation_timers.wave_times.<token>
+# =============================================================================
+
+async def _get_wave_times(user_id: int, token: str) -> dict:
+    """Returns dict of {wave_key: datetime} for this token."""
+    from db import _get_user_collection, _ensure_user_collection_exists
+    await _ensure_user_collection_exists(user_id)
+    doc = await _get_user_collection(user_id).find_one({"type": "automation_timers"})
+    if doc:
+        # store under a safe key — replace dots in token with underscores for mongo
+        safe = token[-20:].replace(".", "_")
+        return doc.get("wave_times", {}).get(safe, {})
+    return {}
+
+async def _mark_wave_done(user_id: int, token: str, wave_key: str):
+    from db import _get_user_collection, _ensure_user_collection_exists
+    import datetime as dt
+    await _ensure_user_collection_exists(user_id)
+    safe = token[-20:].replace(".", "_")
+    await _get_user_collection(user_id).update_one(
+        {"type": "automation_timers"},
+        {"$set": {f"wave_times.{safe}.{wave_key}": dt.datetime.utcnow()}},
+        upsert=True
+    )
+
+async def _clear_waves(user_id: int, token: str):
+    """Clear all wave marks for a token (called when new 24h request cycle starts)."""
+    from db import _get_user_collection, _ensure_user_collection_exists
+    await _ensure_user_collection_exists(user_id)
+    safe = token[-20:].replace(".", "_")
+    await _get_user_collection(user_id).update_one(
+        {"type": "automation_timers"},
+        {"$unset": {f"wave_times.{safe}": ""}},
+        upsert=True
+    )
+
+
+# =============================================================================
+# LOUNGE LOGIC — copied from lounge.py, no UI calls
 # =============================================================================
 
 async def _fetch_lounge_users(session: aiohttp.ClientSession, token: str) -> List[Dict]:
     headers = {**LOUNGE_HEADERS_BASE, 'meeff-access-token': token}
     try:
         async with session.get(LOUNGE_DASHBOARD_URL, params={'locale': "en"}, headers=headers, timeout=10) as resp:
-            if resp.status != 200:
-                return []
+            if resp.status != 200: return []
             return (await resp.json()).get("both", [])
     except Exception as e:
         logger.error(f"Fetch lounge error: {e}")
@@ -187,55 +228,37 @@ async def _open_chatroom_and_send(session: aiohttp.ClientSession, token: str, ta
     return any_sent
 
 async def _run_lounge(user_id: int, token: str, message: str, spam_enabled: bool) -> tuple[int, int]:
-    """Runs full lounge send for one token. Returns (sent, filtered)."""
-    sent_ids     = await is_already_sent(user_id, "lounge", None, bulk=True) if spam_enabled else set()
-    processing   = set()
-    total_sent   = 0
-    total_filt   = 0
+    sent_ids   = await is_already_sent(user_id, "lounge", None, bulk=True) if spam_enabled else set()
+    total_sent = 0
+    total_filt = 0
 
+    # Fetch once per token, process all, move on
     async with aiohttp.ClientSession() as session:
-        while True:
-            users = await _fetch_lounge_users(session, token)
-            if not users:
-                break
+        users = await _fetch_lounge_users(session, token)
+        to_process = []
+        for u in users:
+            pid = u.get("user", {}).get("_id")
+            if not pid: continue
+            if pid in sent_ids:
+                total_filt += 1
+            else:
+                to_process.append(pid)
 
-            to_process = []
-            batch_filt = 0
-            for u in users:
-                pid = u.get("user", {}).get("_id")
-                if not pid:
-                    continue
-                if pid in sent_ids or pid in processing:
-                    batch_filt += 1
-                else:
-                    to_process.append(pid)
-                    processing.add(pid)
+        tasks   = [_open_chatroom_and_send(session, token, pid, message) for pid in to_process]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            tasks   = [_open_chatroom_and_send(session, token, pid, message) for pid in to_process]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
+        good_ids = [pid for pid, r in zip(to_process, results) if r is True]
+        total_sent = len(good_ids)
+        total_filt += len(to_process) - total_sent
 
-            good_ids = [pid for pid, r in zip(to_process, results) if r is True]
-            for pid in to_process:
-                processing.discard(pid)
-
-            total_sent += len(good_ids)
-            total_filt += batch_filt
-
-            if spam_enabled and good_ids:
-                await bulk_add_sent_ids(user_id, "lounge", good_ids)
-                sent_ids.update(good_ids)
-
-            # All filtered → stop
-            if len(good_ids) == 0 and batch_filt > 0:
-                break
-
-            await asyncio.sleep(2)
+        if spam_enabled and good_ids:
+            await bulk_add_sent_ids(user_id, "lounge", good_ids)
 
     return total_sent, total_filt
 
 
 # =============================================================================
-# CHATROOM LOGIC — copied from chatroom.py, no UI calls inside
+# CHATROOM LOGIC — copied from chatroom.py, no UI calls
 # =============================================================================
 
 async def _fetch_chatrooms(session: aiohttp.ClientSession, token: str, from_date=None) -> tuple[List[Dict], any]:
@@ -260,14 +283,12 @@ async def _fetch_chatrooms(session: aiohttp.ClientSession, token: str, from_date
 async def _send_chat_message(session: aiohttp.ClientSession, token: str, room_id: str, message: str) -> bool:
     headers = {**CHAT_HEADERS_BASE, 'meeff-access-token': token}
     parts   = [p.strip() for p in message.split(',') if p.strip()]
-    if not parts:
-        return False
+    if not parts: return False
     if len(parts) == 1:
         try:
             async with session.post(CHAT_SEND_URL, json={"chatRoomId": room_id, "message": parts[0], "locale": "en"}, headers=headers, timeout=10) as resp:
                 return resp.status == 200
         except: return False
-
     all_ok = True
     for part in parts:
         try:
@@ -277,7 +298,6 @@ async def _send_chat_message(session: aiohttp.ClientSession, token: str, room_id
     return all_ok
 
 async def _run_chatroom(user_id: int, token: str, message: str, spam_enabled: bool) -> tuple[int, int]:
-    """Runs full chatroom send for one token. Returns (sent, filtered)."""
     sent_ids      = await is_already_sent(user_id, "chatroom", None, bulk=True) if spam_enabled else set()
     sent_ids_lock = asyncio.Lock()
     total_sent    = 0
@@ -287,8 +307,7 @@ async def _run_chatroom(user_id: int, token: str, message: str, spam_enabled: bo
     async with aiohttp.ClientSession() as session:
         while True:
             rooms, next_from = await _fetch_chatrooms(session, token, from_date)
-            if not rooms:
-                break
+            if not rooms: break
 
             filtered_rooms = []
             batch_filt     = 0
@@ -304,7 +323,6 @@ async def _run_chatroom(user_id: int, token: str, message: str, spam_enabled: bo
 
             tasks   = [_send_chat_message(session, token, r.get('_id'), message) for r in filtered_rooms]
             results = await asyncio.gather(*tasks, return_exceptions=True)
-
             good_ids = [r.get('_id') for r, res in zip(filtered_rooms, results) if res is True]
 
             if spam_enabled and good_ids:
@@ -315,30 +333,10 @@ async def _run_chatroom(user_id: int, token: str, message: str, spam_enabled: bo
             total_sent += len(good_ids)
             total_filt += batch_filt
 
-            if not next_from:
-                break
+            if not next_from: break
             from_date = next_from
 
     return total_sent, total_filt
-
-
-# =============================================================================
-# WAVE TRACKING
-# =============================================================================
-
-async def _is_wave_done(db_data: dict, token: str, pid: str, wave_key: str) -> bool:
-    return wave_key in db_data.get("lounge_sent", {}).get(token, {}).get(pid, {})
-
-async def _mark_wave_done(user_id: int, token: str, pid: str, wave_key: str):
-    from db import _get_user_collection, _ensure_user_collection_exists
-    import datetime as dt
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_timers"},
-        {"$set": {f"lounge_sent.{token}.{pid}.{wave_key}": dt.datetime.utcnow()}},
-        upsert=True
-    )
 
 
 # =============================================================================
@@ -378,32 +376,26 @@ async def _run_requests(user_id: int, token_obj: dict) -> tuple[int, int]:
     req_filt = 0
     ids_save: List[str] = []
 
+    # Per token: fetch once, process all, move on — no loop so it never gets stuck
     async with aiohttp.ClientSession() as session:
-        while True:
-            users = await _discover_users(session, token, filters)
-            if not users: break
+        users = await _discover_users(session, token, filters)
+        for user in users:
+            pid = user.get("_id")
+            if pid in blocked or pid in sent_ids:
+                req_filt += 1
+                continue
+            res = await _send_friend_request(session, token, pid)
+            if res == "LIMIT":
+                break
+            if res == "OK":
+                req_sent += 1
+                sent_ids.add(pid)
+                ids_save.append(pid)
+                await set_automation_add_time(user_id, token, pid)
+                await asyncio.sleep(PER_USER_DELAY)
 
-            limit_hit = False
-            for user in users:
-                pid = user.get("_id")
-                if pid in blocked or pid in sent_ids:
-                    req_filt += 1; continue
-                res = await _send_friend_request(session, token, pid)
-                if res == "LIMIT":
-                    limit_hit = True; break
-                if res == "OK":
-                    req_sent += 1
-                    sent_ids.add(pid)
-                    ids_save.append(pid)
-                    await set_automation_add_time(user_id, token, pid)
-                    await asyncio.sleep(PER_USER_DELAY)
-
-            if is_spam and ids_save:
-                await bulk_add_sent_ids(user_id, "request", ids_save)
-                ids_save = []
-
-            if limit_hit: break
-            await asyncio.sleep(PER_BATCH_DELAY)
+    if is_spam and ids_save:
+        await bulk_add_sent_ids(user_id, "request", ids_save)
 
     return req_sent, req_filt
 
@@ -423,12 +415,13 @@ async def process_account(user_id: int, token_obj: dict, settings: dict):
     # ── 1. FRIEND REQUESTS (24h gate) ─────────────────────────────────────
     last_req_str = db_data.get("request_times", {}).get(token)
     should_req   = False
+    last_req_dt  = None
 
     if not last_req_str:
         should_req = True
     else:
-        last_req = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
-        if (datetime.utcnow() - last_req).total_seconds() > 24 * 3600:
+        last_req_dt = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
+        if (datetime.utcnow() - last_req_dt).total_seconds() > 24 * 3600:
             should_req = True
 
     if should_req:
@@ -442,49 +435,57 @@ async def process_account(user_id: int, token_obj: dict, settings: dict):
         await update_ui(user_id)
         await add_automation_log(user_id, f"[{name}] Requests: {req_sent} sent, {req_filt} filtered")
 
-        # Refresh so new add_times are visible
+        # Clear old waves so they fire fresh this cycle
+        await _clear_waves(user_id, token)
+
+        # Refresh last_req_dt to now
+        last_req_dt = datetime.utcnow()
+
+        # Refresh db_data
         db_data = await get_automation_pending_followups(user_id)
 
-    # ── 2. FOLLOW-UP WAVES ─────────────────────────────────────────────────
-    lounge_msg  = settings.get("lounge_message")
-    chat_msg    = settings.get("chatroom_message")
-    added_users = db_data.get("add_times", {}).get(token, {})
-    now         = datetime.utcnow()
+    if not last_req_dt:
+        # No request ever sent for this token — nothing to follow up on
+        update_account_stats(user_id, token, {}, "No Requests Yet")
+        await update_ui(user_id)
+        return
 
-    lounge_spam = await get_individual_spam_filter(user_id, "lounge")
-    chat_spam   = await get_individual_spam_filter(user_id, "chatroom")
+    # ── 2. FOLLOW-UP WAVES (per token, relative to last request time) ──────
+    lounge_msg = settings.get("lounge_message")
+    chat_msg   = settings.get("chatroom_message")
 
-    for pid, add_time_str in added_users.items():
-        add_time     = add_time_str if isinstance(add_time_str, datetime) else datetime.fromisoformat(str(add_time_str))
-        elapsed_mins = (now - add_time).total_seconds() / 60
+    elapsed_mins = (datetime.utcnow() - last_req_dt).total_seconds() / 60
 
-        for wave_key, do_lounge, do_chat, min_m, max_m in WAVES:
-            if elapsed_mins < min_m or elapsed_mins >= max_m:
-                continue
-            if await _is_wave_done(db_data, token, pid, wave_key):
-                continue
+    lounge_spam  = await get_individual_spam_filter(user_id, "lounge")
+    chat_spam    = await get_individual_spam_filter(user_id, "chatroom")
+    wave_times   = await _get_wave_times(user_id, token)
 
-            # LOUNGE
-            if do_lounge and lounge_msg:
-                update_account_stats(user_id, token, {}, f"Lounge {wave_key}...")
-                await update_ui(user_id)
+    for wave_key, do_lounge, do_chat, min_m, max_m in WAVES:
+        # Outside time window → skip
+        if elapsed_mins < min_m or elapsed_mins >= max_m:
+            continue
+        # Already done this wave → skip
+        if wave_key in wave_times:
+            continue
 
-                lng_sent, lng_filt = await _run_lounge(user_id, token, lounge_msg, lounge_spam)
-                update_account_stats(user_id, token, {'lng_s': lng_sent, 'lng_f': lng_filt})
-                await update_ui(user_id)
+        # LOUNGE
+        if do_lounge and lounge_msg:
+            update_account_stats(user_id, token, {}, f"Lounge {wave_key}...")
+            await update_ui(user_id)
+            lng_sent, lng_filt = await _run_lounge(user_id, token, lounge_msg, lounge_spam)
+            update_account_stats(user_id, token, {'lng_s': lng_sent, 'lng_f': lng_filt})
+            await update_ui(user_id)
 
-            # CHATROOM
-            if do_chat and chat_msg:
-                update_account_stats(user_id, token, {}, f"Chat {wave_key}...")
-                await update_ui(user_id)
+        # CHATROOM
+        if do_chat and chat_msg:
+            update_account_stats(user_id, token, {}, f"Chat {wave_key}...")
+            await update_ui(user_id)
+            chat_sent, chat_filt = await _run_chatroom(user_id, token, chat_msg, chat_spam)
+            update_account_stats(user_id, token, {'chat_s': chat_sent, 'chat_f': chat_filt})
+            await update_ui(user_id)
 
-                chat_sent, chat_filt = await _run_chatroom(user_id, token, chat_msg, chat_spam)
-                update_account_stats(user_id, token, {'chat_s': chat_sent, 'chat_f': chat_filt})
-                await update_ui(user_id)
-
-            await _mark_wave_done(user_id, token, pid, wave_key)
-            await add_automation_log(user_id, f"[{name}] {wave_key} done")
-            break
+        await _mark_wave_done(user_id, token, wave_key)
+        await add_automation_log(user_id, f"[{name}] {wave_key} done")
 
     update_account_stats(user_id, token, {}, "Done")
     await update_ui(user_id)
@@ -497,7 +498,6 @@ async def process_account(user_id: int, token_obj: dict, settings: dict):
 async def monitor_loop(user_id: int):
     logger.info(f"Monitor started for {user_id}")
 
-    # Send initial message before any account is processed
     bot = user_bots.get(user_id)
     if bot:
         try:
