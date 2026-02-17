@@ -317,7 +317,20 @@ async def _run_requests(user_id: int, token_obj: dict):
 
 async def monitor_loop(user_id: int):
     logger.info(f"Monitor started for {user_id}")
-    await update_ui(user_id, force_new=True)
+
+    # Send initial message right away — ui_stats_state is empty at this point
+    # so update_ui would return early. Send manually and save to status_messages.
+    bot = user_bots.get(user_id)
+    if bot:
+        try:
+            new_msg = await bot.send_message(
+                user_id,
+                "🔄 <b>Friend Request Automation</b>\n\nStarting...",
+                parse_mode="HTML"
+            )
+            status_messages[user_id] = new_msg
+        except Exception as e:
+            logger.error(f"Could not send initial status message: {e}")
 
     while True:
         try:
@@ -365,6 +378,7 @@ def start_automation(user_id: int, bot):
     user_bots[user_id] = bot
     asyncio.create_task(set_automation_enabled(user_id, True))
     if monitor_task and not monitor_task.done(): return
+    reset_ui(user_id)
     monitor_task = asyncio.create_task(monitor_loop(user_id))
 
 def stop_automation(user_id: int):
