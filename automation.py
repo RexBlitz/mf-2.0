@@ -1,7 +1,18 @@
 """
 Automation Module
 =================
-Simply calls the original functions.
+Simply calls the original functions. No custom logic.
+
+Single token  → send_lounge(), send_message_to_everyone()
+All tokens    → send_lounge_all_tokens(), send_message_to_everyone_all_tokens()
+Requests      → run_requests_task() per token
+
+Schedule (per added user):
+  24h gate   → Friend Requests
+  +15 min    → Lounge        (wave_1_lounge)
+  +16 min    → Chatroom      (wave_1_chat)
+  +60 min    → Lounge        (wave_2_lounge)
+  +300 min   → Lounge+Chat   (wave_3_lounge)
 """
 
 import asyncio
@@ -169,8 +180,14 @@ async def run_requests_task(user_id: int, token_obj: dict):
 
     async with aiohttp.ClientSession() as session:
         while True:
+            update_account_stats(user_id, token, {}, "Fetching users...")
+            await update_ui(user_id)
+
             users = await _discover_users(session, token, filters)
-            if not users: break
+            if not users:
+                update_account_stats(user_id, token, {}, "No users found")
+                await update_ui(user_id)
+                break
 
             limit_hit = False
             for user in users:
@@ -270,9 +287,7 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
                 update_account_stats(user_id, token, {}, f"Lounge {wave_key}...")
                 await update_ui(user_id)
 
-                # Send on a separate temp message so automation UI is not overwritten
                 tmp_msg = await bot.send_message(user_id, "⏳ Lounge sending...", parse_mode="HTML")
-
                 if is_all:
                     await send_lounge_all_tokens(
                         tokens_data=target_tokens,
@@ -293,6 +308,8 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
                         spam_enabled=lounge_spam,
                         user_id=user_id,
                     )
+                try: await tmp_msg.delete()
+                except: pass
                 update_account_stats(user_id, token, {'lng_s': 1})
                 await update_ui(user_id)
 
@@ -301,9 +318,7 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
                 update_account_stats(user_id, token, {}, f"Chat {wave_key}...")
                 await update_ui(user_id)
 
-                # Send on a separate temp message so automation UI is not overwritten
                 tmp_msg = await bot.send_message(user_id, "⏳ Chatroom sending...", parse_mode="HTML")
-
                 if is_all:
                     await send_message_to_everyone_all_tokens(
                         tokens=[t["token"] for t in target_tokens],
@@ -328,6 +343,8 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
                         sent_ids=sent_ids,
                         sent_ids_lock=sent_ids_lock,
                     )
+                try: await tmp_msg.delete()
+                except: pass
                 update_account_stats(user_id, token, {'chat_s': 1})
                 await update_ui(user_id)
 
