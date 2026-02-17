@@ -1,306 +1,294 @@
-"""Automation Module - Run action immediately when triggered via /automation command."""
+"""Automation Module - Fully integrated logic with Filters & Spam Checks."""
 
 import asyncio
 import aiohttp
 import logging
-from typing import List, Dict, Set
+from typing import List, Dict
+
+# Import your existing logic to ensure consistency
 from db import (
     get_automation_settings, get_active_tokens, get_tokens, 
     get_user_filters, bulk_add_sent_ids, is_already_sent,
     get_blocked_users, add_automation_log, get_individual_spam_filter
 )
+from filters import apply_filter_for_account  # CRITICAL: Applies Age/Gender settings
 
 logger = logging.getLogger(__name__)
 automation_enabled = {}
 
-# Standard headers to look like a real app user
 BASE_HEADERS = {
     'User-Agent': "okhttp/5.1.0",
     'Accept-Encoding': "gzip",
 }
 
+# --- DISCOVERY & API HELPERS ---
+
 async def _discover_users(session: aiohttp.ClientSession, token: str, filters: dict = None) -> List[Dict]:
-    """Discover users respecting nationality filter and location."""
+    """Discover users (Identical to friend_requests.py)."""
     url = "https://api.meeff.com/user/explore/v2/"
-    headers = BASE_HEADERS.copy()
-    headers['meeff-access-token'] = token
+    headers = {**BASE_HEADERS, 'meeff-access-token': token}
     
-    # Added location params to match friend_requests.py behavior
-    params = {
-        "locale": "en",
-        "lat": "29.6264544",
-        "lng": "71.9140141"
-    }
+    # Exact params from friend_requests.py
+    params = {"lng": "71.9140141", "unreachableUserIds": "", "lat": "29.6264544", "locale": "en"}
     
+    # Apply Nationality Filter if set
     if filters and filters.get("filterNationalityCode"):
         params["filterNationalityCode"] = filters["filterNationalityCode"]
-    
+        
     try:
         async with session.get(url, headers=headers, params=params, timeout=10) as resp:
-            if resp.status != 200:
-                return []
+            if resp.status != 200: return []
             data = await resp.json()
-            return data.get("result", {}).get("users", [])
-    except Exception as e:
-        logger.error(f"Discover error: {e}")
-        return []
+            return data.get("users", [])
+    except Exception: return []
 
-async def _send_friend_request(session: aiohttp.ClientSession, token: str, person_id: str) -> str:
-    """
-    Send friend request.
-    Returns: "OK", "LIMIT", or "FAIL"
-    """
+async def _send_friend_request(session, token, person_id):
     url = f"https://api.meeff.com/user/undoableAnswer/v5/?userId={person_id}&isOkay=1"
-    headers = BASE_HEADERS.copy()
-    headers['meeff-access-token'] = token
-    
+    headers = {**BASE_HEADERS, 'meeff-access-token': token}
     try:
         async with session.get(url, headers=headers, timeout=10) as resp:
             data = await resp.json()
-            
-            # Case 1: Daily Limit Reached -> STOP processing this account
-            if data.get("errorCode") == "LikeExceeded":
-                return "LIMIT"
-            
-            # Case 2: Other Errors (Already liked, User not found, etc) -> SKIP user
-            if data.get("errorCode"):
-                return "FAIL"
-            
-            # Case 3: Success
+            if data.get("errorCode") == "LikeExceeded": return "LIMIT"
+            if data.get("errorCode"): return "FAIL"
             return "OK"
-            
-    except Exception:
-        return "FAIL"
+    except: return "FAIL"
 
-async def _send_lounge_msg(session: aiohttp.ClientSession, token: str, person_id: str, message: str) -> bool:
-    """Send lounge message."""
+async def _send_lounge_msg(session, token, person_id, message):
     url = "https://api.meeff.com/lounge/create/v1/"
-    headers = BASE_HEADERS.copy()
-    headers['meeff-access-token'] = token
-    headers['Content-Type'] = "application/json"
-    payload = {"targetUserId": person_id, "content": message, "locale": "en"}
-    
+    headers = {**BASE_HEADERS, 'meeff-access-token': token, 'Content-Type': "application/json"}
     try:
-        async with session.post(url, headers=headers, json=payload, timeout=10) as resp:
+        async with session.post(url, headers=headers, json={"targetUserId": person_id, "content": message, "locale": "en"}, timeout=10) as resp:
             data = await resp.json()
             return not data.get("errorCode")
-    except Exception:
-        return False
+    except: return False
 
-async def _send_chatroom_msg(session: aiohttp.ClientSession, token: str, person_id: str, message: str) -> bool:
-    """Send chatroom message (open + send)."""
-    url_open = "https://api.meeff.com/chatroom/open/v2"
-    url_send = "https://api.meeff.com/chat/send/v2"
-    headers = BASE_HEADERS.copy()
-    headers['meeff-access-token'] = token
-    headers['Content-Type'] = "application/json"
-    
+async def _send_chatroom_msg(session, token, person_id, message):
+    headers = {**BASE_HEADERS, 'meeff-access-token': token, 'Content-Type': "application/json"}
     try:
-        # Step 1: Open the room
-        payload_open = {"waitingRoomId": person_id, "locale": "en"}
-        async with session.post(url_open, headers=headers, json=payload_open, timeout=10) as resp:
-            if resp.status == 412: # Chat disabled by user
-                return False
-            if resp.status != 200:
-                return False
+        # Open Room
+        async with session.post("https://api.meeff.com/chatroom/open/v2", headers=headers, json={"waitingRoomId": person_id, "locale": "en"}, timeout=10) as resp:
+            if resp.status == 412: return "DISABLED" # Chat disabled by user
+            if resp.status != 200: return False
             data = await resp.json()
-            chatroom_id = data.get("chatRoom", {}).get("_id")
-            if not chatroom_id:
-                return False
+            cid = data.get("chatRoom", {}).get("_id")
+            if not cid: return False
         
-        # Step 2: Send the message
-        payload_send = {"chatRoomId": chatroom_id, "message": message, "locale": "en"}
-        async with session.post(url_send, headers=headers, json=payload_send, timeout=10) as resp:
+        # Send Message
+        async with session.post("https://api.meeff.com/chat/send/v2", headers=headers, json={"chatRoomId": cid, "message": message, "locale": "en"}, timeout=10) as resp:
             return resp.status == 200
-    except Exception:
-        return False
+    except: return False
 
-async def run_automation_action(user_id: int, status_msg) -> None:
-    """
-    Run automation action immediately: 
-    1. Send Friend Request 
-    2. Send Lounge Message
-    3. Send Chatroom Message
-    """
+# --- CORE AUTOMATION FUNCTIONS ---
+
+async def run_auto_requests(user_id: int, status_msg, token_list: List[Dict]):
+    """1. Friend Request Automation (Matches friend_requests.py logic)"""
+    total_sent = 0
+    blocked_users = await get_blocked_users(user_id)
+    
+    # 1. SPAM FILTER CHECK
+    is_spam_on = await get_individual_spam_filter(user_id, "request")
+    
+    status_text = f"📨 <b>Request Auto Started</b>\nAccounts: {len(token_list)}\n\n"
+    if status_msg: await status_msg.edit_text(status_text, parse_mode="HTML")
+
+    async with aiohttp.ClientSession() as session:
+        for idx, token_obj in enumerate(token_list, 1):
+            token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
+            
+            # 2. APPLY FILTERS (Critical Step!)
+            await apply_filter_for_account(token, user_id)
+            filters = await get_user_filters(user_id, token) or {}
+            
+            if status_msg: await status_msg.edit_text(status_text + f"<b>{idx}/{len(token_list)} {name}</b>\n🔎 Discovering...", parse_mode="HTML")
+            
+            users = await _discover_users(session, token, filters)
+            
+            # Load Sent IDs if Spam Filter is ON
+            sent_ids = await is_already_sent(user_id, "request", None, bulk=True) if is_spam_on else set()
+            acc_sent = 0
+            ids_to_save = []
+
+            for user in users:
+                pid = user.get("_id")
+                if not pid or pid in blocked_users or pid in sent_ids: continue
+                
+                res = await _send_friend_request(session, token, pid)
+                if res == "LIMIT": 
+                    status_text += f"⚠️ <b>{name}:</b> Limit Reached\n"
+                    break
+                if res == "OK":
+                    acc_sent += 1
+                    total_sent += 1
+                    sent_ids.add(pid) # In-memory update
+                    ids_to_save.append(pid)
+                    await asyncio.sleep(2)
+
+            # 3. SAVE SPAM DATA
+            if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "request", ids_to_save)
+            
+            if acc_sent > 0:
+                await add_automation_log(user_id, f"[{name}] Requests: {acc_sent}")
+                status_text += f"✅ <b>{name}:</b> {acc_sent} Sent\n"
+            else:
+                status_text += f"🔸 <b>{name}:</b> No new users\n"
+
+    final = f"📨 <b>Request Summary</b>\nTotal Sent: {total_sent}\n\n{status_text}"
+    if status_msg: await status_msg.edit_text(final, parse_mode="HTML")
+
+
+async def run_auto_lounge(user_id: int, status_msg, token_list: List[Dict], message: str):
+    """2. Lounge Automation (Matches lounge.py logic)"""
+    total_sent = 0
+    blocked_users = await get_blocked_users(user_id)
+    
+    # 1. SPAM FILTER CHECK
+    is_spam_on = await get_individual_spam_filter(user_id, "lounge")
+    
+    status_text = f"📢 <b>Lounge Auto Started</b>\nAccounts: {len(token_list)}\n\n"
+    if status_msg: await status_msg.edit_text(status_text, parse_mode="HTML")
+
+    async with aiohttp.ClientSession() as session:
+        for idx, token_obj in enumerate(token_list, 1):
+            token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
+            
+            # 2. APPLY FILTERS
+            await apply_filter_for_account(token, user_id)
+            filters = await get_user_filters(user_id, token) or {}
+            
+            if status_msg: await status_msg.edit_text(status_text + f"<b>{idx}/{len(token_list)} {name}</b>\n🔎 Discovering...", parse_mode="HTML")
+            
+            users = await _discover_users(session, token, filters)
+            
+            sent_ids = await is_already_sent(user_id, "lounge", None, bulk=True) if is_spam_on else set()
+            acc_sent = 0
+            ids_to_save = []
+            
+            for user in users:
+                pid = user.get("_id")
+                if not pid or pid in blocked_users or pid in sent_ids: continue
+                
+                if await _send_lounge_msg(session, token, pid, message):
+                    acc_sent += 1
+                    total_sent += 1
+                    sent_ids.add(pid)
+                    ids_to_save.append(pid)
+                    await asyncio.sleep(3)
+
+            # 3. SAVE SPAM DATA
+            if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "lounge", ids_to_save)
+
+            if acc_sent > 0:
+                await add_automation_log(user_id, f"[{name}] Lounge: {acc_sent}")
+                status_text += f"✅ <b>{name}:</b> {acc_sent} Sent\n"
+            else:
+                status_text += f"🔸 <b>{name}:</b> 0 Sent\n"
+
+    final = f"📢 <b>Lounge Summary</b>\nTotal Sent: {total_sent}\n\n{status_text}"
+    if status_msg: await status_msg.edit_text(final, parse_mode="HTML")
+
+
+async def run_auto_chat(user_id: int, status_msg, token_list: List[Dict], message: str):
+    """3. Chatroom Automation (Matches chatroom.py logic)"""
+    total_sent = 0
+    blocked_users = await get_blocked_users(user_id)
+    
+    # 1. SPAM FILTER CHECK
+    is_spam_on = await get_individual_spam_filter(user_id, "chatroom")
+    
+    status_text = f"💬 <b>Chatroom Auto Started</b>\nAccounts: {len(token_list)}\n\n"
+    if status_msg: await status_msg.edit_text(status_text, parse_mode="HTML")
+
+    async with aiohttp.ClientSession() as session:
+        for idx, token_obj in enumerate(token_list, 1):
+            token, name = token_obj["token"], token_obj.get("name", f"Acc {idx}")
+            
+            # 2. APPLY FILTERS
+            await apply_filter_for_account(token, user_id)
+            filters = await get_user_filters(user_id, token) or {}
+            
+            if status_msg: await status_msg.edit_text(status_text + f"<b>{idx}/{len(token_list)} {name}</b>\n🔎 Discovering...", parse_mode="HTML")
+            
+            users = await _discover_users(session, token, filters)
+            
+            sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if is_spam_on else set()
+            acc_sent = 0
+            ids_to_save = []
+            
+            for user in users:
+                pid = user.get("_id")
+                if not pid or pid in blocked_users or pid in sent_ids: continue
+                
+                res = await _send_chatroom_msg(session, token, pid, message)
+                
+                if res == "DISABLED": continue # User blocked chat
+                if res:
+                    acc_sent += 1
+                    total_sent += 1
+                    sent_ids.add(pid)
+                    ids_to_save.append(pid)
+                    await asyncio.sleep(3)
+
+            # 3. SAVE SPAM DATA
+            if is_spam_on and ids_to_save: await bulk_add_sent_ids(user_id, "chatroom", ids_to_save)
+
+            if acc_sent > 0:
+                await add_automation_log(user_id, f"[{name}] Chat: {acc_sent}")
+                status_text += f"✅ <b>{name}:</b> {acc_sent} Sent\n"
+            else:
+                status_text += f"🔸 <b>{name}:</b> 0 Sent\n"
+
+    final = f"💬 <b>Chatroom Summary</b>\nTotal Sent: {total_sent}\n\n{status_text}"
+    if status_msg: await status_msg.edit_text(final, parse_mode="HTML")
+
+
+# --- DISPATCHER ---
+
+async def run_automation_action(user_id: int, status_msg, task_type: str = "request") -> None:
+    """Dispatcher to run specific automation tasks."""
     try:
         settings = await get_automation_settings(user_id)
-        lounge_msg = settings.get("lounge_message", "")
-        chatroom_msg = settings.get("chatroom_message", "")
         
-        # Check if messages are set
-        if not lounge_msg or not chatroom_msg:
-            if status_msg: await status_msg.edit_text("❌ <b>Automation Failed:</b> Messages not set in settings.", parse_mode="HTML")
-            return
-        
-        # Select accounts based on settings
+        # Select Accounts
         selected = settings.get("selected_accounts", "all")
         if selected == "all":
             token_list = await get_tokens(user_id)
         elif selected == "active_only":
             token_list = await get_active_tokens(user_id)
         else:
-            # Manual selection (list of indices)
             all_tokens = await get_tokens(user_id)
-            token_list = []
-            for idx in selected:
-                try:
-                    idx = int(idx) if not isinstance(idx, int) else idx
-                    if 0 <= idx < len(all_tokens) and all_tokens[idx].get("active", True):
-                        token_list.append(all_tokens[idx])
-                except (ValueError, TypeError):
-                    pass
-        
+            token_list = [all_tokens[i] for i in selected if 0 <= i < len(all_tokens)]
+
         if not token_list:
-            if status_msg: await status_msg.edit_text("❌ <b>Automation Failed:</b> No valid accounts selected.", parse_mode="HTML")
+            if status_msg: await status_msg.edit_text("❌ No accounts selected.", parse_mode="HTML")
             return
-        
-        # Get blocked users to skip them
-        blocked_users = await get_blocked_users(user_id)
-        
-        # Initial status
-        status_text = f"🚀 <b>Automation Started</b>\nAccounts: {len(token_list)}\n\n"
-        if status_msg:
-            try: await status_msg.edit_text(status_text, parse_mode="HTML")
-            except: pass
-        
-        total_requests_sent = 0
-        total_lounge_sent = 0
-        total_chat_sent = 0
-        
-        async with aiohttp.ClientSession() as session:
-            for idx, token_obj in enumerate(token_list, 1):
-                token = token_obj["token"]
-                token_name = token_obj.get("name", f"Account {idx}")
-                
-                # Get filters for display
-                filters = await get_user_filters(user_id, token) or {}
-                filter_nat = filters.get("filterNationalityCode", "")
-                filter_txt = f"[{filter_nat}]" if filter_nat else "[All]"
-                
-                # Update Status: Discovering
-                current_status = status_text + f"<b>{idx}/{len(token_list)} {token_name} {filter_txt}</b>\n🔎 Discovering users..."
-                if status_msg:
-                    try: await status_msg.edit_text(current_status, parse_mode="HTML")
-                    except: pass
-                
-                # Check spam filter settings
-                is_spam_enabled = await get_individual_spam_filter(user_id, "request")
-                sent_ids = await is_already_sent(user_id, "request", None, bulk=True) if is_spam_enabled else set()
-                
-                # Discover users
-                users = await _discover_users(session, token, filters)
-                
-                if not users:
-                    status_text += f"🔹 <b>{token_name}:</b> No users found.\n"
-                    continue
-                
-                acc_req_count = 0
-                ids_to_save = []
-                
-                # Update Status: Processing users
-                current_status = status_text + f"<b>{idx}/{len(token_list)} {token_name}</b>\nProcessing {len(users)} users..."
-                if status_msg:
-                    try: await status_msg.edit_text(current_status, parse_mode="HTML")
-                    except: pass
-                
-                for user in users:
-                    person_id = user.get("_id")
-                    
-                    # Validation
-                    if not person_id or person_id in blocked_users or person_id in sent_ids:
-                        continue
-                    
-                    # 1. Send Friend Request
-                    req_status = await _send_friend_request(session, token, person_id)
-                    
-                    if req_status == "LIMIT":
-                        status_text += f"⚠️ <b>{token_name}:</b> Limit Reached.\n"
-                        break # Stop this account, move to next
-                    
-                    if req_status == "FAIL":
-                        continue # Skip user, try next
-                    
-                    # Request was successful ("OK")
-                    sent_ids.add(person_id)
-                    ids_to_save.append(person_id)
-                    acc_req_count += 1
-                    total_requests_sent += 1
-                    
-                    # Update Log
-                    log_msg = f"Req Sent"
-                    
-                    # Wait a bit
-                    await asyncio.sleep(2) 
-                    
-                    # 2. Send Lounge Message
-                    ok_lounge = await _send_lounge_msg(session, token, person_id, lounge_msg)
-                    if ok_lounge:
-                        total_lounge_sent += 1
-                        log_msg += " | Lounge OK"
-                    
-                    # Wait a bit
-                    await asyncio.sleep(2)
-                    
-                    # 3. Send Chatroom Message
-                    ok_chat = await _send_chatroom_msg(session, token, person_id, chatroom_msg)
-                    if ok_chat:
-                        total_chat_sent += 1
-                        log_msg += " | Chat OK"
 
-                    # Live Update for this specific action
-                    temp_status = (
-                        status_text + 
-                        f"<b>{idx}/{len(token_list)} {token_name}</b>\n"
-                        f"✅ Added: {acc_req_count}\n"
-                        f"Action: {log_msg} ({person_id[-4:]})"
-                    )
-                    if status_msg:
-                        try: await status_msg.edit_text(temp_status, parse_mode="HTML")
-                        except: pass
-                    
-                    await asyncio.sleep(1) # Slight delay between users
-                
-                # Save to DB if spam filter is ON
-                if is_spam_enabled and ids_to_save:
-                    await bulk_add_sent_ids(user_id, "request", ids_to_save)
-                
-                # Log completion for this account
-                await add_automation_log(user_id, f"[{token_name}] Sent {acc_req_count} requests")
-                
-                # Add to main status text history so it persists
-                status_text += f"✅ <b>{token_name}:</b> Sent {acc_req_count}\n"
-                
-                await asyncio.sleep(2) # Delay between accounts
+        # Execute Task
+        if task_type == "request":
+            await run_auto_requests(user_id, status_msg, token_list)
+            
+        elif task_type == "lounge":
+            msg = settings.get("lounge_message")
+            if not msg:
+                if status_msg: await status_msg.edit_text("❌ Lounge message not set.", parse_mode="HTML")
+                return
+            await run_auto_lounge(user_id, status_msg, token_list, msg)
+            
+        elif task_type == "chat":
+            msg = settings.get("chatroom_message")
+            if not msg:
+                if status_msg: await status_msg.edit_text("❌ Chatroom message not set.", parse_mode="HTML")
+                return
+            await run_auto_chat(user_id, status_msg, token_list, msg)
         
-        # FINAL SUMMARY
-        final_summary = (
-            f"✅ <b>Automation Complete</b>\n\n"
-            f"📨 Requests: {total_requests_sent}\n"
-            f"📢 Lounge Msgs: {total_lounge_sent}\n"
-            f"💬 Chat Msgs: {total_chat_sent}\n\n"
-            f"{status_text}"
-        )
-        
-        if status_msg:
-            try: await status_msg.edit_text(final_summary, parse_mode="HTML")
-            except: pass
-    
+        # If "all", default to request for now (or implement sequence if needed)
+        elif task_type == "all":
+             await run_auto_requests(user_id, status_msg, token_list)
+
     except Exception as e:
-        logger.error(f"Automation error: {e}")
-        if status_msg:
-            try: await status_msg.edit_text(f"<b>❌ Critical Error:</b> {str(e)[:100]}", parse_mode="HTML")
-            except: pass
+        logger.error(f"Auto Error: {e}")
+        if status_msg: await status_msg.edit_text(f"❌ Error: {str(e)[:50]}", parse_mode="HTML")
 
-# --- Helper Functions ---
-
-def start_automation(user_id: int, bot):
-    """Mark automation as enabled."""
-    automation_enabled[user_id] = True
-
-def stop_automation(user_id: int):
-    """Mark automation as disabled."""
-    automation_enabled[user_id] = False
-
-def is_automation_running(user_id: int) -> bool:
-    """Check if automation is enabled."""
-    return automation_enabled.get(user_id, False)
+# --- CONTROL HELPERS ---
+def start_automation(user_id: int, bot): automation_enabled[user_id] = True
+def stop_automation(user_id: int): automation_enabled[user_id] = False
+def is_automation_running(user_id: int) -> bool: return automation_enabled.get(user_id, False)
