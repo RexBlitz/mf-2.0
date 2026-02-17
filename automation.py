@@ -1,18 +1,6 @@
 """
 Automation Module
 =================
-Simply calls the original functions. No custom logic.
-
-Single token  → send_lounge(), send_message_to_everyone()
-All tokens    → send_lounge_all_tokens(), send_message_to_everyone_all_tokens()
-Requests      → run_requests_task() per token
-
-Schedule (per added user):
-  24h gate   → Friend Requests
-  +15 min    → Lounge        (wave_1_lounge)
-  +16 min    → Chatroom      (wave_1_chat)
-  +60 min    → Lounge        (wave_2_lounge)
-  +300 min   → Lounge+Chat   (wave_3_lounge)
 """
 
 import asyncio
@@ -24,14 +12,14 @@ from typing import List, Dict, Set
 from db import (
     get_current_account,
     get_automation_settings, get_active_tokens, get_tokens,
-    get_user_filters, bulk_add_sent_ids, is_already_sent,
-    get_blocked_users, add_automation_log, get_individual_spam_filter,
+    is_already_sent, bulk_add_sent_ids,
+    add_automation_log, get_individual_spam_filter,
     set_automation_enabled, set_automation_last_request_time,
     get_automation_pending_followups, set_automation_add_time,
 )
-from filters import apply_filter_for_account
 from lounge import send_lounge, send_lounge_all_tokens
 from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
+from requests import run_requests, process_all_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -140,87 +128,26 @@ async def _mark_wave_done(user_id: int, token: str, pid: str, wave_key: str):
 
 
 # =============================================================================
-# REQUESTS
+# REQUESTS — original run_requests / process_all_tokens se directly call
 # =============================================================================
 
-async def _discover_users(session, token, filters=None):
-    headers = {**BASE_HEADERS, 'meeff-access-token': token}
-    params  = {"lng": "71.9140141", "unreachableUserIds": "", "lat": "29.6264544", "locale": "en"}
-    if filters and filters.get("filterNationalityCode"):
-        params["filterNationalityCode"] = filters["filterNationalityCode"]
-    try:
-        async with session.get("https://api.meeff.com/user/explore/v2/", headers=headers, params=params, timeout=10) as resp:
-            return (await resp.json()).get("users", []) if resp.status == 200 else []
-    except: return []
-
-async def _send_friend_request(session, token, person_id):
-    try:
-        async with session.get(
-            f"https://api.meeff.com/user/undoableAnswer/v5/?userId={person_id}&isOkay=1",
-            headers={**BASE_HEADERS, 'meeff-access-token': token}, timeout=10
-        ) as resp:
-            data = await resp.json()
-            if data.get("errorCode") == "LikeExceeded": return "LIMIT"
-            return "FAIL" if data.get("errorCode") else "OK"
-    except: return "FAIL"
-
-async def run_requests_task(user_id: int, token_obj: dict):
-    """Exact original run_requests_task — updates UI directly, no return value."""
+async def run_requests_task(user_id: int, token_obj: dict, bot, status_msg):
+    """Single token — original run_requests() call."""
     token = token_obj["token"]
     name  = token_obj.get("name", "Acc")[:10]
 
-    is_spam_on = await get_individual_spam_filter(user_id, "request")
-    blocked    = await get_blocked_users(user_id)
-    sent_ids   = await is_already_sent(user_id, "request", None, bulk=True) if is_spam_on else set()
+    # Set status_message_id in user_states so run_requests can edit it
+    from requests import user_states
+    user_states[user_id]["status_message_id"] = status_msg.message_id
 
-    await apply_filter_for_account(token, user_id)
-    filters = await get_user_filters(user_id, token) or {}
+    await run_requests(user_id, bot, user_id)
+    await add_automation_log(user_id, f"[{name}] Requests done")
 
-    ids_to_save = []
 
-    async with aiohttp.ClientSession() as session:
-        while True:
-            update_account_stats(user_id, token, {}, "Fetching users...")
-            await update_ui(user_id)
-
-            users = await _discover_users(session, token, filters)
-            if not users:
-                update_account_stats(user_id, token, {}, "No users found")
-                await update_ui(user_id)
-                break
-
-            limit_hit = False
-            for user in users:
-                pid = user.get("_id")
-                if pid in blocked or pid in sent_ids:
-                    update_account_stats(user_id, token, {'req_f': 1})
-                    continue
-
-                res = await _send_friend_request(session, token, pid)
-                if res == "LIMIT":
-                    limit_hit = True; break
-
-                if res == "OK":
-                    update_account_stats(user_id, token, {'req_s': 1})
-                    sent_ids.add(pid)
-                    ids_to_save.append(pid)
-                    await set_automation_add_time(user_id, token, pid)
-                    await update_ui(user_id)
-                    await asyncio.sleep(PER_USER_DELAY)
-
-            if is_spam_on and ids_to_save:
-                await bulk_add_sent_ids(user_id, "request", ids_to_save)
-                ids_to_save = []
-
-            if limit_hit:
-                update_account_stats(user_id, token, {}, "Limit Reached")
-                await update_ui(user_id)
-                break
-
-            await asyncio.sleep(PER_BATCH_DELAY)
-
-    if ui_stats_state.get(user_id, {}).get(token, {}).get('req_s', 0) > 0:
-        await add_automation_log(user_id, f"[{name}] Requests: {ui_stats_state[user_id][token]['req_s']}")
+async def run_requests_all_task(user_id: int, target_tokens: list, bot, status_msg):
+    """All active tokens parallel — original process_all_tokens() call."""
+    await process_all_tokens(user_id, target_tokens, bot, user_id, initial_status_message=status_msg)
+    await add_automation_log(user_id, f"All tokens requests done")
 
 
 # =============================================================================
@@ -247,23 +174,22 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
 
     if should_req:
         if is_all:
-            # All active → parallel, each updates UI directly
-            for t in target_tokens:
-                init_account_stats(user_id, t["token"], t.get("name", "Acc")[:15])
-                update_account_stats(user_id, t["token"], {}, "Sending Requests...")
-            await update_ui(user_id)
-            await asyncio.gather(*[run_requests_task(user_id, t) for t in target_tokens], return_exceptions=True)
+            # All active → process_all_tokens (parallel, own UI)
+            tmp_req_msg = await bot.send_message(user_id, "⏳ Sending requests...", parse_mode="HTML")
+            await run_requests_all_task(user_id, target_tokens, bot, tmp_req_msg)
+            try: await tmp_req_msg.delete()
+            except: pass
             for t in target_tokens:
                 await set_automation_last_request_time(user_id, t["token"])
-            await update_ui(user_id)
         else:
-            # Single token
-            update_account_stats(user_id, token, {}, "Sending Requests...")
-            await update_ui(user_id)
-            await run_requests_task(user_id, token_obj)
+            # Single token → run_requests (own UI on tmp_msg)
+            tmp_req_msg = await bot.send_message(user_id, "⏳ Sending requests...", parse_mode="HTML")
+            await run_requests_task(user_id, token_obj, bot, tmp_req_msg)
+            try: await tmp_req_msg.delete()
+            except: pass
             await set_automation_last_request_time(user_id, token)
-            await update_ui(user_id)
 
+        await update_ui(user_id)
         db_data = await get_automation_pending_followups(user_id)
 
     # ── WAVES ──────────────────────────────────────────────────────────────
