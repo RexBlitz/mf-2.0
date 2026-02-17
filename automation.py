@@ -1,5 +1,6 @@
 """
 Automation Module — Pure Scheduler
+
 """
 
 import asyncio
@@ -72,12 +73,20 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
         should_req = (datetime.utcnow() - last_req).total_seconds() > 24 * 3600
 
     if should_req and bot:
+        from friend_requests import user_states
         if is_all:
+            # process_all_tokens creates its own status message internally
             await process_all_tokens(user_id, target_tokens, bot, user_id)
             for t in target_tokens:
                 await set_automation_last_request_time(user_id, t["token"])
             await add_automation_log(user_id, "All tokens requests done")
         else:
+            # run_requests needs status_message_id set in user_states
+            req_msg = await bot.send_message(user_id, "⏳ Sending requests...", parse_mode="HTML")
+            user_states[user_id]["status_message_id"] = req_msg.message_id
+            user_states[user_id]["running"] = True
+            user_states[user_id]["stopped"] = False
+            user_states[user_id]["total_added_friends"] = 0
             await run_requests(user_id, bot, user_id)
             await set_automation_last_request_time(user_id, token)
             await add_automation_log(user_id, f"[{name}] Requests done")
