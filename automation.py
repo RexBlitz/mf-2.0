@@ -156,6 +156,50 @@ def stop_automation(user_id):
         monitor_task = None
 
 async def run_automation_action(user_id, status_msg):
+    """
+    Manual Button Trigger: 
+    Ye timers ko bypass karke foran functions trigger kar deta hai.
+    """
+    from friend_requests import user_states
+    bot = status_msg.bot
+    
+    # 1. Pehle automation enable karo
     await set_automation_enabled(user_id, True)
-    start_automation(user_id, status_msg.bot)
-    await status_msg.edit_text("🔄 <b>Automation Monitor Started!</b>", parse_mode="HTML")
+    
+    # 2. Settings aur Tokens fetch karo
+    settings = await get_automation_settings(user_id)
+    mode = settings.get("selected_accounts", "all")
+    dummy = SilentMessage(user_id, bot)
+
+    await status_msg.edit_text("🚀 <b>Bypassing Timers...</b>\nTriggering functions right now!", parse_mode="HTML")
+
+    # 3. FORAN TRIGGER (Bypass DB Check)
+    if mode == "current":
+        token = await get_current_account(user_id)
+        if token:
+            # Initialize state manually
+            user_states[user_id]["status_message_id"] = 123456
+            user_states[user_id]["running"] = True
+            
+            # Trigger Request
+            asyncio.create_task(run_requests(user_id, bot, -100))
+            await set_automation_last_request_time(user_id, token)
+            await add_automation_log(user_id, "MANUAL: Single Requests Triggered (Bypass)")
+    else:
+        active_tokens = await get_active_tokens(user_id)
+        if active_tokens:
+            # Initialize state manually
+            user_states[user_id]["status_message_id"] = 123456
+            user_states[user_id]["running"] = True
+            
+            # Trigger Parallel Requests
+            asyncio.create_task(process_all_tokens(user_id, active_tokens, bot, -100, dummy))
+            for t in active_tokens:
+                await set_automation_last_request_time(user_id, t["token"])
+            await add_automation_log(user_id, "MANUAL: Parallel Requests Triggered (Bypass)")
+
+    # 4. Monitor loop ko bhi start kar do (taaki follow-up waves apne time par chalein)
+    start_automation(user_id, bot)
+    
+    await asyncio.sleep(2)
+    await status_msg.edit_text("✅ <b>Automation Triggered!</b>\nTimers bypassed. Requests are now running in background.", parse_mode="HTML")
