@@ -28,16 +28,17 @@ WAVES = [
 # --- GLOBAL TASK ---
 monitor_task = None
 
-# --- DUMMY MESSAGE CLASS (Fixes 'status_message_id' Error) ---
+# --- DUMMY MESSAGE CLASS (Final Fix for 'status_message_id') ---
 class SilentMessage:
     def __init__(self, chat_id, bot): 
-        self.message_id = 123456  # Fixed Dummy ID to prevent crashes in original functions
+        self.message_id = 123456  
+        self.status_message_id = 123456 # Added for original logic compatibility
         self.chat = type('obj', (object,), {'id': chat_id})
         self.bot = bot
     async def edit_text(self, *args, **kwargs): 
         return self 
 
-# --- STATUS CHECK (Fixes ImportError in main.py) ---
+# --- STATUS CHECK ---
 def is_automation_running(user_id: int) -> bool:
     global monitor_task
     return monitor_task is not None and not monitor_task.done()
@@ -53,7 +54,7 @@ async def monitor_loop(user_id, bot):
         try:
             settings = await get_automation_settings(user_id)
             if not settings.get("enabled"): 
-                logger.info(f"🚫 Automation Disabled in settings for {user_id}")
+                logger.info(f"🚫 Automation Disabled for {user_id}")
                 break
             
             mode = settings.get("selected_accounts", "all")
@@ -69,26 +70,27 @@ async def monitor_loop(user_id, bot):
 
                 last_req = db_data.get("request_times", {}).get(token)
                 should_run = False
+                if not last_req: should_run = True
+                elif isinstance(last_req, str): last_req = datetime.fromisoformat(last_req)
                 
-                if not last_req: 
-                    should_run = True
-                else:
-                    if isinstance(last_req, str): last_req = datetime.fromisoformat(last_req)
-                    # 24h Check
-                    if (datetime.utcnow() - last_req).total_seconds() > 86400: 
-                        should_run = True
-                    else:
-                        logger.info(f"⏳ Waiting for 24h cycle for token {token[:10]}...")
-
+                # 24h Check
+                if last_req and (datetime.utcnow() - last_req).total_seconds() > 86400: should_run = True
+                
                 if should_run:
-                    logger.info(f"✅ Triggering Single Requests for {user_id}")
+                    logger.info(f"✅ TRIGGERING: run_requests() for {user_id}")
+                    
+                    # --- INITIALIZE STATE FOR ORIGINAL FUNCTION ---
+                    user_states[user_id]["status_message_id"] = 123456
+                    user_states[user_id]["running"] = True
+                    # ----------------------------------------------
+
                     asyncio.create_task(run_requests(user_id, bot, -100))
                     await set_automation_last_request_time(user_id, token)
                     await add_automation_log(user_id, "Single Requests Triggered")
                     waves_triggered.clear()
                     continue
 
-                # Wave Logic for follow-ups
+                # Wave Logic
                 if last_req:
                     elapsed = (datetime.utcnow() - last_req).total_seconds() / 60
                     for wave, do_lng, do_chat, min_m, max_m in WAVES:
@@ -113,15 +115,18 @@ async def monitor_loop(user_id, bot):
                 last_req = db_data.get("request_times", {}).get(first_token)
                 
                 should_run = False
-                if not last_req: 
-                    should_run = True
-                else:
-                    if isinstance(last_req, str): last_req = datetime.fromisoformat(last_req)
-                    if (datetime.utcnow() - last_req).total_seconds() > 86400: 
-                        should_run = True
+                if not last_req: should_run = True
+                elif isinstance(last_req, str): last_req = datetime.fromisoformat(last_req)
+                if last_req and (datetime.utcnow() - last_req).total_seconds() > 86400: should_run = True
 
                 if should_run:
-                    logger.info(f"✅ Triggering Parallel Requests for {user_id}")
+                    logger.info(f"✅ TRIGGERING: process_all_tokens() for {user_id}")
+                    
+                    # --- INITIALIZE STATE FOR ORIGINAL FUNCTION ---
+                    user_states[user_id]["status_message_id"] = 123456
+                    user_states[user_id]["running"] = True
+                    # ----------------------------------------------
+
                     asyncio.create_task(process_all_tokens(user_id, active_tokens, bot, -100, dummy))
                     for t in active_tokens:
                         await set_automation_last_request_time(user_id, t["token"])
@@ -153,4 +158,4 @@ def stop_automation(user_id):
 async def run_automation_action(user_id, status_msg):
     await set_automation_enabled(user_id, True)
     start_automation(user_id, status_msg.bot)
-    await status_msg.edit_text("🔄 <b>Automation Monitor Started!</b>\nChecking timers for 24h cycle...", parse_mode="HTML")
+    await status_msg.edit_text("🔄 <b>Automation Monitor Started!</b>", parse_mode="HTML")
