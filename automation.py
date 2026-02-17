@@ -137,7 +137,7 @@ async def run_requests_task(user_id: int, token_obj: dict, bot, status_msg):
     name  = token_obj.get("name", "Acc")[:10]
 
     # Set status_message_id in user_states so run_requests can edit it
-    from requests import user_states
+    from friend_requests import user_states
     user_states[user_id]["status_message_id"] = status_msg.message_id
 
     await run_requests(user_id, bot, user_id)
