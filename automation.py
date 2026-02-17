@@ -16,7 +16,7 @@ from db import (
     get_automation_settings, get_active_tokens, get_tokens, 
     get_user_filters, bulk_add_sent_ids, is_already_sent,
     get_blocked_users, add_automation_log, get_individual_spam_filter,
-    set_automation_enabled, is_automation_running as db_is_running,
+    set_automation_enabled,
     set_automation_last_request_time, get_automation_pending_followups,
     set_automation_add_time, mark_lounge_sent, mark_chatroom_sent,
     get_automation_last_request_time
