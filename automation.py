@@ -1,7 +1,7 @@
 """
 Automation Module
 =================
-Simply calls the original functions. No custom logic.
+Simply calls the original functions.
 """
 
 import asyncio
@@ -153,42 +153,57 @@ async def _send_friend_request(session, token, person_id):
             return "FAIL" if data.get("errorCode") else "OK"
     except: return "FAIL"
 
-async def run_requests_task(user_id: int, token_obj: dict) -> tuple[int, int]:
-    token    = token_obj["token"]
-    is_spam  = await get_individual_spam_filter(user_id, "request")
-    blocked  = await get_blocked_users(user_id)
-    sent_ids = await is_already_sent(user_id, "request", None, bulk=True) if is_spam else set()
-    await apply_filter_for_account(token, user_id)
-    filters  = await get_user_filters(user_id, token) or {}
+async def run_requests_task(user_id: int, token_obj: dict):
+    """Exact original run_requests_task — updates UI directly, no return value."""
+    token = token_obj["token"]
+    name  = token_obj.get("name", "Acc")[:10]
 
-    req_sent, req_filt = 0, 0
-    ids_save: List[str] = []
+    is_spam_on = await get_individual_spam_filter(user_id, "request")
+    blocked    = await get_blocked_users(user_id)
+    sent_ids   = await is_already_sent(user_id, "request", None, bulk=True) if is_spam_on else set()
+
+    await apply_filter_for_account(token, user_id)
+    filters = await get_user_filters(user_id, token) or {}
+
+    ids_to_save = []
 
     async with aiohttp.ClientSession() as session:
         while True:
             users = await _discover_users(session, token, filters)
             if not users: break
+
             limit_hit = False
             for user in users:
                 pid = user.get("_id")
                 if pid in blocked or pid in sent_ids:
-                    req_filt += 1; continue
+                    update_account_stats(user_id, token, {'req_f': 1})
+                    continue
+
                 res = await _send_friend_request(session, token, pid)
                 if res == "LIMIT":
                     limit_hit = True; break
+
                 if res == "OK":
-                    req_sent += 1
+                    update_account_stats(user_id, token, {'req_s': 1})
                     sent_ids.add(pid)
-                    ids_save.append(pid)
+                    ids_to_save.append(pid)
                     await set_automation_add_time(user_id, token, pid)
+                    await update_ui(user_id)
                     await asyncio.sleep(PER_USER_DELAY)
-            if is_spam and ids_save:
-                await bulk_add_sent_ids(user_id, "request", ids_save)
-                ids_save = []
-            if limit_hit: break
+
+            if is_spam_on and ids_to_save:
+                await bulk_add_sent_ids(user_id, "request", ids_to_save)
+                ids_to_save = []
+
+            if limit_hit:
+                update_account_stats(user_id, token, {}, "Limit Reached")
+                await update_ui(user_id)
+                break
+
             await asyncio.sleep(PER_BATCH_DELAY)
 
-    return req_sent, req_filt
+    if ui_stats_state.get(user_id, {}).get(token, {}).get('req_s', 0) > 0:
+        await add_automation_log(user_id, f"[{name}] Requests: {ui_stats_state[user_id][token]['req_s']}")
 
 
 # =============================================================================
@@ -215,30 +230,22 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
 
     if should_req:
         if is_all:
-            # All active → parallel
-            update_account_stats(user_id, token, {}, "Sending Requests...")
+            # All active → parallel, each updates UI directly
+            for t in target_tokens:
+                init_account_stats(user_id, t["token"], t.get("name", "Acc")[:15])
+                update_account_stats(user_id, t["token"], {}, "Sending Requests...")
             await update_ui(user_id)
-            tasks = [run_requests_task(user_id, t) for t in target_tokens]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for t_obj, result in zip(target_tokens, results):
-                t_tok  = t_obj["token"]
-                t_name = t_obj.get("name", "Acc")[:15]
-                init_account_stats(user_id, t_tok, t_name)
-                if isinstance(result, tuple):
-                    s, f = result
-                    update_account_stats(user_id, t_tok, {'req_s': s, 'req_f': f}, "Requests Done")
-                    await set_automation_last_request_time(user_id, t_tok)
-                    await add_automation_log(user_id, f"[{t_name}] Requests: {s} sent, {f} filtered")
+            await asyncio.gather(*[run_requests_task(user_id, t) for t in target_tokens], return_exceptions=True)
+            for t in target_tokens:
+                await set_automation_last_request_time(user_id, t["token"])
             await update_ui(user_id)
         else:
             # Single token
             update_account_stats(user_id, token, {}, "Sending Requests...")
             await update_ui(user_id)
-            req_sent, req_filt = await run_requests_task(user_id, token_obj)
-            update_account_stats(user_id, token, {'req_s': req_sent, 'req_f': req_filt}, "Requests Done")
+            await run_requests_task(user_id, token_obj)
             await set_automation_last_request_time(user_id, token)
             await update_ui(user_id)
-            await add_automation_log(user_id, f"[{name}] Requests: {req_sent} sent, {req_filt} filtered")
 
         db_data = await get_automation_pending_followups(user_id)
 
@@ -359,14 +366,15 @@ async def monitor_loop(user_id: int, force_run: bool = False):
 
             if selected == "active_only":
                 target_tokens = await get_active_tokens(user_id)
+                # All active → call once with first token, parallel runs inside
+                if target_tokens:
+                    await process_account(user_id, target_tokens[0], settings, target_tokens, force_run=force_run)
             else:
-                # "current" or "all" → use current account only
+                # Current account only → single token
                 current_token = await get_current_account(user_id)
                 target_tokens = [t for t in all_tokens if t["token"] == current_token] if current_token else []
-
-            for token_obj in target_tokens:
-                if not (await get_automation_settings(user_id)).get("enabled"): break
-                await process_account(user_id, token_obj, settings, target_tokens, force_run=force_run)
+                if target_tokens:
+                    await process_account(user_id, target_tokens[0], settings, target_tokens, force_run=force_run)
 
             await update_ui(user_id)
             force_run = False  # only bypass on first cycle
