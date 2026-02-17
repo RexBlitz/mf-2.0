@@ -1,12 +1,7 @@
 """
 Automation Module
 =================
-Simply calls the original functions. No custom logic.
-
-Single token  → send_lounge(), send_message_to_everyone()
-All tokens    → send_lounge_all_tokens(), send_message_to_everyone_all_tokens()
-Requests      → run_requests_task() per token
-
+Simply calls the original functions
 """
 
 import asyncio
