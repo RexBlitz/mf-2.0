@@ -204,6 +204,7 @@ async def set_token(telegram_user_id, token, name, email=None, filters=None, act
             "active": active
         }
         if email: token_data["email"] = email
+        if password: token_data["password"] = password
         if filters: token_data["filters"] = filters
 
         await user_db.update_one(
@@ -213,7 +214,47 @@ async def set_token(telegram_user_id, token, name, email=None, filters=None, act
         )
 
     return token_index # Return the index
-
+async def resign_token_at_position(
+    user_id: int, position: int, new_token: str, 
+    name: str, email: str = None, password: str = None, filters: dict = None
+):
+    """
+    Replace token at specific position without changing order.
+    Used for re-signing expired accounts in signup menu.
+    
+    Raises:
+        ValueError: If position is out of range
+    """
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    
+    tokens_doc = await user_db.find_one({"type": "tokens"})
+    tokens_list = tokens_doc.get("items", []) if tokens_doc else []
+    
+    if position < 0 or position >= len(tokens_list):
+        raise ValueError(f"Invalid position {position}, tokens list length is {len(tokens_list)}")
+    
+    # Build new token entry
+    token_data = {
+        "token": new_token,
+        "name": name,
+        "active": True
+    }
+    if email:
+        token_data["email"] = email
+    if password:
+        token_data["password"] = password
+    if filters:
+        token_data["filters"] = filters
+    
+    # Replace at exact position
+    tokens_list[position] = token_data
+    
+    await user_db.update_one(
+        {"type": "tokens"},
+        {"$set": {"items": tokens_list}},
+        upsert=True
+    )
 async def toggle_token_status(telegram_user_id, token):
     await _ensure_user_collection_exists(telegram_user_id)
     user_db = _get_user_collection(telegram_user_id)
