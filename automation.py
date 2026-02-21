@@ -64,91 +64,78 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
     is_all = settings.get("selected_accounts") == "active_only"
 
     db_data = await get_automation_pending_followups(user_id)
+    now = datetime.utcnow()
 
-    # ── REQUESTS (24h gate) ────────────────────────────────────────────────
+    # ── 1. REQUESTS TRIGGER LOGIC ──────────────────────────────────────────
     last_req_str = db_data.get("request_times", {}).get(token)
     should_req   = force_run or not last_req_str
+    
     if not should_req:
-        last_req   = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
-        should_req = (datetime.utcnow() - last_req).total_seconds() > 24 * 3600
+        last_req = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
+        should_req = (now - last_req).total_seconds() > 24 * 3600
 
     if should_req and bot:
-        from friend_requests import user_states
+        # TRIGGER HOTE HI TIME SAVE KARO (Ab yahan shift kar diya hai)
         if is_all:
-            # process_all_tokens creates its own status message internally
-            await process_all_tokens(user_id, target_tokens, bot, user_id)
             for t in target_tokens:
                 await set_automation_last_request_time(user_id, t["token"])
-            await add_automation_log(user_id, "All tokens requests done")
+            await add_automation_log(user_id, "All tokens requests triggered")
+            
+            # Background mein process chalao taake loop ruka na rahe
+            asyncio.create_task(process_all_tokens(user_id, target_tokens, bot, user_id))
         else:
-            # run_requests needs status_message_id set in user_states
-            req_msg = await bot.send_message(user_id, "⏳ Sending requests...", parse_mode="HTML")
-            user_states[user_id]["status_message_id"] = req_msg.message_id
-            user_states[user_id]["running"] = True
-            user_states[user_id]["stopped"] = False
-            user_states[user_id]["total_added_friends"] = 0
-            await run_requests(user_id, bot, user_id)
             await set_automation_last_request_time(user_id, token)
-            await add_automation_log(user_id, f"[{name}] Requests done")
+            await add_automation_log(user_id, f"[{name}] Requests triggered")
+            
+            # Background mein process chalao
+            asyncio.create_task(run_requests(user_id, bot, user_id))
 
-        db_data = await get_automation_pending_followups(user_id)
+        # Update last_req_str for the wave calculation in the same loop
+        last_req_str = now
 
-    # ── WAVES ──────────────────────────────────────────────────────────────
+    # ── 2. WAVES LOGIC (Last Request Time Based) ───────────────────────────
+    if not last_req_str:
+        return
+
+    last_req_dt = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
+    elapsed_mins = (now - last_req_dt).total_seconds() / 60
+
     lounge_msg  = settings.get("lounge_message")
     chat_msg    = settings.get("chatroom_message")
-    added_users = db_data.get("add_times", {}).get(token, {})
-    now         = datetime.utcnow()
     lounge_spam = await get_individual_spam_filter(user_id, "lounge")
     chat_spam   = await get_individual_spam_filter(user_id, "chatroom")
 
-    for pid, add_time_str in added_users.items():
-        add_time     = add_time_str if isinstance(add_time_str, datetime) else datetime.fromisoformat(str(add_time_str))
-        elapsed_mins = (now - add_time).total_seconds() / 60
+    for wave_key, do_lounge, do_chat, min_m, max_m in WAVES:
+        # Timer check
+        if elapsed_mins < min_m or elapsed_mins >= max_m:
+            continue
+            
+        # Deduplication check (Account level par)
+        if not force_run and await _is_wave_done(db_data, token, "ACCOUNT_LEVEL", wave_key):
+            continue
 
-        for wave_key, do_lounge, do_chat, min_m, max_m in WAVES:
-            if elapsed_mins < min_m or elapsed_mins >= max_m: continue
-            if not force_run and await _is_wave_done(db_data, token, pid, wave_key): continue
+        # Lounge Trigger
+        if do_lounge and lounge_msg and bot:
+            lounge_status = await bot.send_message(user_id, f"⏳ {wave_key} Lounge...", parse_mode="HTML")
+            if is_all:
+                await send_lounge_all_tokens(target_tokens, lounge_msg, lounge_status, bot, user_id, lounge_spam, user_id)
+            else:
+                await send_lounge(token, lounge_msg, lounge_status, bot, user_id, lounge_spam, user_id)
 
-            # LOUNGE
-            if do_lounge and lounge_msg and bot:
-                lounge_status = await bot.send_message(user_id, "⏳ Lounge...", parse_mode="HTML")
-                if is_all:
-                    await send_lounge_all_tokens(
-                        tokens_data=target_tokens, message=lounge_msg,
-                        status_message=lounge_status, bot=bot,
-                        chat_id=user_id, spam_enabled=lounge_spam, user_id=user_id,
-                    )
-                else:
-                    await send_lounge(
-                        token=token, message=lounge_msg,
-                        status_message=lounge_status, bot=bot,
-                        chat_id=user_id, spam_enabled=lounge_spam, user_id=user_id,
-                    )
+        # Chatroom Trigger
+        if do_chat and chat_msg and bot:
+            chat_status = await bot.send_message(user_id, f"⏳ {wave_key} Chatroom...", parse_mode="HTML")
+            if is_all:
+                token_names = {t["token"]: t.get("name", "Acc") for t in target_tokens}
+                await send_message_to_everyone_all_tokens([t["token"] for t in target_tokens], chat_msg, chat_status, bot, user_id, chat_spam, token_names, chat_spam, user_id)
+            else:
+                sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if chat_spam else set()
+                await send_message_to_everyone(token, chat_msg, user_id, chat_spam, user_id, sent_ids, asyncio.Lock())
 
-            # CHATROOM
-            if do_chat and chat_msg and bot:
-                chat_status = await bot.send_message(user_id, "⏳ Chatroom...", parse_mode="HTML")
-                if is_all:
-                    await send_message_to_everyone_all_tokens(
-                        tokens=[t["token"] for t in target_tokens], message=chat_msg,
-                        status_message=chat_status, bot=bot, chat_id=user_id,
-                        spam_enabled=chat_spam,
-                        token_names={t["token"]: t.get("name", "Acc") for t in target_tokens},
-                        use_in_memory_deduplication=chat_spam, user_id=user_id,
-                    )
-                else:
-                    sent_ids      = await is_already_sent(user_id, "chatroom", None, bulk=True) if chat_spam else set()
-                    sent_ids_lock = asyncio.Lock()
-                    await send_message_to_everyone(
-                        token=token, message=chat_msg, chat_id=user_id,
-                        spam_enabled=chat_spam, user_id=user_id,
-                        sent_ids=sent_ids, sent_ids_lock=sent_ids_lock,
-                    )
-
-            await _mark_wave_done(user_id, token, pid, wave_key)
-            await add_automation_log(user_id, f"[{name}] {wave_key} done")
-            break
-
+        # Mark Done
+        await _mark_wave_done(user_id, token, "ACCOUNT_LEVEL", wave_key)
+        await add_automation_log(user_id, f"[{name}] {wave_key} triggered")
+        break
 
 # =============================================================================
 # MONITOR LOOP
