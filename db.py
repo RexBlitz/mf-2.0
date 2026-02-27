@@ -147,8 +147,11 @@ async def get_info_card(telegram_user_id, token):
         return cards_doc["data"][token].get("info")
     return None
 
-# MODIFIED: set_token now returns the token's index and handles email-based duplicates
-async def set_token(telegram_user_id, token, name, email=None, filters=None, active=True) -> int:
+async def set_token(telegram_user_id, token, name, email=None, password=None, filters=None, active=True) -> int:
+    """
+    Saves or updates a Meeff token. 
+    Added 'password' to arguments to fix NameError.
+    """
     await _ensure_user_collection_exists(telegram_user_id)
     user_db = _get_user_collection(telegram_user_id)
 
@@ -158,37 +161,32 @@ async def set_token(telegram_user_id, token, name, email=None, filters=None, act
     token_index = -1
     email_index = -1
 
-    # 1. Check if email already exists (to prevent duplicates) and if token exists
+    # 1. Check if email already exists and find existing token index
     for i, t in enumerate(tokens_list):
         if email and t.get("email") == email:
             email_index = i
         if t["token"] == token:
             token_index = i
 
-    # 2. If email exists, remove the old entry first (replace logic)
+    # 2. Prevent email-based duplicates
     if email and email_index != -1 and token_index != email_index:
-        # Remove old token with same email
         await user_db.update_one(
             {"type": "tokens"},
             {"$pull": {"items": {"email": email}}}
         )
-        # Refresh the list
+        # Refresh the list and recalculate index
         tokens_doc = await user_db.find_one({"type": "tokens"})
         tokens_list = tokens_doc.get("items", []) if tokens_doc else []
-        # Recalculate token_index
-        token_index = -1
-        for i, t in enumerate(tokens_list):
-            if t["token"] == token:
-                token_index = i
-                break
+        token_index = next((i for i, t in enumerate(tokens_list) if t["token"] == token), -1)
 
     if token_index != -1:
-        # 3. Token exists (Update logic)
+        # 3. Update existing token
         update_fields = {
             "items.$.name": name,
             "items.$.active": active
         }
         if email: update_fields["items.$.email"] = email
+        if password: update_fields["items.$.password"] = password # Now correctly defined
         if filters: update_fields["items.$.filters"] = filters
 
         await user_db.update_one(
@@ -196,15 +194,15 @@ async def set_token(telegram_user_id, token, name, email=None, filters=None, act
             {"$set": update_fields}
         )
     else:
-        # 4. Token is new (Insertion logic)
-        token_index = len(tokens_list) # Assign the new index
+        # 4. Insert new token
+        token_index = len(tokens_list) 
         token_data = {
             "token": token,
             "name": name,
             "active": active
         }
         if email: token_data["email"] = email
-        if password: token_data["password"] = password
+        if password: token_data["password"] = password # Now correctly defined
         if filters: token_data["filters"] = filters
 
         await user_db.update_one(
@@ -213,7 +211,8 @@ async def set_token(telegram_user_id, token, name, email=None, filters=None, act
             upsert=True
         )
 
-    return token_index # Return the index
+    return token_index
+    
 async def resign_token_at_position(
     user_id: int, position: int, new_token: str, 
     name: str, email: str = None, password: str = None, filters: dict = None
