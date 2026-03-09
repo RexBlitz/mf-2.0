@@ -497,7 +497,8 @@ async def callback_handler(callback_query: CallbackQuery):
     original_data = data
     
     # Updated pagination check to exclude filter commands - extracts batch_num from callback data
-    if "|" in data and not data.startswith(("manage_acc_filter|", "manage_acc_nat_")):
+    # Don't extract from view_batch, batch_toggle_all, batch_filter_all, batch_relogin as they handle their own batch_num
+    if "|" in data and not data.startswith(("manage_acc_filter|", "manage_acc_nat_", "view_batch|", "batch_toggle_all|", "batch_filter_all|", "batch_filter_apply_all|", "batch_relogin|")):
         data_parts = data.split("|")
         try:
             if len(data_parts) > 1 and data_parts[-1].isdigit():
