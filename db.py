@@ -311,6 +311,9 @@ async def delete_token(telegram_user_id, token):
     if (await get_current_account(telegram_user_id)) == token:
         await set_current_account(telegram_user_id, None)
     await user_db.update_one({"type": "info_cards"}, {"$unset": {f"data.{token}": ""}})
+    
+    # NEW: Re-organize batches after deletion to fix index corruption
+    await auto_reorganize_batches_after_deletion(telegram_user_id)
 
 async def cleanup_duplicate_emails(telegram_user_id):
     """Remove duplicate email entries, keeping only the latest token for each email"""
@@ -512,7 +515,191 @@ async def has_interacted(telegram_user_id, action_type, user_token):
 async def log_interaction(telegram_user_id, action_type, user_token):
     await db.interactions.insert_one({"user_id": telegram_user_id, "action_type": action_type, "user_token": user_token, "timestamp": datetime.datetime.utcnow()})
 
+# --- Batch Management Functions ---
 
+async def get_batches(telegram_user_id: int) -> list:
+    """Get all batches with their accounts"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    batches_doc = await user_db.find_one({"type": "batches"})
+    return batches_doc.get("items", []) if batches_doc else []
+
+async def get_last_batch(user_id: int) -> Tuple[Optional[Dict], int]:
+    """Retrieves the last created batch and the total number of tokens."""
+    user_db = _get_user_collection(user_id)
+    batches_doc = await user_db.find_one({"type": "batches"})
+    tokens_doc = await user_db.find_one({"type": "tokens"})
+    
+    tokens = tokens_doc.get("items", []) if tokens_doc else []
+    total_tokens = len(tokens)
+    
+    if batches_doc and batches_doc.get("items"):
+        last_batch = batches_doc["items"][-1]
+        return last_batch, total_tokens
+    
+    return None, total_tokens
+
+async def add_token_to_auto_batch(user_id: int, token_index: int):
+    """Adds a newly created token (by index) to the correct batch (batches of 10)."""
+    await _ensure_user_collection_exists(user_id)
+    user_db = _get_user_collection(user_id)
+    
+    last_batch_data, total_tokens = await get_last_batch(user_id)
+    
+    # Calculate the current batch number (e.g., index 0-9 is Batch 1, index 10-19 is Batch 2)
+    new_batch_number = (token_index // 10) + 1
+    new_batch_name = f"Batch {new_batch_number}"
+
+    if last_batch_data and last_batch_data.get("name") == new_batch_name:
+        # Case 1: Add to existing, non-full batch (should always be the last one)
+        await user_db.update_one(
+            {"type": "batches", "items.name": new_batch_name},
+            {"$push": {"items.$.token_indices": token_index}}
+        )
+    else:
+        # Case 2: Create a brand new batch for this index (e.g., token 0 or token 10, 20, etc.)
+        batch_data = {
+            "name": new_batch_name,
+            "token_indices": [token_index],
+            "active": True,
+            "filter_nationality": ""
+        }
+        await user_db.update_one(
+            {"type": "batches"},
+            {"$push": {"items": batch_data}},
+            upsert=True
+        )
+
+async def create_batch(telegram_user_id: int, batch_name: str, token_indices: list) -> bool:
+    """Create a new batch with specified token indices"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+
+    batch_data = {
+        "name": batch_name,
+        "token_indices": token_indices,
+        "active": True,
+        "filter_nationality": ""
+    }
+
+    await user_db.update_one(
+        {"type": "batches"},
+        {"$push": {"items": batch_data}},
+        upsert=True
+    )
+    return True
+
+async def toggle_batch_status(telegram_user_id: int, batch_name: str):
+    """Toggle the active status of all accounts in a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+
+    batches_doc = await user_db.find_one({"type": "batches"})
+    if not batches_doc:
+        return False
+
+    tokens = await get_tokens(telegram_user_id)
+    batch_found = False
+    new_status = True
+
+    for batch in batches_doc.get("items", []):
+        if batch["name"] == batch_name:
+            batch_found = True
+            new_status = not batch.get("active", True)
+
+            for idx in batch.get("token_indices", []):
+                if 0 <= idx < len(tokens):
+                    await set_account_active(telegram_user_id, tokens[idx]["token"], new_status)
+
+            await user_db.update_one(
+                {"type": "batches", "items.name": batch_name},
+                {"$set": {"items.$.active": new_status}}
+            )
+            break
+
+    return batch_found
+
+async def set_batch_filter(telegram_user_id: int, batch_name: str, nationality_code: str):
+    """Set nationality filter for all accounts in a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+
+    batches_doc = await user_db.find_one({"type": "batches"})
+    if not batches_doc:
+        return False
+
+    tokens = await get_tokens(telegram_user_id)
+
+    for batch in batches_doc.get("items", []):
+        if batch["name"] == batch_name:
+            for idx in batch.get("token_indices", []):
+                if 0 <= idx < len(tokens):
+                    filters = await get_user_filters(telegram_user_id, tokens[idx]["token"]) or {}
+                    filters["filterNationalityCode"] = nationality_code
+                    await set_user_filters(telegram_user_id, tokens[idx]["token"], filters)
+
+            await user_db.update_one(
+                {"type": "batches", "items.name": batch_name},
+                {"$set": {"items.$.filter_nationality": nationality_code}}
+            )
+            return True
+
+    return False
+
+async def get_batch_by_name(telegram_user_id: int, batch_name: str):
+    """Get a specific batch by name"""
+    batches = await get_batches(telegram_user_id)
+    for batch in batches:
+        if batch["name"] == batch_name:
+            return batch
+    return None
+
+async def auto_reorganize_batches_after_deletion(user_id: int):
+    """
+    Clears all existing batches and re-creates them based on the new token indices
+    after a deletion event. It attempts to preserve batch filters/status.
+    This corrects index corruption and removes empty batches.
+    """
+    user_db = _get_user_collection(user_id)
+    tokens = await get_tokens(user_id)
+    
+    # 1. Get current batches to preserve filters/status
+    old_batches = await get_batches(user_id)
+    batch_metadata = {
+        batch["name"]: {
+            "filter": batch.get("filter_nationality", ""),
+            "active": batch.get("active", True)
+        } 
+        for batch in old_batches
+    }
+
+    # 2. Re-create all batches based on current indices
+    new_batches = {}
+    for index, token in enumerate(tokens):
+        # Calculate the batch number (0-9 is Batch 1, 10-19 is Batch 2, etc.)
+        batch_number = (index // 10) + 1
+        batch_name = f"Batch {batch_number}"
+        
+        if batch_name not in new_batches:
+            # Initialize new batch data, attempting to restore old metadata
+            metadata = batch_metadata.get(batch_name, {"active": True, "filter": ""})
+            
+            new_batches[batch_name] = {
+                "name": batch_name,
+                "token_indices": [],
+                "active": metadata["active"],
+                "filter_nationality": metadata["filter"]
+            }
+            
+        new_batches[batch_name]["token_indices"].append(index)
+
+    # 3. Replace the entire 'items' array with the new, corrected list of batches
+    new_items_list = list(new_batches.values())
+    await user_db.update_one(
+        {"type": "batches"},
+        {"$set": {"items": new_items_list}},
+        upsert=True
+    )
 
 # REMOVED auto_organize_batches as it's replaced by automated logic
 
@@ -727,6 +914,43 @@ async def is_chatroom_sent(user_id: int, token: str, person_id: str) -> bool:
     if doc:
         return person_id in doc.get("chatroom_sent", {}).get(token, {})
     return False
+
+
+# --- Batch Account Nationality Filters ---
+
+async def set_batch_account_filter(telegram_user_id: int, batch_name: str, token_index: int, nationality_code: str):
+    """Set nationality filter for a specific account within a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    
+    # Initialize batch_account_filters doc if it doesn't exist
+    await user_db.update_one(
+        {"type": "batch_account_filters"},
+        {"$set": {f"{batch_name}.{token_index}": nationality_code}},
+        upsert=True
+    )
+
+
+async def get_batch_account_filter(telegram_user_id: int, batch_name: str, token_index: int) -> str:
+    """Get nationality filter for a specific account within a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    
+    doc = await user_db.find_one({"type": "batch_account_filters"})
+    if doc and batch_name in doc:
+        return doc[batch_name].get(str(token_index), "")
+    return ""
+
+
+async def get_all_batch_account_filters(telegram_user_id: int, batch_name: str) -> dict:
+    """Get all account filters for a batch"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    user_db = _get_user_collection(telegram_user_id)
+    
+    doc = await user_db.find_one({"type": "batch_account_filters"})
+    if doc and batch_name in doc:
+        return doc[batch_name]
+    return {}
 
 
 # --- Blocked Users ---
