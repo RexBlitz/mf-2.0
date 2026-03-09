@@ -136,7 +136,6 @@ def get_confirmation_menu(action_type: str) -> InlineKeyboardMarkup:
 
 async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
     batches = await get_batches(user_id)
-    tokens = await get_tokens(user_id)
     buttons = []
     for batch in batches:
         batch_name = batch.get("name", "Unnamed")
@@ -148,11 +147,12 @@ async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
         buttons.append([
             InlineKeyboardButton(text=f"{batch_name}{nat_display}", callback_data=f"view_batch_{batch_name}"),
             InlineKeyboardButton(text=status, callback_data=f"toggle_batch_{batch_name}"),
+            InlineKeyboardButton(text="Relogin", callback_data=f"batch_relogin_{batch_name}"), # New Button
             InlineKeyboardButton(text="Filter", callback_data=f"batch_filter_{batch_name}")
         ])
     buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
-
+    
 def get_batch_filter_menu(batch_name: str) -> InlineKeyboardMarkup:
     countries = [
         ("RU", "Russia"), ("UA", "Ukraine"), ("BY", "Belarus"), ("IR", "Iran"), ("PH", "Philippines"),
@@ -887,6 +887,56 @@ async def callback_handler(callback_query: CallbackQuery):
     elif data.startswith("batch_filter_"):
         batch_name = data.replace("batch_filter_", "")
         await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
+    elif data.startswith("batch_relogin_"):
+        batch_name = data.replace("batch_relogin_", "")
+        batch = await get_batch_by_name(user_id, batch_name)
+        if not batch: 
+            return await callback_query.answer("Batch not found.")
+
+        tokens_list = await get_tokens(user_id)
+        indices = batch.get("token_indices", [])
+        
+        status_msg = await callback_query.message.edit_text(
+            f"<b>🔄 Re-signing {batch_name}...</b>\nProcessing {len(indices)} accounts.",
+            parse_mode="HTML"
+        )
+
+        from signup import try_signin
+        from db import update_token_at_index
+        
+        success = 0
+        failed = 0
+
+        for idx in indices:
+            if idx >= len(tokens_list): continue
+            
+            account = tokens_list[idx]
+            email = account.get("email")
+            password = account.get("password")
+
+            if not email or not password:
+                failed += 1
+                continue
+
+            # This uses the same device info generation logic stored for that email
+            res = await try_signin(email, password, user_id)
+            
+            if res.get("accessToken"):
+                new_token = res["accessToken"]
+                # Update DB at exact index to preserve position
+                await update_token_at_index(user_id, idx, new_token)
+                success += 1
+            else:
+                failed += 1
+            
+            # Small delay to avoid rate limits
+            await asyncio.sleep(0.5)
+
+        await status_msg.edit_text(
+            f"<b>Batch Relogin Complete</b>\n\n✅ Success: {success}\n❌ Failed: {failed}",
+            reply_markup=await get_batch_management_menu(user_id),
+            parse_mode="HTML"
+        )
 
     elif data.startswith("batch_nat_"):
         parts = data.split("_")
