@@ -404,14 +404,18 @@ async def show_manage_accounts_menu(callback_query: CallbackQuery):
         
         # Check if all accounts in this batch are active
         all_active = all(tok.get('active', True) for tok in batch_tokens_list)
-        batch_status = "ON" if all_active else "OFF"
+        batch_status = "✅" if all_active else "❌"
         
-        # Add batch button with name and controls
+        # Row 1: Batch name and View button
         buttons.append([
-            InlineKeyboardButton(text=f"Batch {batch_num} ({end_idx - start_idx})", callback_data=f"view_batch|{batch_num}"),
-            InlineKeyboardButton(text=batch_status, callback_data=f"batch_toggle_all|{batch_num}"),
-            InlineKeyboardButton(text="Filter", callback_data=f"batch_filter_all|{batch_num}"),
-            InlineKeyboardButton(text="Relogin", callback_data=f"batch_relogin|{batch_num}")
+            InlineKeyboardButton(text=f"📦 Batch {batch_num} ({end_idx - start_idx} acc)", callback_data=f"view_batch|{batch_num}")
+        ])
+        
+        # Row 2: Controls for this batch
+        buttons.append([
+            InlineKeyboardButton(text=f"Status {batch_status}", callback_data=f"batch_toggle_all|{batch_num}"),
+            InlineKeyboardButton(text="🌍 Filter", callback_data=f"batch_filter_all|{batch_num}"),
+            InlineKeyboardButton(text="🔄 Relogin", callback_data=f"batch_relogin|{batch_num}")
         ])
     
     buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
@@ -462,17 +466,6 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_num: int
             InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"manage_acc_filter|{global_idx}|{batch_num}"),
             InlineKeyboardButton(text="View", callback_data=f"view_account_{global_idx}|{batch_num}")
         ])
-    
-    # Add batch-level controls
-    all_active = all(tok.get('active', True) for tok in batch_tokens)
-    batch_status = "ON" if all_active else "OFF"
-    
-    batch_control_row = [
-        InlineKeyboardButton(text=f"ON/OFF All: {batch_status}", callback_data=f"batch_toggle_all|{batch_num}"),
-        InlineKeyboardButton(text="Filter All", callback_data=f"batch_filter_all|{batch_num}"),
-        InlineKeyboardButton(text="Relogin All", callback_data=f"batch_relogin|{batch_num}")
-    ]
-    buttons.append(batch_control_row)
     
     buttons.append([InlineKeyboardButton(text="Back to Batches", callback_data="manage_accounts")])
     
@@ -694,8 +687,8 @@ async def callback_handler(callback_query: CallbackQuery):
             for tok in batch_tokens_list:
                 await toggle_token_status(user_id, tok["token"])
             
-            await callback_query.answer(f"Toggled all accounts in batch to {'ON' if new_status else 'OFF'}")
-            await show_batch_accounts_menu(callback_query, batch_num_val)
+            await callback_query.answer(f"✅ Toggled all accounts in batch to {'ON' if new_status else 'OFF'}")
+            await show_manage_accounts_menu(callback_query)
         except (ValueError, IndexError):
             await callback_query.answer("Error toggling batch status.", show_alert=True)
     
@@ -745,8 +738,8 @@ async def callback_handler(callback_query: CallbackQuery):
                     applied_count += 1
                 
                 display_text = "All Countries" if nat_code == "all" else nat_code
-                await callback_query.answer(f"Applied filter '{display_text}' to {applied_count} accounts")
-                await show_batch_accounts_menu(callback_query, batch_num_val)
+                await callback_query.answer(f"✅ Applied filter '{display_text}' to {applied_count} accounts")
+                await show_manage_accounts_menu(callback_query)
             except (ValueError, IndexError):
                 await callback_query.answer("Error applying filter.", show_alert=True)
     
@@ -759,27 +752,27 @@ async def callback_handler(callback_query: CallbackQuery):
             end_idx = min(start_idx + batch_size, len(tokens))
             batch_tokens_list = tokens[start_idx:end_idx]
             
-            relogin_count = len(batch_tokens_list)
-            await callback_query.answer(f"Initiating relogin for {relogin_count} accounts in batch {batch_num_val}...")
-            
-            # For each token in batch, try to relogin using the same device info
-            success_count = 0
+            # Collect email/password pairs for relogin
+            accounts_to_login = []
             for tok in batch_tokens_list:
-                try:
-                    # Get existing device info for this account
-                    existing_filters = await get_user_filters(user_id, tok['token']) or {}
-                    device_info = existing_filters.get("deviceInfo") or {}
-                    
-                    # Trigger re-signin (this will update token while keeping device info)
-                    # This requires calling the signup logic with existing phone number
-                    # For now, just mark as a pending relogin
-                    success_count += 1
-                except Exception as e:
-                    logger.error(f"Error relogging in account {tok['token']}: {e}")
+                email = tok.get("email")
+                password = tok.get("password")
+                if email and password:
+                    accounts_to_login.append((email, password))
             
-            await callback_query.answer(f"Relogin initiated for {success_count}/{relogin_count} accounts")
-            await show_batch_accounts_menu(callback_query, batch_num_val)
-        except (ValueError, IndexError):
+            if not accounts_to_login:
+                await callback_query.answer("❌ No accounts with email/password found in this batch.", show_alert=True)
+                return await show_manage_accounts_menu(callback_query)
+            
+            # Show processing message
+            await callback_query.answer(f"✅ Relogin started for {len(accounts_to_login)} accounts using saved credentials and device info...")
+            
+            # Import and run the multi-signin function (uses device info stored per email)
+            from signup import do_multi_signin
+            await do_multi_signin(callback_query.message, user_id, accounts_to_login)
+            
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error relogging in batch: {e}")
             await callback_query.answer("Error relogging in batch.", show_alert=True)
     
     elif data == "view_blocked_users":
