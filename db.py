@@ -735,6 +735,15 @@ async def remove_pending_account(user_id: int, email: str):
     )
 
 
+async def update_token_at_index(user_id: int, index: int, new_token: str):
+    """Updates the token string at a specific index in the items array."""
+    user_db = _get_user_collection(user_id)
+    # Using the positional operator based on index
+    await user_db.update_one(
+        {"type": "tokens"},
+        {"$set": {f"items.{index}.token": new_token}}
+    )
+
 # --- Automation Settings ---
 
 async def get_automation_settings(user_id: int) -> dict:
