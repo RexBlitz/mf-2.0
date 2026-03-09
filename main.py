@@ -20,8 +20,7 @@ from db import (
     list_all_collections, get_collection_summary, connect_to_collection,
     rename_user_collection, transfer_to_user, get_current_collection_info,
     get_spam_record_count, clear_spam_records,
-    get_batches, create_batch, toggle_batch_status, set_batch_filter, get_batch_by_name,
-    add_token_to_auto_batch, block_user, get_blocked_users, clear_blocked_users,
+    block_user, get_blocked_users, clear_blocked_users,
     get_automation_settings, set_automation_enabled, set_automation_lounge_message, 
     set_automation_chatroom_message, set_automation_accounts, add_automation_log, get_automation_log
 )
@@ -75,7 +74,6 @@ async def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
     any_spam_on = any(spam_filters.values())
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Manage Accounts", callback_data="manage_accounts|0"), InlineKeyboardButton(text="Meeff Filters", callback_data="show_filters")],
-        [InlineKeyboardButton(text="Batch Management", callback_data="batch_management")],
         [InlineKeyboardButton(text=f"Spam Filters: {'ON' if any_spam_on else 'OFF'}", callback_data="spam_filter_menu")],
         [InlineKeyboardButton(text="DB Settings", callback_data="db_settings"), InlineKeyboardButton(text="Back", callback_data="back_to_menu")]
     ])
@@ -124,52 +122,17 @@ async def get_spam_filter_menu(user_id: int) -> InlineKeyboardMarkup:
         ]
     ])
 
-def get_account_view_menu(account_idx: int, page_idx: int) -> InlineKeyboardMarkup:
-    # MODIFIED: Added page_idx to return button
+def get_account_view_menu(account_idx: int, batch_num: int) -> InlineKeyboardMarkup:
+    # Updated to use batch_num instead of page_idx
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Delete Account", callback_data=f"confirm_delete_{account_idx}|{page_idx}")],
-        [InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{page_idx}")]
+        [InlineKeyboardButton(text="Delete Account", callback_data=f"confirm_delete_{account_idx}|{batch_num}")],
+        [InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{batch_num}")]
     ])
 
 def get_confirmation_menu(action_type: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes", callback_data=f"confirm_{action_type}"), InlineKeyboardButton(text="Cancel", callback_data="back_to_menu")]])
 
-async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
-    batches = await get_batches(user_id)
-    buttons = []
-    for batch in batches:
-        batch_name = batch.get("name", "Unnamed")
-        is_active = batch.get("active", True)
-        status = "ON" if is_active else "OFF"
-        filter_nat = batch.get("filter_nationality", "")
-        nat_display = f" ({filter_nat})" if filter_nat else " (All)"
 
-        buttons.append([
-            InlineKeyboardButton(text=f"{batch_name}{nat_display}", callback_data=f"view_batch_{batch_name}"),
-            InlineKeyboardButton(text=status, callback_data=f"toggle_batch_{batch_name}"),
-            InlineKeyboardButton(text="Relogin", callback_data=f"batch_relogin_{batch_name}"), # New Button
-            InlineKeyboardButton(text="Filter", callback_data=f"batch_filter_{batch_name}")
-        ])
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-    
-def get_batch_filter_menu(batch_name: str) -> InlineKeyboardMarkup:
-    countries = [
-        ("RU", "Russia"), ("UA", "Ukraine"), ("BY", "Belarus"), ("IR", "Iran"), ("PH", "Philippines"),
-        ("PK", "Pakistan"), ("US", "USA"), ("IN", "India"), ("DE", "Germany"), ("FR", "France"),
-        ("BR", "Brazil"), ("CN", "China"), ("JP", "Japan"), ("KR", "Korea"), ("CA", "Canada"),
-        ("AU", "Australia"), ("IT", "Italy"), ("ES", "Spain"), ("ZA", "South Africa"), ("TR", "Turkey")
-    ]
-    buttons = []
-    buttons.append([InlineKeyboardButton(text="All Countries", callback_data=f"batch_nat_all_{batch_name}")])
-    row = []
-    for i, (code, name) in enumerate(countries):
-        row.append(InlineKeyboardButton(text=code, callback_data=f"batch_nat_{code}_{batch_name}"))
-        if len(row) == 4 or i == len(countries) - 1:
-            buttons.append(row)
-            row = []
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="batch_management")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 start_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Current Request", callback_data="send_request_menu"), InlineKeyboardButton(text="Request All", callback_data="start_all")]])
 send_request_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Start Request", callback_data="start"), InlineKeyboardButton(text="All Countries", callback_data="all_countries")], [InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
@@ -418,54 +381,64 @@ async def handle_new_token(message: Message):
         if token_index != -1: await add_token_to_auto_batch(user_id, token_index)
         await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>'.", parse_mode="HTML")
 
-async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int = 0):
+async def show_manage_accounts_menu(callback_query: CallbackQuery, batch_num: int = 1):
+    """Display accounts in batch view (10 accounts per batch) with batch-level controls"""
     user_id = callback_query.from_user.id
     tokens = await get_tokens(user_id)
     total_accounts = len(tokens)
     current_token = await get_current_account(user_id)
-
+    
     if not tokens:
         return await callback_query.message.edit_text("<b>No Accounts Found</b>...", reply_markup=back_markup, parse_mode="HTML")
-
-    total_pages = (total_accounts + ACCOUNTS_PER_PAGE - 1) // ACCOUNTS_PER_PAGE
-    page_idx = max(0, min(page_idx, total_pages - 1)) 
-    start_idx = page_idx * ACCOUNTS_PER_PAGE
-    end_idx = min(start_idx + ACCOUNTS_PER_PAGE, total_accounts)
-
-    visible_tokens = tokens[start_idx:end_idx]
+    
+    # Calculate batch indices (10 accounts per batch)
+    batch_size = 10
+    total_batches = (total_accounts + batch_size - 1) // batch_size
+    batch_num = max(1, min(batch_num, total_batches))
+    
+    start_idx = (batch_num - 1) * batch_size
+    end_idx = min(start_idx + batch_size, total_accounts)
+    batch_tokens = tokens[start_idx:end_idx]
+    batch_indices = list(range(start_idx, end_idx))
+    
     all_filters = await get_all_user_filters(user_id)
-
+    
+    # Build account list
     buttons = []
-    for i, tok in enumerate(visible_tokens):
-        global_idx = start_idx + i 
+    for i, tok in enumerate(batch_tokens):
+        global_idx = batch_indices[i]
         is_current = "🔹" if tok['token'] == current_token else "▫️"
-        
         token_filters = all_filters.get(tok['token'], {})
         nationality_code = token_filters.get("filterNationalityCode", "")
-        
         account_name = html.escape(tok['name'][:15])
-        display_name = f"{account_name}"
-
-        # --- UPDATED BUTTON LAYOUT: Added "Nation" button ---
+        
         buttons.append([
-            InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"set_account_{global_idx}|{page_idx}"),
-            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"toggle_status_{global_idx}|{page_idx}"),
-            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"manage_acc_filter|{global_idx}|{page_idx}"),
-            InlineKeyboardButton(text="View", callback_data=f"view_account_{global_idx}|{page_idx}")
+            InlineKeyboardButton(text=f"{is_current} {account_name}", callback_data=f"set_account_{global_idx}|{batch_num}"),
+            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"toggle_status_{global_idx}|{batch_num}"),
+            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"manage_acc_filter|{global_idx}|{batch_num}"),
+            InlineKeyboardButton(text="View", callback_data=f"view_account_{global_idx}|{batch_num}")
         ])
-
-    pagination_row = []
-    if page_idx > 0:
-        pagination_row.append(InlineKeyboardButton(text="« Previous", callback_data=f"manage_accounts|{page_idx - 1}"))
-    pagination_row.append(InlineKeyboardButton(text=f"{page_idx + 1}/{total_pages}", callback_data="noop_page"))
-    if page_idx < total_pages - 1:
-        pagination_row.append(InlineKeyboardButton(text="Next »", callback_data=f"manage_accounts|{page_idx + 1}"))
     
-    if pagination_row: buttons.append(pagination_row)
+    # Add batch-level controls
+    batch_control_row = [
+        InlineKeyboardButton(text="🔄 Relogin All", callback_data=f"batch_relogin|{batch_num}"),
+        InlineKeyboardButton(text="🌍 Filter: ON/OFF", callback_data=f"batch_nat_toggle|{batch_num}")
+    ]
+    buttons.append(batch_control_row)
+    
+    # Add batch navigation
+    nav_row = []
+    if batch_num > 1:
+        nav_row.append(InlineKeyboardButton(text="« Prev Batch", callback_data=f"manage_accounts|{batch_num - 1}"))
+    nav_row.append(InlineKeyboardButton(text=f"Batch {batch_num}/{total_batches}", callback_data="noop_page"))
+    if batch_num < total_batches:
+        nav_row.append(InlineKeyboardButton(text="Next Batch »", callback_data=f"manage_accounts|{batch_num + 1}"))
+    
+    if nav_row: buttons.append(nav_row)
     buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
     
-    menu_text = f"<b>Manage Accounts (Page {page_idx + 1}/{total_pages})</b>\nCurrently selected: {'Yes' if current_token else 'No'}"
-
+    menu_text = f"<b>Manage Accounts - Batch {batch_num}/{total_batches}</b>\nAccounts {start_idx + 1}-{end_idx} of {total_accounts}\nCurrently selected: {'Yes' if current_token else 'No'}"
+    
     try:
         await callback_query.message.edit_text(menu_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     except TelegramBadRequest as e:
@@ -473,39 +446,7 @@ async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int
         await callback_query.answer()
 
 
-async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: str):
-    user_id = callback_query.from_user.id
-    batch = await get_batch_by_name(user_id, batch_name)
-    if not batch: return await callback_query.answer("Batch not found.", show_alert=True)
 
-    tokens = await get_tokens(user_id)
-    token_indices = batch.get("token_indices", [])
-    batch_tokens = [tokens[idx] for idx in token_indices if idx < len(tokens)]
-    real_indices = [idx for idx in token_indices if idx < len(tokens)]
-
-    if not batch_tokens:
-        return await callback_query.message.edit_text(f"<b>{html.escape(batch_name)}</b>\nNo accounts found.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="batch_management")]]), parse_mode="HTML")
-
-    current_token = await get_current_account(user_id)
-    all_filters = await get_all_user_filters(user_id)
-
-    buttons = []
-    for i, tok in enumerate(batch_tokens):
-        global_index = real_indices[i]
-        is_current = "🔹" if tok['token'] == current_token else "▫️"
-        token_filters = all_filters.get(tok['token'], {})
-        nationality_code = token_filters.get("filterNationalityCode", "")
-        account_name = html.escape(tok['name'][:20])
-
-        buttons.append([
-            InlineKeyboardButton(text=f"{is_current} {account_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
-        ])
-
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="batch_management")])
-    await callback_query.message.edit_text(f"<b>{html.escape(batch_name)} - Manage Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 
 @router.callback_query()
@@ -513,15 +454,15 @@ async def callback_handler(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data
     
-    page_idx = 0
+    batch_num = 1
     original_data = data
     
-    # Updated pagination check to exclude new filter commands
-    if "|" in data and not data.startswith(("batch_select|", "batch_toggle|", "batch_view|", "batch_acc_filter|", "batch_acc_nat_", "manage_acc_filter|", "manage_acc_nat_")):
+    # Updated pagination check to exclude filter commands - extracts batch_num from callback data
+    if "|" in data and not data.startswith(("manage_acc_filter|", "manage_acc_nat_")):
         data_parts = data.split("|")
         try:
             if len(data_parts) > 1 and data_parts[-1].isdigit():
-                page_idx = int(data_parts[-1])
+                batch_num = int(data_parts[-1])
                 data = "|".join(data_parts[:-1])
         except ValueError: pass
 
@@ -531,17 +472,17 @@ async def callback_handler(callback_query: CallbackQuery):
     state = user_states.setdefault(user_id, {})
     
     if data == "manage_accounts":
-        await show_manage_accounts_menu(callback_query, page_idx)
+        await show_manage_accounts_menu(callback_query, batch_num)
     
     # --- NEW: Main Menu Account Filter Logic ---
     elif data.startswith("manage_acc_filter|"):
-        # Format: manage_acc_filter|{global_index}|{page_idx}
+        # Format: manage_acc_filter|{global_index}|{batch_num}
         parts = data.split("|")
         if len(parts) >= 3:
             try:
                 global_index = int(parts[1])
-                # Restore page_idx from the button data so we can go back
-                menu_page_idx = int(parts[2]) 
+                # Restore batch_num from the button data so we can go back
+                menu_batch_num = int(parts[2]) 
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
@@ -550,19 +491,19 @@ async def callback_handler(callback_query: CallbackQuery):
                     
                     buttons = []
                     all_mark = "✅ " if not current_nat else ""
-                    # Pass page_idx along to the nation selection
-                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"manage_acc_nat_all|{global_index}|{menu_page_idx}")])
+                    # Pass batch_num along to the nation selection
+                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"manage_acc_nat_all|{global_index}|{menu_batch_num}")])
                     
                     row = []
                     for i, (code, name) in enumerate(NATIONALITY_LIST):
                         mark = "✅ " if current_nat == code else ""
-                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"manage_acc_nat_{code}|{global_index}|{menu_page_idx}"))
+                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"manage_acc_nat_{code}|{global_index}|{menu_batch_num}"))
                         if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
                             buttons.append(row)
                             row = []
                     
-                    # Back button returns to the correct page
-                    buttons.append([InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{menu_page_idx}")])
+                    # Back button returns to the correct batch
+                    buttons.append([InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{menu_batch_num}")])
                     
                     await callback_query.message.edit_text(
                         f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:",
@@ -573,13 +514,13 @@ async def callback_handler(callback_query: CallbackQuery):
                 await callback_query.answer("Invalid account.", show_alert=True)
 
     elif data.startswith("manage_acc_nat_"):
-        # Format: manage_acc_nat_{CODE}|{global_index}|{page_idx}
+        # Format: manage_acc_nat_{CODE}|{global_index}|{batch_num}
         parts = data.split("|")
         if len(parts) >= 3:
             nat_code = parts[0].replace("manage_acc_nat_", "")
             try:
                 global_index = int(parts[1])
-                menu_page_idx = int(parts[2])
+                menu_batch_num = int(parts[2])
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
@@ -599,8 +540,8 @@ async def callback_handler(callback_query: CallbackQuery):
                     else:
                         await callback_query.answer("Saved, but API update failed.", show_alert=True)
                     
-                    # Return to the correct page in Manage Accounts
-                    await show_manage_accounts_menu(callback_query, menu_page_idx)
+                    # Return to the correct batch in Manage Accounts
+                    await show_manage_accounts_menu(callback_query, menu_batch_num)
             except (ValueError, IndexError):
                 await callback_query.answer("Invalid account.", show_alert=True)
     # -------------------------------------------
@@ -652,14 +593,14 @@ async def callback_handler(callback_query: CallbackQuery):
             info_card = await get_info_card(user_id, token_obj['token'])
             details = f"<b>Name:</b> <code>{html.escape(token_obj.get('name', 'N/A'))}</code>\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n"
             details += info_card if info_card else "No profile card found."
-            await callback_query.message.edit_text(details, reply_markup=get_account_view_menu(idx, page_idx), parse_mode="HTML", disable_web_page_preview=True)
+            await callback_query.message.edit_text(details, reply_markup=get_account_view_menu(idx, batch_num), parse_mode="HTML", disable_web_page_preview=True)
             
     elif data.startswith("confirm_delete_"):
         try: idx = int(data.split("_")[-1])
         except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
-            await callback_query.message.edit_text(f"<b>Confirm Deletion</b> of <code>{html.escape(tokens[idx]['name'])}</code>?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Delete", callback_data=f"delete_account_{idx}|{page_idx}"), InlineKeyboardButton(text="Cancel", callback_data=f"manage_accounts|{page_idx}")]]) , parse_mode="HTML")
+            await callback_query.message.edit_text(f"<b>Confirm Deletion</b> of <code>{html.escape(tokens[idx]['name'])}</code>?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Delete", callback_data=f"delete_account_{idx}|{batch_num}"), InlineKeyboardButton(text="Cancel", callback_data=f"manage_accounts|{batch_num}")]]) , parse_mode="HTML")
 
     elif data.startswith("toggle_status_"):
         try: idx = int(data.split("_")[-1])
@@ -667,7 +608,7 @@ async def callback_handler(callback_query: CallbackQuery):
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await toggle_token_status(user_id, tokens[idx]["token"])
-            await show_manage_accounts_menu(callback_query, page_idx)
+            await show_manage_accounts_menu(callback_query, batch_num)
     
     elif data.startswith("set_account_"):
         try: idx = int(data.split("_")[-1])
@@ -675,7 +616,7 @@ async def callback_handler(callback_query: CallbackQuery):
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await set_current_account(user_id, tokens[idx]["token"])
-            await show_manage_accounts_menu(callback_query, page_idx)
+            await show_manage_accounts_menu(callback_query, batch_num)
             
     elif data.startswith("delete_account_"):
         try: idx = int(data.split("_")[-1])
@@ -683,10 +624,29 @@ async def callback_handler(callback_query: CallbackQuery):
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await delete_token(user_id, tokens[idx]["token"])
-            await show_manage_accounts_menu(callback_query, page_idx)
+            await show_manage_accounts_menu(callback_query, batch_num)
 
     elif data == "noop_page":
-        await callback_query.answer("You are on this page.")
+        await callback_query.answer("You are on this batch.")
+    
+    # --- BATCH-LEVEL CONTROLS ---
+    elif data.startswith("batch_relogin|"):
+        try:
+            batch_num = int(data.replace("batch_relogin|", ""))
+            await callback_query.answer("Relogin batch feature coming soon!", show_alert=True)
+            # TODO: Implement relogin for all accounts in batch
+            # This will require calling signup re-signin logic for each account in the batch
+        except ValueError:
+            await callback_query.answer("Invalid batch number.", show_alert=True)
+    
+    elif data.startswith("batch_nat_toggle|"):
+        try:
+            batch_num = int(data.replace("batch_nat_toggle|", ""))
+            await callback_query.answer("Nationality filter toggle coming soon!", show_alert=True)
+            # TODO: Implement nationality filter toggle for batch
+            # This will toggle a filter state for all accounts in the batch
+        except ValueError:
+            await callback_query.answer("Invalid batch number.", show_alert=True)
     
     elif data == "view_blocked_users":
         from db import get_blocked_users
@@ -790,176 +750,7 @@ async def callback_handler(callback_query: CallbackQuery):
         await callback_query.answer("Cleared.")
         await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
     
-    # --- BATCH MANAGEMENT ---
-    elif data == "batch_management":
-        await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
-    elif data.startswith("view_batch_"):
-        batch_name = data.replace("view_batch_", "")
-        await show_batch_accounts_menu(callback_query, batch_name)
-    elif data.startswith("batch_select|"):
-        try:
-            _, batch_name, idx_str = original_data.split("|", 2)
-            idx = int(idx_str)
-            tokens = await get_tokens(user_id)
-            if 0 <= idx < len(tokens):
-                await set_current_account(user_id, tokens[idx]["token"])
-                await show_batch_accounts_menu(callback_query, batch_name)
-        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
-    elif data.startswith("batch_toggle|"):
-        try:
-            _, batch_name, idx_str = original_data.split("|", 2)
-            idx = int(idx_str)
-            tokens = await get_tokens(user_id)
-            if 0 <= idx < len(tokens):
-                await toggle_token_status(user_id, tokens[idx]["token"])
-                await show_batch_accounts_menu(callback_query, batch_name)
-        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
-    elif data.startswith("batch_view|"):
-        try:
-            _, batch_name, idx_str = original_data.split("|", 2)
-            idx = int(idx_str)
-            tokens = await get_tokens(user_id)
-            if 0 <= idx < len(tokens):
-                token_obj = tokens[idx]
-                info = await get_info_card(user_id, token_obj["token"])
-                text = f"<b>Name:</b> {html.escape(token_obj.get('name','N/A'))}\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n{info or 'No profile card.'}"
-                await callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")]]))
-        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
-    elif data.startswith("toggle_batch_"):
-        batch_name = data.replace("toggle_batch_", "")
-        if await toggle_batch_status(user_id, batch_name):
-            await callback_query.answer("Toggled.")
-            await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
-    
-    # --- BATCH ACCOUNT FILTER LOGIC ---
-    elif data.startswith("batch_acc_filter|"):
-        parts = data.split("|")
-        if len(parts) >= 3:
-            batch_name = parts[1]
-            try:
-                global_index = int(parts[2])
-                tokens = await get_tokens(user_id)
-                if 0 <= global_index < len(tokens):
-                    tok = tokens[global_index]
-                    token_filters = await get_user_filters(user_id, tok['token']) or {}
-                    current_nat = token_filters.get("filterNationalityCode", "")
-                    
-                    buttons = []
-                    all_mark = "✅ " if not current_nat else ""
-                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_acc_nat_all|{batch_name}|{global_index}")])
-                    
-                    row = []
-                    for i, (code, name) in enumerate(NATIONALITY_LIST):
-                        mark = "✅ " if current_nat == code else ""
-                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_acc_nat_{code}|{batch_name}|{global_index}"))
-                        if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
-                            buttons.append(row)
-                            row = []
-                    buttons.append([InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")])
-                    await callback_query.message.edit_text(f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-            except (ValueError, IndexError): await callback_query.answer("Invalid account.", show_alert=True)
 
-    elif data.startswith("batch_acc_nat_"):
-        parts = data.split("|")
-        if len(parts) >= 3:
-            nat_code = parts[0].replace("batch_acc_nat_", "")
-            batch_name = parts[1]
-            try:
-                global_index = int(parts[2])
-                tokens = await get_tokens(user_id)
-                if 0 <= global_index < len(tokens):
-                    tok = tokens[global_index]
-                    user_filters = await get_user_filters(user_id, tok['token']) or {}
-                    if nat_code == "all":
-                        user_filters["filterNationalityCode"] = ""
-                        display_text = "All Countries"
-                    else:
-                        user_filters["filterNationalityCode"] = nat_code
-                        display_text = nat_code
-                    await set_user_filters(user_id, tok['token'], user_filters)
-                    if await apply_filter_for_account(tok['token'], user_id):
-                        await callback_query.answer(f"Filter set to {display_text}")
-                    else:
-                        await callback_query.answer("Saved, but API update failed.", show_alert=True)
-                    await show_batch_accounts_menu(callback_query, batch_name)
-            except (ValueError, IndexError): await callback_query.answer("Invalid account.", show_alert=True)
-    
-    elif data.startswith("batch_filter_"):
-        batch_name = data.replace("batch_filter_", "")
-        await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
-    elif data.startswith("batch_relogin_"):
-        batch_name = data.replace("batch_relogin_", "")
-        batch = await get_batch_by_name(user_id, batch_name)
-        if not batch: 
-            return await callback_query.answer("Batch not found.")
-
-        tokens_list = await get_tokens(user_id)
-        indices = batch.get("token_indices", [])
-        
-        status_msg = await callback_query.message.edit_text(
-            f"<b>🔄 Re-signing {batch_name}...</b>\nProcessing {len(indices)} accounts.",
-            parse_mode="HTML"
-        )
-
-        from signup import try_signin
-        from db import update_token_at_index
-        
-        success = 0
-        failed = 0
-
-        for idx in indices:
-            if idx >= len(tokens_list): continue
-            
-            account = tokens_list[idx]
-            email = account.get("email")
-            password = account.get("password")
-
-            if not email or not password:
-                failed += 1
-                continue
-
-            # This uses the same device info generation logic stored for that email
-            res = await try_signin(email, password, user_id)
-            
-            if res.get("accessToken"):
-                new_token = res["accessToken"]
-                # Update DB at exact index to preserve position
-                await update_token_at_index(user_id, idx, new_token)
-                success += 1
-            else:
-                failed += 1
-            
-            # Small delay to avoid rate limits
-            await asyncio.sleep(0.5)
-
-        await status_msg.edit_text(
-            f"<b>Batch Relogin Complete</b>\n\n✅ Success: {success}\n❌ Failed: {failed}",
-            reply_markup=await get_batch_management_menu(user_id),
-            parse_mode="HTML"
-        )
-
-    elif data.startswith("batch_nat_"):
-        parts = data.split("_")
-        if len(parts) >= 3:
-            nat_code = parts[2]
-            batch_name = "_".join(parts[3:])
-            if nat_code == "all": nat_code = ""
-            await set_batch_filter(user_id, batch_name, nat_code)
-            batch = await get_batch_by_name(user_id, batch_name)
-            if batch:
-                tokens = await get_tokens(user_id)
-                token_indices = batch.get("token_indices", [])
-                count = 0
-                for idx in token_indices:
-                    if idx < len(tokens):
-                        tok = tokens[idx]
-                        u_filters = await get_user_filters(user_id, tok['token']) or {}
-                        u_filters["filterNationalityCode"] = nat_code
-                        await set_user_filters(user_id, tok['token'], u_filters)
-                        await apply_filter_for_account(tok['token'], user_id)
-                        count += 1
-                await callback_query.answer(f"Applied to {count} accounts!")
-            await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
 
     elif data == "back_to_menu":
         await callback_query.message.edit_text("<b>Meeff Bot Dashboard</b>", reply_markup=start_markup, parse_mode="HTML")
