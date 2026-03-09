@@ -381,8 +381,52 @@ async def handle_new_token(message: Message):
         if token_index != -1: await add_token_to_auto_batch(user_id, token_index)
         await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>'.", parse_mode="HTML")
 
-async def show_manage_accounts_menu(callback_query: CallbackQuery, batch_num: int = 1):
-    """Display accounts in batch view (10 accounts per batch) with batch-level controls"""
+async def show_manage_accounts_menu(callback_query: CallbackQuery):
+    """Display list of all batches with batch-level controls"""
+    user_id = callback_query.from_user.id
+    tokens = await get_tokens(user_id)
+    total_accounts = len(tokens)
+    
+    if not tokens:
+        return await callback_query.message.edit_text("<b>No Accounts Found</b>...", reply_markup=back_markup, parse_mode="HTML")
+    
+    # Calculate batches (10 accounts per batch)
+    batch_size = 10
+    total_batches = (total_accounts + batch_size - 1) // batch_size
+    all_filters = await get_all_user_filters(user_id)
+    
+    # Build batch list
+    buttons = []
+    for batch_num in range(1, total_batches + 1):
+        start_idx = (batch_num - 1) * batch_size
+        end_idx = min(start_idx + batch_size, total_accounts)
+        batch_tokens_list = tokens[start_idx:end_idx]
+        
+        # Check if all accounts in this batch are active
+        all_active = all(tok.get('active', True) for tok in batch_tokens_list)
+        batch_status = "ON" if all_active else "OFF"
+        
+        # Add batch button with name and controls
+        buttons.append([
+            InlineKeyboardButton(text=f"Batch {batch_num} ({end_idx - start_idx})", callback_data=f"view_batch|{batch_num}"),
+            InlineKeyboardButton(text=batch_status, callback_data=f"batch_toggle_all|{batch_num}"),
+            InlineKeyboardButton(text="Filter", callback_data=f"batch_filter_all|{batch_num}"),
+            InlineKeyboardButton(text="Relogin", callback_data=f"batch_relogin|{batch_num}")
+        ])
+    
+    buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
+    
+    menu_text = f"<b>Manage Accounts</b>\nTotal Accounts: {total_accounts}\nTotal Batches: {total_batches}"
+    
+    try:
+        await callback_query.message.edit_text(menu_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" not in e.message: logger.error(f"Error editing message: {e}")
+        await callback_query.answer()
+
+
+async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_num: int):
+    """Display accounts within a specific batch"""
     user_id = callback_query.from_user.id
     tokens = await get_tokens(user_id)
     total_accounts = len(tokens)
@@ -419,29 +463,20 @@ async def show_manage_accounts_menu(callback_query: CallbackQuery, batch_num: in
             InlineKeyboardButton(text="View", callback_data=f"view_account_{global_idx}|{batch_num}")
         ])
     
-    # Add batch-level controls - first check if all accounts are active
+    # Add batch-level controls
     all_active = all(tok.get('active', True) for tok in batch_tokens)
     batch_status = "ON" if all_active else "OFF"
     
     batch_control_row = [
         InlineKeyboardButton(text=f"ON/OFF All: {batch_status}", callback_data=f"batch_toggle_all|{batch_num}"),
-        InlineKeyboardButton(text="📍 Filter All", callback_data=f"batch_filter_all|{batch_num}"),
-        InlineKeyboardButton(text="🔄 Relogin All", callback_data=f"batch_relogin|{batch_num}")
+        InlineKeyboardButton(text="Filter All", callback_data=f"batch_filter_all|{batch_num}"),
+        InlineKeyboardButton(text="Relogin All", callback_data=f"batch_relogin|{batch_num}")
     ]
     buttons.append(batch_control_row)
     
-    # Add batch navigation
-    nav_row = []
-    if batch_num > 1:
-        nav_row.append(InlineKeyboardButton(text="« Prev Batch", callback_data=f"manage_accounts|{batch_num - 1}"))
-    nav_row.append(InlineKeyboardButton(text=f"Batch {batch_num}/{total_batches}", callback_data="noop_page"))
-    if batch_num < total_batches:
-        nav_row.append(InlineKeyboardButton(text="Next Batch »", callback_data=f"manage_accounts|{batch_num + 1}"))
+    buttons.append([InlineKeyboardButton(text="Back to Batches", callback_data="manage_accounts")])
     
-    if nav_row: buttons.append(nav_row)
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
-    
-    menu_text = f"<b>Manage Accounts - Batch {batch_num}/{total_batches}</b>\nAccounts {start_idx + 1}-{end_idx} of {total_accounts}\nCurrently selected: {'Yes' if current_token else 'No'}"
+    menu_text = f"<b>Batch {batch_num} - Accounts {start_idx + 1}-{end_idx} of {total_accounts}</b>\nCurrently selected: {'Yes' if current_token else 'No'}"
     
     try:
         await callback_query.message.edit_text(menu_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -476,7 +511,14 @@ async def callback_handler(callback_query: CallbackQuery):
     state = user_states.setdefault(user_id, {})
     
     if data == "manage_accounts":
-        await show_manage_accounts_menu(callback_query, batch_num)
+        await show_manage_accounts_menu(callback_query)
+    
+    elif data.startswith("view_batch|"):
+        try:
+            batch_num = int(data.replace("view_batch|", ""))
+            await show_batch_accounts_menu(callback_query, batch_num)
+        except ValueError:
+            await callback_query.answer("Invalid batch number.", show_alert=True)
     
     # --- NEW: Main Menu Account Filter Logic ---
     elif data.startswith("manage_acc_filter|"):
@@ -545,7 +587,7 @@ async def callback_handler(callback_query: CallbackQuery):
                         await callback_query.answer("Saved, but API update failed.", show_alert=True)
                     
                     # Return to the correct batch in Manage Accounts
-                    await show_manage_accounts_menu(callback_query, menu_batch_num)
+                    await show_batch_accounts_menu(callback_query, menu_batch_num)
             except (ValueError, IndexError):
                 await callback_query.answer("Invalid account.", show_alert=True)
     # -------------------------------------------
@@ -612,7 +654,7 @@ async def callback_handler(callback_query: CallbackQuery):
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await toggle_token_status(user_id, tokens[idx]["token"])
-            await show_manage_accounts_menu(callback_query, batch_num)
+            await show_batch_accounts_menu(callback_query, batch_num)
     
     elif data.startswith("set_account_"):
         try: idx = int(data.split("_")[-1])
@@ -620,7 +662,7 @@ async def callback_handler(callback_query: CallbackQuery):
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await set_current_account(user_id, tokens[idx]["token"])
-            await show_manage_accounts_menu(callback_query, batch_num)
+            await show_batch_accounts_menu(callback_query, batch_num)
             
     elif data.startswith("delete_account_"):
         try: idx = int(data.split("_")[-1])
@@ -628,7 +670,7 @@ async def callback_handler(callback_query: CallbackQuery):
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await delete_token(user_id, tokens[idx]["token"])
-            await show_manage_accounts_menu(callback_query, batch_num)
+            await show_batch_accounts_menu(callback_query, batch_num)
 
     elif data == "noop_page":
         await callback_query.answer("You are on this batch.")
@@ -652,7 +694,7 @@ async def callback_handler(callback_query: CallbackQuery):
                 await toggle_token_status(user_id, tok["token"])
             
             await callback_query.answer(f"Toggled all accounts in batch to {'ON' if new_status else 'OFF'}")
-            await show_manage_accounts_menu(callback_query, batch_num_val)
+            await show_batch_accounts_menu(callback_query, batch_num_val)
         except (ValueError, IndexError):
             await callback_query.answer("Error toggling batch status.", show_alert=True)
     
@@ -671,7 +713,7 @@ async def callback_handler(callback_query: CallbackQuery):
                     buttons.append(row)
                     row = []
             
-            buttons.append([InlineKeyboardButton(text="Cancel", callback_data=f"manage_accounts|{batch_num_val}")])
+            buttons.append([InlineKeyboardButton(text="Cancel", callback_data=f"view_batch|{batch_num_val}")])
             await callback_query.message.edit_text(f"<b>Apply Filter to All Accounts in Batch {batch_num_val}</b>\n\nSelect nationality to apply to all {len(NATIONALITY_LIST)} accounts:", 
                                                    reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
         except ValueError:
@@ -703,7 +745,7 @@ async def callback_handler(callback_query: CallbackQuery):
                 
                 display_text = "All Countries" if nat_code == "all" else nat_code
                 await callback_query.answer(f"Applied filter '{display_text}' to {applied_count} accounts")
-                await show_manage_accounts_menu(callback_query, batch_num_val)
+                await show_batch_accounts_menu(callback_query, batch_num_val)
             except (ValueError, IndexError):
                 await callback_query.answer("Error applying filter.", show_alert=True)
     
@@ -735,7 +777,7 @@ async def callback_handler(callback_query: CallbackQuery):
                     logger.error(f"Error relogging in account {tok['token']}: {e}")
             
             await callback_query.answer(f"Relogin initiated for {success_count}/{relogin_count} accounts")
-            await show_manage_accounts_menu(callback_query, batch_num_val)
+            await show_batch_accounts_menu(callback_query, batch_num_val)
         except (ValueError, IndexError):
             await callback_query.answer("Error relogging in batch.", show_alert=True)
     
