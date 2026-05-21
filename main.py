@@ -504,7 +504,10 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
 
-    buttons.append([InlineKeyboardButton(text="Back", callback_data="batch_management")])
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Refresh Batch", callback_data=f"refresh_batch_{batch_name}"),
+        InlineKeyboardButton(text="Back", callback_data="batch_management")
+    ])
     await callback_query.message.edit_text(f"<b>{html.escape(batch_name)} - Manage Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
 
 
@@ -887,6 +890,65 @@ async def callback_handler(callback_query: CallbackQuery):
     elif data.startswith("batch_filter_"):
         batch_name = data.replace("batch_filter_", "")
         await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
+
+    elif data.startswith("refresh_batch_"):
+        batch_name = data.replace("refresh_batch_", "")
+        batch = await get_batch_by_name(user_id, batch_name)
+        if not batch:
+            return await callback_query.answer("Batch not found.", show_alert=True)
+
+        indices = batch.get("token_indices", [])
+        all_tokens = await get_tokens(user_id)
+
+        await callback_query.answer("Refreshing batch...")
+        status_msg = await callback_query.message.answer("<b>🔄 Refreshing batch tokens...</b>", parse_mode="HTML")
+
+        success, failed, no_creds = 0, 0, 0
+
+        for idx in indices:
+            if idx >= len(all_tokens):
+                continue
+            token_data = all_tokens[idx]
+            email = token_data.get("email")
+            password = token_data.get("password")
+            name = token_data.get("name", f"Account {idx}")
+
+            if not email or not password:
+                no_creds += 1
+                continue
+
+            try:
+                from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
+                device_info = await get_or_create_device_info_for_email(user_id, email)
+                payload = get_api_payload_with_device_info(email, password, device_info)
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://api.meeff.com/auth/password/v2",
+                        json=payload,
+                        headers={'User-Agent': "okhttp/5.1.0"},
+                        timeout=10
+                    ) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            new_token = result.get("accessToken")
+                            if new_token:
+                                await set_token(user_id=user_id, token=new_token, name=name, email=email, password=password, position=idx)
+                                success += 1
+                            else:
+                                failed += 1
+                        else:
+                            failed += 1
+            except Exception as e:
+                logger.error(f"Refresh failed for {name}: {e}")
+                failed += 1
+
+            await asyncio.sleep(0.5)
+
+        result_text = f"<b>🔄 Batch Refresh Complete</b>\n\n✅ Success: {success}\n❌ Failed: {failed}"
+        if no_creds:
+            result_text += f"\n⚠️ Skipped (no credentials): {no_creds}"
+        await status_msg.edit_text(result_text, parse_mode="HTML")
 
     elif data.startswith("batch_nat_"):
         parts = data.split("_")
