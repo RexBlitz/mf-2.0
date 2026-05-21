@@ -6,7 +6,7 @@ from typing import Dict, Optional, Tuple, Any
 
 
 # MongoDB connection using the asynchronous Motor client
-client = AsyncIOMotorClient("12312320Pk..")
+client = AsyncIOMotorClient("mongodb+srv://irexanon:12312320Pk..@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB")
 db = client.meeff_bot
 
 async def get_user_collection(user_id: int):
