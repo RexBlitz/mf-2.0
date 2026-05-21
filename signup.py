@@ -297,34 +297,6 @@ async def select_available_emails(base_email: str, num_accounts: int, pending_em
     return available_emails
 
 
-async def check_invalid_tokens(user_id: int) -> List[Tuple[int, str, str]]:
-    """
-    Check all user tokens for 401 errors (expired sessions).
-    Returns list of (index, token, name) for invalid accounts.
-    """
-    from db import get_tokens
-    
-    tokens = await get_tokens(user_id)
-    invalid = []
-    
-    async with aiohttp.ClientSession() as session:
-        for idx, token_obj in enumerate(tokens):
-            token = token_obj["token"]
-            headers = {'User-Agent': "okhttp/5.1.0", 'meeff-access-token': token}
-            try:
-                async with session.get(
-                    "https://api.meeff.com/user/explore/v2?lng=71.9140141&lat=29.6264544&locale=en",
-                    headers=headers,
-                    timeout=5
-                ) as resp:
-                    if resp.status == 401:
-                        invalid.append((idx, token, token_obj.get("name", f"Account {idx+1}")))
-            except:
-                pass
-    
-    return invalid
-
-
 # -------------------------
 # Signup command (shows menu + pending count)
 # -------------------------
@@ -334,23 +306,12 @@ async def signup_command(message: Message) -> None:
     pending = await get_pending_accounts(user_id)
     pending_count = len(pending) if pending else 0
     
-    # Check for invalid/expired tokens
-    invalid_tokens = await check_invalid_tokens(user_id)
-    invalid_count = len(invalid_tokens)
-
     # build menu copy so we can inject buttons
     menu = [row[:] for row in SIGNUP_MENU.inline_keyboard]
     
-    if invalid_count > 0:
-        menu.insert(0, [InlineKeyboardButton(
-            text=f"🔄 Re-sign in ({invalid_count})", 
-            callback_data="resign_invalid"
-        )])
-    
     if pending_count > 0:
-        insert_pos = 1 if invalid_count > 0 else 0
-        menu.insert(insert_pos, [InlineKeyboardButton(
-            text=f"Login Pending Accounts ({pending_count})", 
+        menu.insert(0, [InlineKeyboardButton(
+            text=f"Login Pending Accounts ({pending_count})",
             callback_data="login_pending"
         )])
 
@@ -841,79 +802,6 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.answer()
         return True
         
-    if data == "resign_invalid":
-        invalid_tokens = await check_invalid_tokens(user_id)
-        if not invalid_tokens:
-            await callback.message.edit_text(
-                "<b>No Invalid Accounts</b>\n\nAll accounts are valid!",
-                reply_markup=SIGNUP_MENU,
-                parse_mode="HTML"
-            )
-            return True
-        
-        status_msg = await callback.message.edit_text(
-            f"<b>Re-signing {len(invalid_tokens)} accounts...</b>",
-            parse_mode="HTML"
-        )
-        
-        from db import get_tokens, set_token
-        all_tokens = await get_tokens(user_id)
-        success_count = 0
-        failed_count = 0
-        
-        for idx, old_token, name in invalid_tokens:
-            try:
-                # Get stored email/password for this account
-                token_data = all_tokens[idx]
-                email = token_data.get("email")
-                password = token_data.get("password")
-                
-                if not email or not password:
-                    failed_count += 1
-                    continue
-                
-                # Re-authenticate using stored credentials
-                device_info = await get_or_create_device_info_for_email(user_id, email)
-                payload = get_api_payload_with_device_info(email, password, device_info)
-                
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        "https://api.meeff.com/auth/password/v2",
-                        json=payload,
-                        headers={'User-Agent': "okhttp/5.1.0"},
-                        timeout=10
-                    ) as resp:
-                        if resp.status == 200:
-                            data = await resp.json()
-                            new_token = data.get("accessToken")
-                            if new_token:
-                                # Update token at SAME position
-                                await set_token(
-                                    user_id=user_id,
-                                    token=new_token,
-                                    name=name,
-                                    email=email,
-                                    password=password,
-                                    position=idx  # KEEP SAME POSITION
-                                )
-                                success_count += 1
-                            else:
-                                failed_count += 1
-                        else:
-                            failed_count += 1
-            except Exception as e:
-                logger.error(f"Re-signin failed for {name}: {e}")
-                failed_count += 1
-            
-            await asyncio.sleep(0.5)
-        
-        result_text = (
-            f"<b>Re-sign Complete</b>\n\n"
-            f"✅ Success: {success_count}\n"
-            f"❌ Failed: {failed_count}"
-        )
-        await status_msg.edit_text(result_text, reply_markup=SIGNUP_MENU, parse_mode="HTML")
-        return True
     # ---------- Simple menu / signin flow ----------
     if data == "signup_menu":
         state["stage"] = "menu"
