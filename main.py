@@ -903,7 +903,7 @@ async def callback_handler(callback_query: CallbackQuery):
         await callback_query.answer("Refreshing batch...")
         status_msg = await callback_query.message.answer("<b>🔄 Refreshing batch tokens...</b>", parse_mode="HTML")
 
-        success, failed, no_creds = 0, 0, 0
+        success, failed, banned, no_creds = 0, 0, 0, 0
 
         for idx in indices:
             if idx >= len(all_tokens):
@@ -937,6 +937,13 @@ async def callback_handler(callback_query: CallbackQuery):
                                 success += 1
                             else:
                                 failed += 1
+                        elif resp.status == 403:
+                            result = await resp.json()
+                            err_msg = result.get("errorMessage", "").lower()
+                            if any(k in err_msg for k in ("ban", "suspend", "block")):
+                                banned += 1
+                            else:
+                                failed += 1
                         else:
                             failed += 1
             except Exception as e:
@@ -945,7 +952,7 @@ async def callback_handler(callback_query: CallbackQuery):
 
             await asyncio.sleep(0.5)
 
-        result_text = f"<b>🔄 Batch Refresh Complete</b>\n\n✅ Success: {success}\n❌ Failed: {failed}"
+        result_text = f"<b>🔄 Batch Refresh Complete</b>\n\n✅ Refreshed: {success}\n🚫 Banned: {banned}\n❌ Failed: {failed}"
         if no_creds:
             result_text += f"\n⚠️ Skipped (no credentials): {no_creds}"
         await status_msg.edit_text(result_text, parse_mode="HTML")
