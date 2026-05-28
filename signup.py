@@ -518,7 +518,7 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
             if isinstance(res, dict) and res.get("accessToken") and res.get("user"):
                 # SUCCESS: Save and count
                 token = res["accessToken"]
-                await set_token(user_id, token, res["user"].get("name", email), email)
+                await set_token(user_id, token, res["user"].get("name", email), email, password)
                 await set_user_filters(user_id, token, {"filterNationalityCode": ""}) # set default filter
                 user_obj = res.get("user", {})
                 user_obj.update({"email": email, "password": password, "token": token})
@@ -1044,7 +1044,7 @@ async def store_token_and_show_card(msg_obj: Message, login_result: Dict, creds:
     user_data = login_result.get("user")
     if access_token and user_data:
         user_id = msg_obj.chat.id
-        await set_token(user_id, access_token, user_data.get("name", creds.get("email")), creds.get("email"))
+        await set_token(user_id, access_token, user_data.get("name", creds.get("email")), creds.get("email"), creds.get("password"))
         user_data.update({
             "email": creds.get("email"),
             "password": creds.get("password"),
