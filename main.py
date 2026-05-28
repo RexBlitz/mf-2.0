@@ -12,7 +12,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 
 from db import (
-    set_token, get_tokens, set_current_account, get_current_account, delete_token,
+    set_token, resign_token_at_position, get_tokens, set_current_account, get_current_account, delete_token,
     set_user_filters, get_user_filters, get_all_user_filters, set_spam_filter, get_spam_filter,
     is_already_sent, toggle_token_status, get_active_tokens,
     get_token_status, set_account_active, get_info_card,
@@ -934,7 +934,7 @@ async def callback_handler(callback_query: CallbackQuery):
                             result = await resp.json()
                             new_token = result.get("accessToken")
                             if new_token:
-                                await set_token(user_id=user_id, token=new_token, name=name, email=email, password=password, position=idx)
+                                await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
                                 success += 1
                             else:
                                 failed += 1
