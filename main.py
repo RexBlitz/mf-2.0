@@ -920,13 +920,14 @@ async def callback_handler(callback_query: CallbackQuery):
             try:
                 from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
                 device_info = await get_or_create_device_info_for_email(user_id, email)
-                payload = get_api_payload_with_device_info(email, password, device_info)
+                base_payload = {"provider": "email", "providerId": email, "providerToken": password, "locale": "en"}
+                payload = get_api_payload_with_device_info(base_payload, device_info)
 
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
-                        "https://api.meeff.com/auth/password/v2",
+                        "https://api.meeff.com/user/login/v4",
                         json=payload,
-                        headers={'User-Agent': "okhttp/5.1.0"},
+                        headers={'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"},
                         timeout=10
                     ) as resp:
                         if resp.status == 200:
