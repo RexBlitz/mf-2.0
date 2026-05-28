@@ -621,6 +621,20 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
     # ---------- Start signup flow ----------
     if data == "signup_go":
         cfg = await get_signup_config(user_id) or {}
+        auto_signup = cfg.get("auto_signup", False)
+
+        if not auto_signup:
+            # Manual mode: ask for email and password directly
+            state["stage"] = "manual_signup_email"
+            user_signup_states[user_id] = state
+            await callback.message.edit_text(
+                "<b>Manual Sign Up</b>\n\nEnter the email address for the new account:",
+                reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
+            )
+            await callback.answer()
+            return True
+
+        # Auto signup mode: require full config
         if not all(k in cfg for k in ['email', 'password', 'gender', 'birth_year', 'nationality']):
             await callback.message.edit_text(
                 "<b>Configuration Incomplete</b>\n\nPlease set up all details in <b>Signup Config</b> first.",
@@ -633,6 +647,19 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         user_signup_states[user_id] = state
         await callback.message.edit_text(
             "<b>Account Creation</b>\n\nEnter the number of accounts to create (1-100):",
+            reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
+        )
+        await callback.answer()
+        return True
+
+    # ---------- Manual signup gender selection ----------
+    if data.startswith("manual_gender_"):
+        gender = data.replace("manual_gender_", "")  # "M" or "F"
+        state["manual_gender"] = gender
+        state["stage"] = "manual_signup_birth_year"
+        user_signup_states[user_id] = state
+        await callback.message.edit_text(
+            "<b>Birth Year</b>\n\nEnter your birth year (e.g. 1995):",
             reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
         )
         await callback.answer()
@@ -877,6 +904,78 @@ async def signup_message_handler(message: Message) -> bool:
         user_signup_states[user_id] = state
         return True
     
+    # ---------- Manual Sign Up (auto signup OFF) ----------
+    if stage == "manual_signup_email":
+        email = text.strip()
+        if "@" not in email or "." not in email:
+            await message.answer("Invalid email. Please enter a valid email address:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+            return True
+        state["manual_email"] = email
+        state["stage"] = "manual_signup_password"
+        user_signup_states[user_id] = state
+        await message.answer("<b>Password</b>\n\nEnter the password for this account:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+        return True
+
+    if stage == "manual_signup_password":
+        password = text.strip()
+        if len(password) < 6:
+            await message.answer("Password too short (min 6 characters). Try again:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+            return True
+        state["manual_password"] = password
+        state["stage"] = "manual_signup_name"
+        user_signup_states[user_id] = state
+        await message.answer("<b>Display Name</b>\n\nEnter the display name for this account:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+        return True
+
+    if stage == "manual_signup_name":
+        state["manual_name"] = text.strip() or "User"
+        state["stage"] = "manual_signup_gender"
+        user_signup_states[user_id] = state
+        gender_kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Male", callback_data="manual_gender_M"),
+             InlineKeyboardButton(text="Female", callback_data="manual_gender_F")]
+        ])
+        await message.answer("<b>Gender</b>\n\nSelect gender:", reply_markup=gender_kb, parse_mode="HTML")
+        return True
+
+    if stage == "manual_signup_birth_year":
+        try:
+            year = int(text.strip())
+            if not (1950 <= year <= 2006):
+                raise ValueError()
+        except ValueError:
+            await message.answer("Invalid year. Enter a year between 1950 and 2006:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+            return True
+
+        state["manual_birth_year"] = year
+        msg = await message.answer("<b>Creating Account...</b>", parse_mode="HTML")
+
+        acc_state = {
+            "email": state["manual_email"],
+            "password": state["manual_password"],
+            "name": state["manual_name"],
+            "gender": state["manual_gender"],
+            "birth_year": year,
+            "nationality": "US",
+            "desc": get_random_bio(),
+            "photos": [],
+        }
+        res = await try_signup(acc_state, user_id)
+
+        if isinstance(res, dict) and res.get("user", {}).get("_id"):
+            token = res.get("accessToken")
+            creds = {"email": acc_state["email"], "password": acc_state["password"]}
+            await store_token_and_show_card(msg, res, creds)
+        else:
+            err = res.get("errorMessage", "Unknown error.") if isinstance(res, dict) else str(res)
+            await msg.edit_text(f"<b>Sign Up Failed</b>\n\nError: {err}", reply_markup=SIGNUP_MENU, parse_mode="HTML")
+
+        state["stage"] = "menu"
+        user_signup_states[user_id] = state
+        return True
+
+    # ---------- End Manual Sign Up stages ----------
+
     # ---------- UNIFIED Sign In email input (formerly multi_signin_emails) ----------
     if stage == "multi_signin_emails":
         emails = [e.strip() for e in text.split('\n') if e.strip() and '@' in e.strip()]
