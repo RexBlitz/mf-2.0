@@ -4,7 +4,7 @@ import logging
 import html
 from aiogram import Bot, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from db import get_individual_spam_filter, bulk_add_sent_ids, get_active_tokens, get_current_account, get_already_sent_ids
+from db import get_individual_spam_filter, bulk_add_sent_ids, get_active_tokens, get_current_account, get_already_sent_ids, get_exclude_filter
 from filters import apply_filter_for_account, is_request_filter_enabled
 from collections import defaultdict
 from dateutil import parser
@@ -99,7 +99,7 @@ def format_user(user):
         f"<b>Last Active:</b> {last_active}"
     )
 
-async def process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock):
+async def process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes=None):
     """
     Process a batch of users.
     Checks 'already_sent_ids' ALWAYS (for session deduplication),
@@ -129,6 +129,13 @@ async def process_users(session, users, token, user_id, bot, token_name, already
                 continue
             already_sent_ids.add(user_id_to_check)
         # -----------------------------
+
+        # --- EXCLUDE NATIONALITY FILTER ---
+        user_nationality = user.get("nationalityCode", "")
+        if exclude_codes and user_nationality in exclude_codes:
+            filtered_count += 1
+            continue
+        # ----------------------------------
         
         url = f"https://api.meeff.com/user/undoableAnswer/v5/?userId={user_id_to_check}&isOkay=1"
         
@@ -207,6 +214,7 @@ async def run_requests(user_id, bot, target_channel_id):
         already_sent_ids = set()
     # ----------------------
 
+    exclude_codes = set(await get_exclude_filter(user_id))
     lock = asyncio.Lock()
 
     async with aiohttp.ClientSession() as session:
@@ -248,7 +256,7 @@ async def run_requests(user_id, bot, target_channel_id):
                     await asyncio.sleep(EMPTY_BATCH_DELAY)
                     continue
                 
-                limit_reached, _, _ = await process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock)
+                limit_reached, _, _ = await process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes)
                 
                 if limit_reached:
                     state["running"] = False
@@ -301,6 +309,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
         session_sent_ids = await get_already_sent_ids(user_id, "request")
     else:
         session_sent_ids = set()
+    exclude_codes = set(await get_exclude_filter(user_id))
     # ----------------------
 
     lock = asyncio.Lock()
@@ -337,7 +346,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
                     empty_batches = 0
                     token_status[token]["status"] = "Processing"
                     
-                    limit_reached, batch_added, batch_filtered = await process_users(session, users, token, user_id, bot, name, session_sent_ids, lock)
+                    limit_reached, batch_added, batch_filtered = await process_users(session, users, token, user_id, bot, name, session_sent_ids, lock, exclude_codes)
                     
                     token_status[token]["added"] += batch_added
                     token_status[token]["filtered"] += batch_filtered
