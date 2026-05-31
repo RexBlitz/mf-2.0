@@ -543,21 +543,26 @@ async def add_token_to_auto_batch(user_id: int, token_index: int):
     """Adds a newly created token (by index) to the correct batch (batches of 10)."""
     await _ensure_user_collection_exists(user_id)
     user_db = _get_user_collection(user_id)
-    
-    last_batch_data, total_tokens = await get_last_batch(user_id)
-    
-    # Calculate the current batch number (e.g., index 0-9 is Batch 1, index 10-19 is Batch 2)
+
+    # Check if this index is already in any batch — avoid duplicates
+    batches_doc = await user_db.find_one({"type": "batches"})
+    if batches_doc:
+        for batch in batches_doc.get("items", []):
+            if token_index in batch.get("token_indices", []):
+                return  # already tracked, nothing to do
+
+    # Calculate which batch this token belongs to (groups of 10)
     new_batch_number = (token_index // 10) + 1
     new_batch_name = f"Batch {new_batch_number}"
 
-    if last_batch_data and last_batch_data.get("name") == new_batch_name:
-        # Case 1: Add to existing, non-full batch (should always be the last one)
+    if batches_doc and any(b.get("name") == new_batch_name for b in batches_doc.get("items", [])):
+        # Batch exists — append index to it
         await user_db.update_one(
             {"type": "batches", "items.name": new_batch_name},
             {"$push": {"items.$.token_indices": token_index}}
         )
     else:
-        # Case 2: Create a brand new batch for this index (e.g., token 0 or token 10, 20, etc.)
+        # Batch doesn't exist yet — create it (also creates the batches doc if missing)
         batch_data = {
             "name": new_batch_name,
             "token_indices": [token_index],
