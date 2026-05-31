@@ -1,1013 +1,1055 @@
-from pymongo import MongoClient
-import datetime
-from motor.motor_asyncio import AsyncIOMotorClient
-import os
-from typing import Dict, Optional, Tuple, Any
+import asyncio
+import logging
+from datetime import datetime, timedelta
+from typing import Dict
+import aiohttp
+import html
+from aiogram import Bot, Dispatcher, Router
+from aiogram.filters import Command
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, CallbackQuery
+from collections import defaultdict
+from aiogram.exceptions import TelegramBadRequest
 
 
-# MongoDB connection using the asynchronous Motor client
-client = AsyncIOMotorClient("mongodb+srv://irexanon:12312320Pk..@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB")
-db = client.meeff_bot
+from db import (
+    set_token, resign_token_at_position, get_tokens, set_current_account, get_current_account, delete_token,
+    set_user_filters, get_user_filters, get_all_user_filters, set_spam_filter, get_spam_filter,
+    is_already_sent, toggle_token_status, get_active_tokens,
+    get_token_status, set_account_active, get_info_card,
+    set_individual_spam_filter, get_individual_spam_filter, get_all_spam_filters,get_spam_menu_data,
+    list_all_collections, get_collection_summary, connect_to_collection,
+    rename_user_collection, transfer_to_user, get_current_collection_info,
+    get_spam_record_count, clear_spam_records,
+    get_batches, create_batch, toggle_batch_status, set_batch_filter, get_batch_by_name,
+    add_token_to_auto_batch, block_user, get_blocked_users, clear_blocked_users,
+    get_automation_settings, set_automation_enabled, set_automation_lounge_message, 
+    set_automation_chatroom_message, set_automation_accounts, add_automation_log, get_automation_log
+)
+# Make sure these other local modules are compatible if they also perform I/O
+from lounge import send_lounge, send_lounge_all_tokens
+from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
+from unsubscribe import unsubscribe_everyone
+from filters import (
+    meeff_filter_command, set_account_filter, get_meeff_filter_main_keyboard, 
+    set_filter, apply_filter_for_account
+)
+from allcountry import run_all_countries
+from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command
+from friend_requests import run_requests, process_all_tokens, user_states, stop_markup
+# --- NEW IMPORT ---
+from automation import start_automation
 
-async def get_user_collection(user_id: int):
-    """
-    Retrieves the correct MongoDB collection for a given user.
-    This is the async version required by other functions.
-    """
-    collection_name = f"user_{user_id}"
-    return db[collection_name]
+# --- Configuration & Setup ---
+API_TOKEN = "7916536914:AAHwtvO8hfGl2U4xcfM1fAjMLNypPFEW5JQ"
+ADMIN_USER_IDS = {7405203657, 7725409374, 7691399254, 7795345443}
+TEMP_PASSWORD = "11223344"
+TARGET_CHANNEL_ID = -1002610862940
+ACCOUNTS_PER_PAGE = 10 # Adjusted for extra button row
 
-# Helper function to get a user's collection (synchronous version for internal use if needed)
-def _get_user_collection(telegram_user_id):
-    """Get the collection for a user"""
-    collection_name = f"user_{telegram_user_id}"
-    return db[collection_name]
+password_access: Dict[int, datetime] = {}
+db_operation_states: Dict[int, Dict[str, str]] = defaultdict(dict)
 
-# Helper function to ensure collection exists with basic structure
-_initialized_users: set = set()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logger = logging.getLogger(__name__)
 
-async def _ensure_user_collection_exists(telegram_user_id):
-    """Make sure user collection exists with default documents — skips DB check if already seen this session"""
-    if telegram_user_id in _initialized_users:
-        return
-    user_db = _get_user_collection(telegram_user_id)
-    if await user_db.count_documents({"type": "metadata"}) == 0:
-        await user_db.insert_many([
-            {"type": "metadata", "created_at": datetime.datetime.utcnow(), "user_id": telegram_user_id},
-            {"type": "tokens", "items": []},
-            {"type": "settings", "current_token": None, "spam_filter": False},
-            {"type": "sent_records", "data": {}},
-            {"type": "filters", "data": {}},
-            {"type": "info_cards", "data": {}},
-            {"type": "batches", "items": []}
-        ])
-    _initialized_users.add(telegram_user_id)
+bot = Bot(token=API_TOKEN)
+router = Router()
+dp = Dispatcher()
 
-async def get_all_user_filters(user_id: int):
-    """
-    Efficiently fetches all filter documents for a user and returns a dictionary
-    mapping token to its filter data.
-    """
-    collection = await get_user_collection(user_id)
-    tokens_doc = await collection.find_one({"type": "tokens"})
-    if not tokens_doc or "items" not in tokens_doc:
-        return {}
-    
-    return {
-        token_item.get("token"): token_item.get("filters", {})
-        for token_item in tokens_doc.get("items", [])
-        if "token" in token_item
-    }
+# --- Constants ---
+NATIONALITY_LIST = [
+    ("RU", "🇷🇺 Russia"), ("UA", "🇺🇦 Ukraine"), ("BY", "🇧🇾 Belarus"), ("IR", "🇮🇷 Iran"), ("PH", "🇵🇭 Philippines"),
+    ("PK", "🇵🇰 Pakistan"), ("US", "🇺🇸 USA"), ("IN", "🇮🇳 India"), ("DE", "🇩🇪 Germany"), ("FR", "🇫🇷 France"),
+    ("BR", "🇧🇷 Brazil"), ("CN", "🇨🇳 China"), ("JP", "🇯🇵 Japan"), ("KR", "🇰🇷 Korea"), ("CA", "🇨🇦 Canada"),
+    ("AU", "🇦🇺 Australia"), ("IT", "🇮🇹 Italy"), ("ES", "🇪🇸 Spain"), ("ZA", "🇿🇦 South Africa"), ("TR", "🇹🇷 Turkey")
+]
 
-# Enhanced DB Collection Management Functions
-async def list_all_collections():
-    collection_names = await db.list_collection_names()
-    user_collections = []
-    for name in filter(lambda n: n.startswith("user_") and n != "user_", collection_names):
-        try:
-            summary = await get_collection_summary(name)
-            user_collections.append({"collection_name": name, "user_id": name[5:], "summary": summary})
-        except Exception as e:
-            print(f"Error processing collection {name}: {e}")
-    return sorted(user_collections, key=lambda x: x.get("summary", {}).get("created_at") or datetime.datetime.min, reverse=True)
+# --- Utility & Keyboards ---
+def is_admin(user_id: int) -> bool: return user_id in ADMIN_USER_IDS
+def has_valid_access(user_id: int) -> bool:
+    if is_admin(user_id): return True
+    return user_id in password_access and password_access[user_id] > datetime.now()
 
-async def get_collection_summary(collection_name):
-    collection = db[collection_name]
-    query_types = ["tokens", "sent_records", "info_cards", "settings", "metadata"]
-    all_docs = await collection.find({"type": {"$in": query_types}}).to_list(length=None)
-    docs_by_type = {doc.get("type"): doc for doc in all_docs}
-    tokens_doc = docs_by_type.get("tokens", {})
-    sent_doc = docs_by_type.get("sent_records", {})
-    info_doc = docs_by_type.get("info_cards", {})
-    settings_doc = docs_by_type.get("settings", {})
-    metadata_doc = docs_by_type.get("metadata", {})
-    tokens_count = len(tokens_doc.get("items", []))
-    active_tokens = sum(1 for token in tokens_doc.get("items", []) if token.get("active", True))
-    sent_total = sum(len(ids) for ids in sent_doc.get("data", {}).values() if isinstance(ids, list))
-    current_token = settings_doc.get("current_token")
-    return {
-        "tokens_count": tokens_count,
-        "active_tokens": active_tokens,
-        "sent_records": {"total": sent_total},
-        "info_cards_count": len(info_doc.get("data", {})),
-        "has_current_token": bool(current_token),
-        "spam_filter_enabled": settings_doc.get("spam_filter", False),
-        "created_at": metadata_doc.get("created_at"),
-        "total_documents": await collection.count_documents({})
-    }
+async def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
+    spam_filters = await get_all_spam_filters(user_id)
+    any_spam_on = any(spam_filters.values())
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Manage Accounts", callback_data="manage_accounts|0"), InlineKeyboardButton(text="Meeff Filters", callback_data="show_filters")],
+        [InlineKeyboardButton(text="Batch Management", callback_data="batch_management")],
+        [InlineKeyboardButton(text=f"Spam Filters: {'ON' if any_spam_on else 'OFF'}", callback_data="spam_filter_menu")],
+        [InlineKeyboardButton(text="DB Settings", callback_data="db_settings"), InlineKeyboardButton(text="Back", callback_data="back_to_menu")]
+    ])
 
-async def connect_to_collection(collection_name, target_user_id):
-    if collection_name not in await db.list_collection_names():
-        return False, f"Collection '{collection_name}' not found"
-    await _ensure_user_collection_exists(target_user_id)
-    from_collection, to_collection = db[collection_name], _get_user_collection(target_user_id)
-    all_docs = await from_collection.find({}).to_list(length=None)
-    if not all_docs: return False, "Source collection is empty"
-    await to_collection.delete_many({})
-    for doc in all_docs:
-        if doc.get("type") == "metadata":
-            doc.update({"user_id": target_user_id, "connected_at": datetime.datetime.utcnow(), "original_collection": collection_name})
-    await to_collection.insert_many(all_docs)
-    return True, f"Successfully connected to '{collection_name}' with {len(all_docs)} documents"
+def get_db_settings_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect DB", callback_data="db_connect"), InlineKeyboardButton(text="Rename DB", callback_data="db_rename")], [InlineKeyboardButton(text="View DB", callback_data="db_view"), InlineKeyboardButton(text="Transfer DB", callback_data="db_transfer")], [InlineKeyboardButton(text="Back", callback_data="settings_menu")]])
 
-async def rename_user_collection(user_id, new_collection_name):
-    old_name = f"user_{user_id}"
-    if old_name not in await db.list_collection_names(): return False, "Your collection not found"
-    new_name = f"user_{new_collection_name}" if not new_collection_name.startswith("user_") else new_collection_name
-    if new_name in await db.list_collection_names(): return False, "Target collection name already exists"
-    old_collection = db[old_name]
-    all_docs = await old_collection.find({}).to_list(length=None)
-    if not all_docs: return False, "Your collection is empty"
-    for doc in all_docs:
-        if doc.get("type") == "metadata":
-            doc.update({"renamed_at": datetime.datetime.utcnow(), "original_name": old_name})
-    await db[new_name].insert_many(all_docs)
-    await old_collection.drop()
-    return True, f"Successfully renamed to '{new_name}'"
+def get_unsubscribe_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Unsubscribe Current", callback_data="unsub_current"), InlineKeyboardButton(text="Unsubscribe All", callback_data="unsub_all")], [InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
 
-async def transfer_to_user(from_user_id, to_user_id):
-    from_name = f"user_{from_user_id}"
-    if from_name not in await db.list_collection_names(): return False, "Your collection not found"
-    return await connect_to_collection(from_name, to_user_id)
-
-async def get_current_collection_info(user_id):
-    collection_name = f"user_{user_id}"
-    collection = db[collection_name]
-    tokens_doc = await collection.find_one({"type": "tokens"}, {"items": 1})
-    if tokens_doc:
-        tokens_count = len(tokens_doc.get("items", []))
-        return {"collection_name": collection_name, "exists": True, "summary": {"tokens_count": tokens_count}}
-    return {"collection_name": collection_name, "exists": False, "summary": None}
-
-async def set_info_card(telegram_user_id, token, info_text, email=None):
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-    await user_db.update_one(
-        {"type": "info_cards"},
-        {"$set": {f"data.{token}": {"info": info_text, "email": email, "updated_at": datetime.datetime.utcnow()}}},
-        upsert=True
+async def get_spam_filter_menu(user_id: int) -> InlineKeyboardMarkup:
+    # Fetch spam data and blocked users in parallel
+    menu_data, blocked_users = await asyncio.gather(
+        get_spam_menu_data(user_id),
+        get_blocked_users(user_id)
     )
-
-async def get_info_card(telegram_user_id, token):
-    await _ensure_user_collection_exists(telegram_user_id)
-    cards_doc = await _get_user_collection(telegram_user_id).find_one({"type": "info_cards"})
-    if cards_doc and token in cards_doc.get("data", {}):
-        return cards_doc["data"][token].get("info")
-    return None
-
-async def set_token(telegram_user_id, token, name, email=None, password=None, filters=None, active=True) -> int:
-    """
-    Saves or updates a Meeff token. 
-    Added 'password' to arguments to fix NameError.
-    """
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-
-    tokens_doc = await user_db.find_one({"type": "tokens"})
-    tokens_list = tokens_doc.get("items", []) if tokens_doc else []
-
-    token_index = -1
-    email_index = -1
-
-    # 1. Check if email already exists and find existing token index
-    for i, t in enumerate(tokens_list):
-        if email and t.get("email") == email:
-            email_index = i
-        if t["token"] == token:
-            token_index = i
-
-    # 2. Prevent email-based duplicates
-    if email and email_index != -1 and token_index != email_index:
-        await user_db.update_one(
-            {"type": "tokens"},
-            {"$pull": {"items": {"email": email}}}
-        )
-        # Refresh the list and recalculate index
-        tokens_doc = await user_db.find_one({"type": "tokens"})
-        tokens_list = tokens_doc.get("items", []) if tokens_doc else []
-        token_index = next((i for i, t in enumerate(tokens_list) if t["token"] == token), -1)
-
-    if token_index != -1:
-        # 3. Update existing token
-        update_fields = {
-            "items.$.name": name,
-            "items.$.active": active
-        }
-        if email: update_fields["items.$.email"] = email
-        if password: update_fields["items.$.password"] = password # Now correctly defined
-        if filters: update_fields["items.$.filters"] = filters
-
-        await user_db.update_one(
-            {"type": "tokens", "items.token": token},
-            {"$set": update_fields}
-        )
-    else:
-        # 4. Insert new token
-        token_index = len(tokens_list) 
-        token_data = {
-            "token": token,
-            "name": name,
-            "active": active
-        }
-        if email: token_data["email"] = email
-        if password: token_data["password"] = password # Now correctly defined
-        if filters: token_data["filters"] = filters
-
-        await user_db.update_one(
-            {"type": "tokens"},
-            {"$push": {"items": token_data}},
-            upsert=True
-        )
-
-    return token_index
-    
-async def resign_token_at_position(
-    user_id: int, position: int, new_token: str, 
-    name: str, email: str = None, password: str = None, filters: dict = None
-):
-    """
-    Replace token at specific position without changing order.
-    Used for re-signing expired accounts in signup menu.
-    
-    Raises:
-        ValueError: If position is out of range
-    """
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    
-    tokens_doc = await user_db.find_one({"type": "tokens"})
-    tokens_list = tokens_doc.get("items", []) if tokens_doc else []
-    
-    if position < 0 or position >= len(tokens_list):
-        raise ValueError(f"Invalid position {position}, tokens list length is {len(tokens_list)}")
-    
-    # Build new token entry
-    token_data = {
-        "token": new_token,
-        "name": name,
-        "active": True
-    }
-    if email:
-        token_data["email"] = email
-    if password:
-        token_data["password"] = password
-    if filters:
-        token_data["filters"] = filters
-    
-    # Replace at exact position
-    tokens_list[position] = token_data
-    
-    await user_db.update_one(
-        {"type": "tokens"},
-        {"$set": {"items": tokens_list}},
-        upsert=True
-    )
-async def toggle_token_status(telegram_user_id, token):
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-    token_obj = await user_db.find_one({"type": "tokens", "items.token": token}, {"items.$": 1})
-    if token_obj and token_obj.get("items"):
-        current_status = token_obj["items"][0].get("active", True)
-        await user_db.update_one({"type": "tokens", "items.token": token}, {"$set": {"items.$.active": not current_status}})
-
-async def set_account_active(telegram_user_id, token, active_status):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "tokens", "items.token": token}, {"$set": {"items.$.active": active_status}})
-
-async def get_active_tokens(telegram_user_id):
-    await _ensure_user_collection_exists(telegram_user_id)
-    tokens_doc = await _get_user_collection(telegram_user_id).find_one({"type": "tokens"})
-    return [t for t in tokens_doc.get("items", []) if t.get("active", True)] if tokens_doc else []
-
-async def get_token_status(telegram_user_id, token):
-    await _ensure_user_collection_exists(telegram_user_id)
-    token_obj = await _get_user_collection(telegram_user_id).find_one({"type": "tokens", "items.token": token}, {"items.$": 1})
-    if token_obj and token_obj.get("items"):
-        return token_obj["items"][0].get("active", True)
-    return None
-
-async def get_tokens(telegram_user_id):
-    await _ensure_user_collection_exists(telegram_user_id)
-    tokens_doc = await _get_user_collection(telegram_user_id).find_one({"type": "tokens"})
-    return tokens_doc.get("items", []) if tokens_doc else []
-
-get_all_tokens = get_tokens
-
-async def list_tokens():
-    result = []
-    collection_names = await db.list_collection_names()
-    for name in filter(lambda n: n.startswith("user_"), collection_names):
-        tokens_doc = await db[name].find_one({"type": "tokens"})
-        if tokens_doc:
-            for token in tokens_doc.get("items", []):
-                result.append({"user_id": name[5:], "token": token.get("token"), "name": token.get("name")})
-    return result
-
-async def set_current_account(telegram_user_id, token):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "settings"}, {"$set": {"current_token": token}}, upsert=True)
-
-async def get_current_account(telegram_user_id):
-    await _ensure_user_collection_exists(telegram_user_id)
-    settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
-    return settings.get("current_token") if settings else None
-
-async def delete_token(telegram_user_id, token):
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-    await user_db.update_one({"type": "tokens"}, {"$pull": {"items": {"token": token}}})
-    if (await get_current_account(telegram_user_id)) == token:
-        await set_current_account(telegram_user_id, None)
-    await user_db.update_one({"type": "info_cards"}, {"$unset": {f"data.{token}": ""}})
-    
-    # NEW: Re-organize batches after deletion to fix index corruption
-    await auto_reorganize_batches_after_deletion(telegram_user_id)
-
-async def cleanup_duplicate_emails(telegram_user_id):
-    """Remove duplicate email entries, keeping only the latest token for each email"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-
-    tokens_doc = await user_db.find_one({"type": "tokens"})
-    if not tokens_doc:
-        return {"status": "No tokens found", "removed": 0}
-
-    tokens_list = tokens_doc.get("items", [])
-    if not tokens_list:
-        return {"status": "No tokens to clean", "removed": 0}
-
-    email_map = {}
-    to_remove = []
-
-    # Map each email to its tokens, keep track of all but the last one
-    for i, token_obj in enumerate(tokens_list):
-        email = token_obj.get("email")
-        if email:
-            if email not in email_map:
-                email_map[email] = []
-            email_map[email].append(i)
-
-    # Mark older tokens for deletion (keep only the latest)
-    for email, indices in email_map.items():
-        if len(indices) > 1:
-            # Keep the last one (highest index), mark others for removal
-            for idx in indices[:-1]:
-                to_remove.append(tokens_list[idx]["token"])
-
-    # Remove duplicates
-    removed_count = 0
-    for token_to_remove in to_remove:
-        await user_db.update_one(
-            {"type": "tokens"},
-            {"$pull": {"items": {"token": token_to_remove}}}
-        )
-        removed_count += 1
-
-    return {"status": "Cleanup complete", "removed": removed_count}
-
-async def set_user_filters(telegram_user_id, token, filters):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "tokens", "items.token": token}, {"$set": {"items.$.filters": filters}})
-
-async def get_user_filters(telegram_user_id, token):
-    await _ensure_user_collection_exists(telegram_user_id)
-    token_obj = await _get_user_collection(telegram_user_id).find_one({"type": "tokens", "items.token": token}, {"items.$": 1})
-    if token_obj and token_obj.get("items"):
-        return token_obj["items"][0].get("filters")
-    return None
-
-async def set_spam_filter(telegram_user_id, status: bool):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "settings"}, {"$set": {"spam_filter": status}}, upsert=True)
-
-async def set_individual_spam_filter(telegram_user_id, filter_type: str, status: bool):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "settings"}, {"$set": {f"spam_filter_{filter_type}": status}}, upsert=True)
-
-async def get_individual_spam_filter(telegram_user_id: int, filter_type: str) -> bool:
-    await _ensure_user_collection_exists(telegram_user_id)
-    settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
-    return settings.get(f"spam_filter_{filter_type}", False) if settings else False
-
-async def get_all_spam_filters(telegram_user_id: int) -> dict:
-    await _ensure_user_collection_exists(telegram_user_id)
-    settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
-    if not settings: return {"chatroom": False, "request": False, "lounge": False}
-    return {
-        "chatroom": settings.get("spam_filter_chatroom", False),
-        "request": settings.get("spam_filter_request", False),
-        "lounge": settings.get("spam_filter_lounge", False),
-    }
-
-async def get_spam_menu_data(telegram_user_id: int) -> dict:
-    """
-    Efficiently fetches all data needed for the spam filter menu in a single DB query.
-    """
-    await _ensure_user_collection_exists(telegram_user_id)
-    collection = _get_user_collection(telegram_user_id)
-    
-    # Fetch both the settings and sent_records documents at the same time
-    query_results = await collection.find(
-        {"type": {"$in": ["settings", "sent_records"]}}
-    ).to_list(length=2)
-    
-    settings_doc = {}
-    records_doc = {}
-    for doc in query_results:
-        if doc.get("type") == "settings":
-            settings_doc = doc
-        elif doc.get("type") == "sent_records":
-            records_doc = doc.get("data", {})
-
-    # Process the results into a clean dictionary
-    data = {
-        "filters": {
-            "chatroom": settings_doc.get("spam_filter_chatroom", False),
-            "request": settings_doc.get("spam_filter_request", False),
-            "lounge": settings_doc.get("spam_filter_lounge", False),
-        },
-        "counts": {
-            "chatroom": len(records_doc.get("chatroom", [])),
-            "request": len(records_doc.get("request", [])),
-            "lounge": len(records_doc.get("lounge", [])),
-        }
-    }
-    return data
-
-async def get_spam_filter(telegram_user_id: int) -> bool:
-    await _ensure_user_collection_exists(telegram_user_id)
-    settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
-    return settings.get("spam_filter", False) if settings else False
-
-async def get_already_sent_ids(telegram_user_id, category):
-    await _ensure_user_collection_exists(telegram_user_id)
-    records_doc = await _get_user_collection(telegram_user_id).find_one({"type": "sent_records"})
-    return set(records_doc.get("data", {}).get(category, [])) if records_doc else set()
-
-async def add_sent_id(telegram_user_id, category, target_id):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "sent_records"}, {"$addToSet": {f"data.{category}": target_id}}, upsert=True)
-
-async def is_already_sent(telegram_user_id, category, target_id=None, bulk=False):
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-    if not bulk:
-        return await user_db.count_documents({"type": "sent_records", f"data.{category}": target_id}) > 0
-    else:
-        records_doc = await user_db.find_one({"type": "sent_records"}, {f"data.{category}": 1})
-        return set(records_doc.get("data", {}).get(category, [])) if records_doc else set()
-
-async def get_spam_record_count(telegram_user_id: int, category: str) -> int:
-    """Gets the count of stored IDs for a specific spam category."""
-    await _ensure_user_collection_exists(telegram_user_id)
-    records_doc = await _get_user_collection(telegram_user_id).find_one({"type": "sent_records"})
-    if not records_doc or "data" not in records_doc or category not in records_doc["data"]:
-        return 0
-    return len(records_doc["data"][category])
-
-async def clear_spam_records(telegram_user_id: int, category: str):
-    """Clears all stored IDs for a specific spam category."""
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one(
-        {"type": "sent_records"},
-        {"$set": {f"data.{category}": []}}
-    )
-
-async def bulk_add_sent_ids(telegram_user_id, category, target_ids):
-    if not target_ids: return
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "sent_records"}, {"$addToSet": {f"data.{category}": {"$each": list(target_ids)}}}, upsert=True)
-
-async def has_valid_access(telegram_user_id):
-    collection_name = f"user_{telegram_user_id}"
-    if collection_name not in await db.list_collection_names(): return False
-    return await db[collection_name].count_documents({"type": "metadata"}) > 0
-
-def get_message_delay(telegram_user_id):
-    return 2
-
-# Functions for signup, email variations, etc., all converted
-async def add_used_email_variation(telegram_user_id, base_email, variation):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "email_variations"}, {"$addToSet": {f"data.{base_email}": variation}}, upsert=True)
-
-async def get_used_email_variations(telegram_user_id, base_email):
-    await _ensure_user_collection_exists(telegram_user_id)
-    doc = await _get_user_collection(telegram_user_id).find_one({"type": "email_variations"})
-    return doc.get("data", {}).get(base_email, []) if doc else []
-
-async def set_auto_signup_enabled(telegram_user_id, enabled):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "settings"}, {"$set": {"auto_signup_enabled": enabled}}, upsert=True)
-
-async def get_auto_signup_enabled(telegram_user_id):
-    await _ensure_user_collection_exists(telegram_user_id)
-    settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
-    return settings.get("auto_signup_enabled", False) if settings else False
-
-async def set_signup_config(telegram_user_id, config):
-    await _ensure_user_collection_exists(telegram_user_id)
-    await _get_user_collection(telegram_user_id).update_one({"type": "signup_config"}, {"$set": {"data": config}}, upsert=True)
-
-async def get_signup_config(telegram_user_id):
-    await _ensure_user_collection_exists(telegram_user_id)
-    doc = await _get_user_collection(telegram_user_id).find_one({"type": "signup_config"})
-    return doc.get("data") if doc else None
-
-transfer_user_data = transfer_to_user
-
-# Legacy functions converted
-async def has_interacted(telegram_user_id, action_type, user_token):
-    return await db.interactions.find_one({"user_id": telegram_user_id, "action_type": action_type, "user_token": user_token}) is not None
-
-async def log_interaction(telegram_user_id, action_type, user_token):
-    await db.interactions.insert_one({"user_id": telegram_user_id, "action_type": action_type, "user_token": user_token, "timestamp": datetime.datetime.utcnow()})
-
-# --- Batch Management Functions ---
-
-async def get_batches(telegram_user_id: int) -> list:
-    """Get all batches with their accounts"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-    batches_doc = await user_db.find_one({"type": "batches"})
-    return batches_doc.get("items", []) if batches_doc else []
-
-async def get_last_batch(user_id: int) -> Tuple[Optional[Dict], int]:
-    """Retrieves the last created batch and the total number of tokens."""
-    user_db = _get_user_collection(user_id)
-    batches_doc = await user_db.find_one({"type": "batches"})
-    tokens_doc = await user_db.find_one({"type": "tokens"})
-    
-    tokens = tokens_doc.get("items", []) if tokens_doc else []
-    total_tokens = len(tokens)
-    
-    if batches_doc and batches_doc.get("items"):
-        last_batch = batches_doc["items"][-1]
-        return last_batch, total_tokens
-    
-    return None, total_tokens
-
-async def add_token_to_auto_batch(user_id: int, token_index: int):
-    """Adds a newly created token (by index) to the correct batch (batches of 10)."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-
-    # Check if this index is already in any batch — avoid duplicates
-    batches_doc = await user_db.find_one({"type": "batches"})
-    if batches_doc:
-        for batch in batches_doc.get("items", []):
-            if token_index in batch.get("token_indices", []):
-                return  # already tracked, nothing to do
-
-    # Calculate which batch this token belongs to (groups of 10)
-    new_batch_number = (token_index // 10) + 1
-    new_batch_name = f"Batch {new_batch_number}"
-
-    # Ensure batches doc exists with items array
-    await user_db.update_one(
-        {"type": "batches"},
-        {"$setOnInsert": {"type": "batches", "items": []}},
-        upsert=True
-    )
-
-    if batches_doc and any(b.get("name") == new_batch_name for b in batches_doc.get("items", [])):
-        # Batch exists — append index to it
-        await user_db.update_one(
-            {"type": "batches", "items.name": new_batch_name},
-            {"$push": {"items.$.token_indices": token_index}}
-        )
-    else:
-        # Batch doesn't exist yet — create it
-        batch_data = {
-            "name": new_batch_name,
-            "token_indices": [token_index],
-            "active": True,
-            "filter_nationality": ""
-        }
-        await user_db.update_one(
-            {"type": "batches"},
-            {"$push": {"items": batch_data}}
-        )
-
-async def create_batch(telegram_user_id: int, batch_name: str, token_indices: list) -> bool:
-    """Create a new batch with specified token indices"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-
-    batch_data = {
-        "name": batch_name,
-        "token_indices": token_indices,
-        "active": True,
-        "filter_nationality": ""
-    }
-
-    await user_db.update_one(
-        {"type": "batches"},
-        {"$push": {"items": batch_data}},
-        upsert=True
-    )
-    return True
-
-async def toggle_batch_status(telegram_user_id: int, batch_name: str):
-    """Toggle the active status of all accounts in a batch"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-
-    batches_doc = await user_db.find_one({"type": "batches"})
-    if not batches_doc:
-        return False
-
-    tokens = await get_tokens(telegram_user_id)
-    batch_found = False
-    new_status = True
-
-    for batch in batches_doc.get("items", []):
-        if batch["name"] == batch_name:
-            batch_found = True
-            new_status = not batch.get("active", True)
-
-            for idx in batch.get("token_indices", []):
-                if 0 <= idx < len(tokens):
-                    await set_account_active(telegram_user_id, tokens[idx]["token"], new_status)
-
-            await user_db.update_one(
-                {"type": "batches", "items.name": batch_name},
-                {"$set": {"items.$.active": new_status}}
-            )
-            break
-
-    return batch_found
-
-async def set_batch_filter(telegram_user_id: int, batch_name: str, nationality_code: str):
-    """Set nationality filter for all accounts in a batch"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
-
-    batches_doc = await user_db.find_one({"type": "batches"})
-    if not batches_doc:
-        return False
-
-    tokens = await get_tokens(telegram_user_id)
-
-    for batch in batches_doc.get("items", []):
-        if batch["name"] == batch_name:
-            for idx in batch.get("token_indices", []):
-                if 0 <= idx < len(tokens):
-                    filters = await get_user_filters(telegram_user_id, tokens[idx]["token"]) or {}
-                    filters["filterNationalityCode"] = nationality_code
-                    await set_user_filters(telegram_user_id, tokens[idx]["token"], filters)
-
-            await user_db.update_one(
-                {"type": "batches", "items.name": batch_name},
-                {"$set": {"items.$.filter_nationality": nationality_code}}
-            )
-            return True
-
-    return False
-
-async def get_batch_by_name(telegram_user_id: int, batch_name: str):
-    """Get a specific batch by name"""
-    batches = await get_batches(telegram_user_id)
-    for batch in batches:
-        if batch["name"] == batch_name:
-            return batch
-    return None
-
-async def auto_reorganize_batches_after_deletion(user_id: int):
-    """
-    Clears all existing batches and re-creates them based on the new token indices
-    after a deletion event. It attempts to preserve batch filters/status.
-    This corrects index corruption and removes empty batches.
-    """
-    user_db = _get_user_collection(user_id)
+    spam_filters = menu_data["filters"]
+    counts = menu_data["counts"]
+    blocked_count = len(blocked_users)
+
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(text=f"Chatroom: {'ON' if spam_filters['chatroom'] else 'OFF'}", callback_data="toggle_spam_chatroom"),
+            InlineKeyboardButton(text=f"({counts['chatroom']})", callback_data="noop_count"),
+            InlineKeyboardButton(text="Clear", callback_data="confirm_clear_spam_chatroom")
+        ],
+        [
+            InlineKeyboardButton(text=f"Requests: {'ON' if spam_filters['request'] else 'OFF'}", callback_data="toggle_spam_request"),
+            InlineKeyboardButton(text=f"({counts['request']})", callback_data="noop_count"),
+            InlineKeyboardButton(text="Clear", callback_data="confirm_clear_spam_request")
+        ],
+        [
+            InlineKeyboardButton(text=f"Lounge: {'ON' if spam_filters['lounge'] else 'OFF'}", callback_data="toggle_spam_lounge"),
+            InlineKeyboardButton(text=f"({counts['lounge']})", callback_data="noop_count"),
+            InlineKeyboardButton(text="Clear", callback_data="confirm_clear_spam_lounge")
+        ],
+        [
+            InlineKeyboardButton(text=f"Block User ({blocked_count})", callback_data="view_blocked_users"),
+            InlineKeyboardButton(text="Clear", callback_data="confirm_clear_blocked")
+        ],
+        [
+            InlineKeyboardButton(text="Toggle All", callback_data="toggle_spam_all"),
+            InlineKeyboardButton(text="Back", callback_data="settings_menu")
+        ]
+    ])
+
+def get_account_view_menu(account_idx: int, page_idx: int) -> InlineKeyboardMarkup:
+    # MODIFIED: Added page_idx to return button
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Delete Account", callback_data=f"confirm_delete_{account_idx}|{page_idx}")],
+        [InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{page_idx}")]
+    ])
+
+def get_confirmation_menu(action_type: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes", callback_data=f"confirm_{action_type}"), InlineKeyboardButton(text="Cancel", callback_data="back_to_menu")]])
+
+async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
+    batches = await get_batches(user_id)
     tokens = await get_tokens(user_id)
-    
-    # 1. Get current batches to preserve filters/status
-    old_batches = await get_batches(user_id)
-    batch_metadata = {
-        batch["name"]: {
-            "filter": batch.get("filter_nationality", ""),
-            "active": batch.get("active", True)
-        } 
-        for batch in old_batches
-    }
+    buttons = []
+    for batch in batches:
+        batch_name = batch.get("name", "Unnamed")
+        is_active = batch.get("active", True)
+        status = "ON" if is_active else "OFF"
+        filter_nat = batch.get("filter_nationality", "")
+        nat_display = f" ({filter_nat})" if filter_nat else " (All)"
 
-    # 2. Re-create all batches based on current indices
-    new_batches = {}
-    for index, token in enumerate(tokens):
-        # Calculate the batch number (0-9 is Batch 1, 10-19 is Batch 2, etc.)
-        batch_number = (index // 10) + 1
-        batch_name = f"Batch {batch_number}"
+        buttons.append([
+            InlineKeyboardButton(text=f"{batch_name}{nat_display}", callback_data=f"view_batch_{batch_name}"),
+            InlineKeyboardButton(text=status, callback_data=f"toggle_batch_{batch_name}"),
+            InlineKeyboardButton(text="Filter", callback_data=f"batch_filter_{batch_name}")
+        ])
+    buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def get_batch_filter_menu(batch_name: str) -> InlineKeyboardMarkup:
+    countries = [
+        ("RU", "Russia"), ("UA", "Ukraine"), ("BY", "Belarus"), ("IR", "Iran"), ("PH", "Philippines"),
+        ("PK", "Pakistan"), ("US", "USA"), ("IN", "India"), ("DE", "Germany"), ("FR", "France"),
+        ("BR", "Brazil"), ("CN", "China"), ("JP", "Japan"), ("KR", "Korea"), ("CA", "Canada"),
+        ("AU", "Australia"), ("IT", "Italy"), ("ES", "Spain"), ("ZA", "South Africa"), ("TR", "Turkey")
+    ]
+    buttons = []
+    buttons.append([InlineKeyboardButton(text="All Countries", callback_data=f"batch_nat_all_{batch_name}")])
+    row = []
+    for i, (code, name) in enumerate(countries):
+        row.append(InlineKeyboardButton(text=code, callback_data=f"batch_nat_{code}_{batch_name}"))
+        if len(row) == 4 or i == len(countries) - 1:
+            buttons.append(row)
+            row = []
+    buttons.append([InlineKeyboardButton(text="Back", callback_data="batch_management")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+start_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Current Request", callback_data="send_request_menu"), InlineKeyboardButton(text="Request All", callback_data="start_all")]])
+send_request_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Start Request", callback_data="start"), InlineKeyboardButton(text="All Countries", callback_data="all_countries")], [InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
+back_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
+
+# --- Command Handlers ---
+@router.message(Command("password"))
+async def password_command(message: Message):
+    try:
+        if message.text.split()[1] == TEMP_PASSWORD:
+            password_access[message.chat.id] = datetime.now() + timedelta(hours=1)
+            await message.reply("Access granted for one hour.")
+        else:
+            await message.reply("Incorrect password.")
+    except IndexError: await message.reply("Usage: /password <password>")
+    finally:
+        try: await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
+        except Exception as e: logger.error(f"Failed to delete password message: {e}")
+
+@router.message(Command("start"))
+async def start_command(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized. Use /password to get access.")
+    state = user_states.setdefault(message.chat.id, {})
+    status = await message.reply("<b>Meeff Bot Dashboard</b>...", reply_markup=start_markup, parse_mode="HTML")
+    state.update({"status_message_id": status.message_id, "pinned_message_id": None})
+
+@router.message(Command("signup"))
+async def signup_cmd(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    await signup_command(message)
+
+@router.message(Command("signup_settings"))
+async def signup_settings_cmd(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    await signup_settings_command(message)
+
+@router.message(Command("signin"))
+async def signin_cmd(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    from signup import user_signup_states, BACK_TO_SIGNUP
+    # Redirect signin command to the unified email input stage
+    user_signup_states[message.from_user.id] = {"stage": "multi_signin_emails"}
+    await message.reply("<b>Sign In (Single or Multi)</b>\n\nEnter one or more emails:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+
+@router.message(Command("skip"))
+async def skip_command(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    await message.reply("<b>Unsubscribe Options</b>...", reply_markup=get_unsubscribe_menu(), parse_mode="HTML")
+
+@router.message(Command("send_lounge_all"))
+async def send_lounge_all(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/send_lounge_all &lt;message&gt;</code>", parse_mode="HTML")
+    
+    custom_message = parts[1]
+    active_tokens_data = await get_active_tokens(user_id)
+    if not active_tokens_data: return await message.reply("No active tokens found.")
+
+    spam_enabled = await get_individual_spam_filter(user_id, "lounge")
+    status = await message.reply(f"<b>Starting Lounge Messages</b> for {len(active_tokens_data)} accounts...", parse_mode="HTML")
+    await send_lounge_all_tokens(active_tokens_data, custom_message, status, bot, user_id, spam_enabled, user_id)
+
+@router.message(Command("lounge"))
+async def lounge_command(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+    token = await get_current_account(user_id)
+    if not token: return await message.reply("No active account found.")
+    
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/lounge &lt;message&gt;</code>", parse_mode="HTML")
+    
+    custom_message = parts[1]
+    spam_enabled = await get_individual_spam_filter(user_id, "lounge")
+    status_message = await message.reply(f"<b>Starting Lounge Messaging...</b>", parse_mode="HTML")
+    await send_lounge(token, custom_message, status_message, bot, user_id, spam_enabled, user_id)
+
+
+@router.message(Command("chatroom"))
+async def send_to_all_command(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+    token = await get_current_account(user_id)
+    if not token: return await message.reply("No active account found.")
+
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/chatroom &lt;message&gt;</code>", parse_mode="HTML")
+    
+    custom_message = parts[1]
+    spam_enabled = await get_individual_spam_filter(user_id, "chatroom")
+    status_message = await message.reply("<b>Starting Chatroom Messages...</b>", parse_mode="HTML")
+
+    sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if spam_enabled else set()
+    sent_ids_lock = asyncio.Lock()
+    
+    total, sent, filtered = await send_message_to_everyone(
+        token, custom_message, user_id, spam_enabled, user_id,
+        sent_ids, sent_ids_lock
+    )
+    await status_message.edit_text(f"<b>Complete</b>\nTotal: {total}, Sent: {sent}, Filtered: {filtered}", parse_mode="HTML")
+
+@router.message(Command("send_chat_all"))
+async def send_chat_all(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+    parts = message.text.split(maxsplit=1)
+    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/send_chat_all &lt;message&gt;</code>", parse_mode="HTML")
+
+    custom_message = parts[1]
+    active_tokens = await get_active_tokens(user_id)
+    if not active_tokens: return await message.reply("No active tokens found.")
+
+    tokens = [t["token"] for t in active_tokens]
+    token_names = {t["token"]: t["name"] for t in active_tokens}
+    spam_enabled = await get_individual_spam_filter(user_id, "chatroom")
+    status = await message.reply(f"<b>Starting Multi-Account Chatroom ({len(tokens)})...</b>", parse_mode="HTML")
+    
+    await send_message_to_everyone_all_tokens(
+        tokens, custom_message, status, bot, user_id, spam_enabled, token_names, True, user_id
+    )
+
+@router.message(Command("invoke"))
+async def invoke_command(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+    
+    # ... (Same invoke logic as before, abbreviated for space)
+    # Default behavior: check active
+    active_tokens = await get_active_tokens(user_id)
+    if not active_tokens: return await message.reply("No active accounts.")
+    status_msg = await message.reply("<b>Checking Active Accounts...</b>", parse_mode="HTML")
+    
+    # Simple check logic...
+    disabled = []
+    async with aiohttp.ClientSession() as session:
+        for t in active_tokens:
+            try:
+                headers = {"User-Agent": "okhttp/5.0.0-alpha.14", "meeff-access-token": t["token"]}
+                async with session.get("https://api.meeff.com/facetalk/vibemeet/history/count/v1", params={"locale": "en"}, headers=headers) as resp:
+                    data = await resp.json(content_type=None)
+                    if data.get("errorCode") == "AuthRequired": disabled.append(t)
+            except: pass
+    
+    if disabled:
+        for acc in disabled: await delete_token(user_id, acc["token"])
+        await status_msg.edit_text(f"<b>Cleanup:</b> Removed {len(disabled)} disabled accounts.", parse_mode="HTML")
+    else:
+        await status_msg.edit_text("<b>All active accounts operational.</b>", parse_mode="HTML")
+
+@router.message(Command("settings"))
+async def settings_command(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    await message.reply("<b>Settings Menu</b>", reply_markup=await get_settings_menu(message.chat.id), parse_mode="HTML")
+
+@router.message(Command("automation"))
+async def automation_command(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    user_id = message.chat.id
+    from db import get_automation_settings
+    from automation import is_automation_running
+    settings = await get_automation_settings(user_id)
+    running = is_automation_running(user_id)
+    enabled = settings["enabled"] and running
+    
+    lounge_msg = settings.get("lounge_message", "") or "Not set"
+    chatroom_msg = settings.get("chatroom_message", "") or "Not set"
+    
+    status_icon = "ON" if enabled else "OFF"
+    
+    buttons = [
+        [InlineKeyboardButton(text=f"Automation: {status_icon}", callback_data="toggle_automation")],
+        [InlineKeyboardButton(text=f"Lounge Msg: {lounge_msg[:20]}...", callback_data="auto_set_lounge")],
+        [InlineKeyboardButton(text=f"Chatroom Msg: {chatroom_msg[:20]}...", callback_data="auto_set_chatroom")],
+        [InlineKeyboardButton(text="Select Accounts", callback_data="auto_select_accounts")],
+        [InlineKeyboardButton(text="Run Action Now", callback_data="auto_run_action")],
+        [InlineKeyboardButton(text="View Log", callback_data="auto_view_log")],
+    ]
+    await message.reply("<b>Automation Menu</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+@router.message(Command("block"))
+async def block_command(message: Message):
+    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
+    args = message.text.split()
+    if len(args) < 2: return await message.reply("Usage: /block meeff_user_id")
+    await block_user(message.chat.id, args[1])
+    await message.reply(f"✅ Blocked user: <code>{args[1]}</code>", parse_mode="HTML")
+
+@router.message(Command("add"))
+async def add_person_command(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+    args = message.text.strip().split()
+    if len(args) < 2: return await message.reply("Usage: /add <person_id>")
+    
+    token = await get_current_account(user_id)
+    if not token: return await message.reply("No active account found.")
+
+    person_id = args[1]
+    url = f"https://api.meeff.com/user/undoableAnswer/v5/?userId={person_id}&isOkay=1"
+    headers = {"meeff-access-token": token, "Connection": "keep-alive"}
+    
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as response:
+                data = await response.json()
+                await message.reply(f"Response: {data.get('errorCode') or 'Success'}")
+    except Exception as e:
+        await message.reply(f"Error: {e}")
+
+@router.message()
+async def handle_new_token(message: Message):
+    if message.text and message.text.startswith("/"): return
+    user_id = message.from_user.id
+    if message.from_user.is_bot: return
+    if await signup_message_handler(message): return
+
+    state = db_operation_states.get(user_id)
+    if state:
+        operation, text = state.get("operation"), message.text.strip()
+        msg = await message.reply("<b>Processing...</b>", parse_mode="HTML")
+        success, result_msg = False, "Invalid operation."
+        if operation == "connect_db":
+            collection_name = f"user_{text}" if not text.startswith("user_") else text
+            success, result_msg = await connect_to_collection(collection_name, user_id)
+        elif operation == "rename_db":
+            success, result_msg = await rename_user_collection(user_id, text)
+        elif operation == "transfer_db":
+            try: success, result_msg = await transfer_to_user(user_id, int(text))
+            except ValueError: result_msg = "Invalid user ID."
+        await msg.edit_text(f"<b>{'Success' if success else 'Failed'}</b>: {result_msg}", parse_mode="HTML")
+        db_operation_states.pop(user_id, None)
+        return
+
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+
+    if message.text:
+        token_data = message.text.strip().split(" ", 1)
+        token = token_data[0]
+        if len(token) < 100: return await message.reply("Invalid token format.")
         
-        if batch_name not in new_batches:
-            # Initialize new batch data, attempting to restore old metadata
-            metadata = batch_metadata.get(batch_name, {"active": True, "filter": ""})
+        status_msg = await message.reply("<b>Saving Token...</b>", parse_mode="HTML")
+        account_name = token_data[1] if len(token_data) > 1 else f"Account {len(await get_tokens(user_id)) + 1}"
+        token_index = await set_token(user_id, token, account_name)
+        if token_index != -1: await add_token_to_auto_batch(user_id, token_index)
+        await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>'.", parse_mode="HTML")
+
+async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int = 0):
+    user_id = callback_query.from_user.id
+    tokens = await get_tokens(user_id)
+    total_accounts = len(tokens)
+    current_token = await get_current_account(user_id)
+
+    if not tokens:
+        return await callback_query.message.edit_text("<b>No Accounts Found</b>...", reply_markup=back_markup, parse_mode="HTML")
+
+    total_pages = (total_accounts + ACCOUNTS_PER_PAGE - 1) // ACCOUNTS_PER_PAGE
+    page_idx = max(0, min(page_idx, total_pages - 1)) 
+    start_idx = page_idx * ACCOUNTS_PER_PAGE
+    end_idx = min(start_idx + ACCOUNTS_PER_PAGE, total_accounts)
+
+    visible_tokens = tokens[start_idx:end_idx]
+    all_filters = await get_all_user_filters(user_id)
+
+    buttons = []
+    for i, tok in enumerate(visible_tokens):
+        global_idx = start_idx + i 
+        is_current = "🔹" if tok['token'] == current_token else "▫️"
+        
+        token_filters = all_filters.get(tok['token'], {})
+        nationality_code = token_filters.get("filterNationalityCode", "")
+        
+        account_name = html.escape(tok['name'][:15])
+        display_name = f"{account_name}"
+
+        # --- UPDATED BUTTON LAYOUT: Added "Nation" button ---
+        buttons.append([
+            InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"set_account_{global_idx}|{page_idx}"),
+            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"toggle_status_{global_idx}|{page_idx}"),
+            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"manage_acc_filter|{global_idx}|{page_idx}"),
+            InlineKeyboardButton(text="View", callback_data=f"view_account_{global_idx}|{page_idx}")
+        ])
+
+    pagination_row = []
+    if page_idx > 0:
+        pagination_row.append(InlineKeyboardButton(text="« Previous", callback_data=f"manage_accounts|{page_idx - 1}"))
+    pagination_row.append(InlineKeyboardButton(text=f"{page_idx + 1}/{total_pages}", callback_data="noop_page"))
+    if page_idx < total_pages - 1:
+        pagination_row.append(InlineKeyboardButton(text="Next »", callback_data=f"manage_accounts|{page_idx + 1}"))
+    
+    if pagination_row: buttons.append(pagination_row)
+    buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
+    
+    menu_text = f"<b>Manage Accounts (Page {page_idx + 1}/{total_pages})</b>\nCurrently selected: {'Yes' if current_token else 'No'}"
+
+    try:
+        await callback_query.message.edit_text(menu_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    except TelegramBadRequest as e:
+        if "message is not modified" not in e.message: logger.error(f"Error editing message: {e}")
+        await callback_query.answer()
+
+
+async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: str):
+    user_id = callback_query.from_user.id
+    batch = await get_batch_by_name(user_id, batch_name)
+    if not batch: return await callback_query.answer("Batch not found.", show_alert=True)
+
+    tokens = await get_tokens(user_id)
+    token_indices = batch.get("token_indices", [])
+    batch_tokens = [tokens[idx] for idx in token_indices if idx < len(tokens)]
+    real_indices = [idx for idx in token_indices if idx < len(tokens)]
+
+    if not batch_tokens:
+        return await callback_query.message.edit_text(f"<b>{html.escape(batch_name)}</b>\nNo accounts found.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="batch_management")]]), parse_mode="HTML")
+
+    current_token = await get_current_account(user_id)
+    all_filters = await get_all_user_filters(user_id)
+
+    buttons = []
+    for i, tok in enumerate(batch_tokens):
+        global_index = real_indices[i]
+        is_current = "🔹" if tok['token'] == current_token else "▫️"
+        token_filters = all_filters.get(tok['token'], {})
+        nationality_code = token_filters.get("filterNationalityCode", "")
+        account_name = html.escape(tok['name'][:20])
+
+        buttons.append([
+            InlineKeyboardButton(text=f"{is_current} {account_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
+        ])
+
+    buttons.append([
+        InlineKeyboardButton(text="🔄 Refresh Batch", callback_data=f"refresh_batch_{batch_name}"),
+        InlineKeyboardButton(text="Back", callback_data="batch_management")
+    ])
+    await callback_query.message.edit_text(f"<b>{html.escape(batch_name)} - Manage Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+
+
+@router.callback_query()
+async def callback_handler(callback_query: CallbackQuery):
+    user_id = callback_query.from_user.id
+    data = callback_query.data
+    
+    page_idx = 0
+    original_data = data
+    
+    # Updated pagination check to exclude new filter commands
+    if "|" in data and not data.startswith(("batch_select|", "batch_toggle|", "batch_view|", "batch_acc_filter|", "batch_acc_nat_", "manage_acc_filter|", "manage_acc_nat_")):
+        data_parts = data.split("|")
+        try:
+            if len(data_parts) > 1 and data_parts[-1].isdigit():
+                page_idx = int(data_parts[-1])
+                data = "|".join(data_parts[:-1])
+        except ValueError: pass
+
+    if await signup_callback_handler(callback_query): return
+    if not has_valid_access(user_id): return await callback_query.answer("You are not authorized.")
+    
+    state = user_states.setdefault(user_id, {})
+    
+    if data == "manage_accounts":
+        await show_manage_accounts_menu(callback_query, page_idx)
+    
+    # --- NEW: Main Menu Account Filter Logic ---
+    elif data.startswith("manage_acc_filter|"):
+        # Format: manage_acc_filter|{global_index}|{page_idx}
+        parts = data.split("|")
+        if len(parts) >= 3:
+            try:
+                global_index = int(parts[1])
+                # Restore page_idx from the button data so we can go back
+                menu_page_idx = int(parts[2]) 
+                tokens = await get_tokens(user_id)
+                if 0 <= global_index < len(tokens):
+                    tok = tokens[global_index]
+                    token_filters = await get_user_filters(user_id, tok['token']) or {}
+                    current_nat = token_filters.get("filterNationalityCode", "")
+                    
+                    buttons = []
+                    all_mark = "✅ " if not current_nat else ""
+                    # Pass page_idx along to the nation selection
+                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"manage_acc_nat_all|{global_index}|{menu_page_idx}")])
+                    
+                    row = []
+                    for i, (code, name) in enumerate(NATIONALITY_LIST):
+                        mark = "✅ " if current_nat == code else ""
+                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"manage_acc_nat_{code}|{global_index}|{menu_page_idx}"))
+                        if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
+                            buttons.append(row)
+                            row = []
+                    
+                    # Back button returns to the correct page
+                    buttons.append([InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{menu_page_idx}")])
+                    
+                    await callback_query.message.edit_text(
+                        f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                        parse_mode="HTML"
+                    )
+            except (ValueError, IndexError):
+                await callback_query.answer("Invalid account.", show_alert=True)
+
+    elif data.startswith("manage_acc_nat_"):
+        # Format: manage_acc_nat_{CODE}|{global_index}|{page_idx}
+        parts = data.split("|")
+        if len(parts) >= 3:
+            nat_code = parts[0].replace("manage_acc_nat_", "")
+            try:
+                global_index = int(parts[1])
+                menu_page_idx = int(parts[2])
+                tokens = await get_tokens(user_id)
+                if 0 <= global_index < len(tokens):
+                    tok = tokens[global_index]
+                    
+                    user_filters = await get_user_filters(user_id, tok['token']) or {}
+                    if nat_code == "all":
+                        user_filters["filterNationalityCode"] = ""
+                        display_text = "All Countries"
+                    else:
+                        user_filters["filterNationalityCode"] = nat_code
+                        display_text = nat_code
+                    
+                    await set_user_filters(user_id, tok['token'], user_filters)
+                    
+                    if await apply_filter_for_account(tok['token'], user_id):
+                        await callback_query.answer(f"Filter set to {display_text}")
+                    else:
+                        await callback_query.answer("Saved, but API update failed.", show_alert=True)
+                    
+                    # Return to the correct page in Manage Accounts
+                    await show_manage_accounts_menu(callback_query, menu_page_idx)
+            except (ValueError, IndexError):
+                await callback_query.answer("Invalid account.", show_alert=True)
+    # -------------------------------------------
+
+    elif data == "db_settings":
+        current_info = await get_current_collection_info(user_id)
+        info_text = f"<b>DB:</b> <code>{html.escape(current_info['collection_name'])}</code>\nAccounts: {current_info['summary'].get('tokens_count', 0)}" if current_info["exists"] else "No database found."
+        await callback_query.message.edit_text(f"<b>Database Settings</b>\n{info_text}", reply_markup=get_db_settings_menu(), parse_mode="HTML")
+    elif data in ("db_connect", "db_rename", "db_transfer"):
+        prompts = {"db_connect": "Enter collection name", "db_rename": "Enter new name", "db_transfer": "Enter target Telegram user ID"}
+        db_operation_states[user_id] = {"operation": data}
+        await callback_query.message.edit_text(f"<b>{prompts[data]}:</b>", parse_mode="HTML")
+    elif data == "db_view":
+        collections = await list_all_collections()
+        text = "\n\n".join([f"<b>{i}.</b> <code>{html.escape(c['collection_name'])}</code>\n  Accounts: {c['summary'].get('tokens_count', 0)}" for i, c in enumerate(collections[:10], 1)]) or "No Collections Found."
+        await callback_query.message.edit_text(text, reply_markup=get_db_settings_menu(), parse_mode="HTML")
+    elif data in ("unsub_current", "unsub_all"):
+        confirm_text, count = ("current account", 1) if data == "unsub_current" else (f"all {len(await get_active_tokens(user_id))} active accounts", -1)
+        await callback_query.message.edit_text(f"<b>Confirm:</b> Unsubscribe {confirm_text}?", reply_markup=get_confirmation_menu(data), parse_mode="HTML")
+    elif data == "confirm_unsub_current":
+        token = await get_current_account(user_id)
+        if not token: return await callback_query.message.edit_text("No active account found.", reply_markup=back_markup, parse_mode="HTML")
+        msg = await callback_query.message.edit_text("<b>Unsubscribing Current Account...</b>", parse_mode="HTML")
+        await unsubscribe_everyone(token, status_message=msg, bot=bot, chat_id=user_id, user_id=user_id)
+    elif data == "confirm_unsub_all":
+        active_tokens = await get_active_tokens(user_id)
+        if not active_tokens: return await callback_query.message.edit_text("No active accounts found.", reply_markup=back_markup, parse_mode="HTML")
+        msg = await callback_query.message.edit_text(f"<b>Unsubscribing All Accounts ({len(active_tokens)})...</b>", parse_mode="HTML")
+        for i, token_obj in enumerate(active_tokens, 1):
+            await msg.edit_text(f"Processing account {i}/{len(active_tokens)}: {html.escape(token_obj['name'])}", parse_mode="HTML")
+            await unsubscribe_everyone(token_obj["token"], user_id=user_id)
+        await msg.edit_text(f"<b>Unsubscribe Complete</b>\nSuccessfully unsubscribed {len(active_tokens)} accounts.", parse_mode="HTML")
+    elif data == "send_request_menu":
+        await callback_query.message.edit_text("<b>Send Request Options</b>", reply_markup=send_request_markup, parse_mode="HTML")
+    elif data == "settings_menu":
+        await callback_query.message.edit_text("<b>Settings Menu</b>", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
+    elif data == "show_filters":
+        await callback_query.message.edit_text("<b>Filter Settings</b>", reply_markup=await get_meeff_filter_main_keyboard(user_id), parse_mode="HTML")
+    elif data in ("toggle_request_filter", "meeff_filter_main") or data.startswith(("account_filter_", "account_gender_", "account_age_", "account_nationality_")):
+        await set_account_filter(callback_query)
+    
+    # --- ACCOUNT MANAGEMENT ---
+    elif data.startswith("view_account_"):
+        try: idx = int(data.split("_")[-1])
+        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        tokens = await get_tokens(user_id)
+        if 0 <= idx < len(tokens):
+            token_obj = tokens[idx]
+            info_card = await get_info_card(user_id, token_obj['token'])
+            details = f"<b>Name:</b> <code>{html.escape(token_obj.get('name', 'N/A'))}</code>\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n"
+            details += info_card if info_card else "No profile card found."
+            await callback_query.message.edit_text(details, reply_markup=get_account_view_menu(idx, page_idx), parse_mode="HTML", disable_web_page_preview=True)
             
-            new_batches[batch_name] = {
-                "name": batch_name,
-                "token_indices": [],
-                "active": metadata["active"],
-                "filter_nationality": metadata["filter"]
-            }
+    elif data.startswith("confirm_delete_"):
+        try: idx = int(data.split("_")[-1])
+        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        tokens = await get_tokens(user_id)
+        if 0 <= idx < len(tokens):
+            await callback_query.message.edit_text(f"<b>Confirm Deletion</b> of <code>{html.escape(tokens[idx]['name'])}</code>?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Delete", callback_data=f"delete_account_{idx}|{page_idx}"), InlineKeyboardButton(text="Cancel", callback_data=f"manage_accounts|{page_idx}")]]) , parse_mode="HTML")
+
+    elif data.startswith("toggle_status_"):
+        try: idx = int(data.split("_")[-1])
+        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        tokens = await get_tokens(user_id)
+        if 0 <= idx < len(tokens):
+            await toggle_token_status(user_id, tokens[idx]["token"])
+            await show_manage_accounts_menu(callback_query, page_idx)
+    
+    elif data.startswith("set_account_"):
+        try: idx = int(data.split("_")[-1])
+        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        tokens = await get_tokens(user_id)
+        if 0 <= idx < len(tokens):
+            await set_current_account(user_id, tokens[idx]["token"])
+            await show_manage_accounts_menu(callback_query, page_idx)
             
-        new_batches[batch_name]["token_indices"].append(index)
+    elif data.startswith("delete_account_"):
+        try: idx = int(data.split("_")[-1])
+        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        tokens = await get_tokens(user_id)
+        if 0 <= idx < len(tokens):
+            await delete_token(user_id, tokens[idx]["token"])
+            await show_manage_accounts_menu(callback_query, page_idx)
 
-    # 3. Replace the entire 'items' array with the new, corrected list of batches
-    new_items_list = list(new_batches.values())
-    await user_db.update_one(
-        {"type": "batches"},
-        {"$set": {"items": new_items_list}},
-        upsert=True
-    )
-
-# REMOVED auto_organize_batches as it's replaced by automated logic
-
-# --- Pending Signup Accounts Storage ---
-
-async def get_pending_accounts(user_id: int):
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "pending_signup"})
-    return doc.get("accounts", []) if doc else []
-
-async def add_pending_accounts(user_id: int, accounts: list):
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "pending_signup"},
-        {"$push": {"accounts": {"$each": accounts}}},
-        upsert=True
-    )
-
-async def clear_pending_accounts(user_id: int):
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "pending_signup"},
-        {"$set": {"accounts": []}},
-        upsert=True
-    )
-
-async def remove_pending_account(user_id: int, email: str):
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "pending_signup"},
-        {"$pull": {"accounts": {"email": email}}},
-        upsert=True
-    )
-
-
-# --- Automation Settings ---
-
-async def get_automation_settings(user_id: int) -> dict:
-    """Get automation settings for a user."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "automation_settings"})
-    if doc:
-        return {
-            "enabled": doc.get("enabled", False),
-            "lounge_message": doc.get("lounge_message", ""),
-            "chatroom_message": doc.get("chatroom_message", ""),
-            "selected_accounts": doc.get("selected_accounts", "all"),  # "all" or list of indices
-        }
-    return {
-        "enabled": False,
-        "lounge_message": "",
-        "chatroom_message": "",
-        "selected_accounts": "all",
-    }
-
-
-async def set_automation_enabled(user_id: int, enabled: bool):
-    """Toggle automation on/off."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_settings"},
-        {"$set": {"enabled": enabled}},
-        upsert=True
-    )
-
-
-async def set_automation_lounge_message(user_id: int, message: str):
-    """Set the lounge message for automation."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_settings"},
-        {"$set": {"lounge_message": message}},
-        upsert=True
-    )
-
-
-async def set_automation_chatroom_message(user_id: int, message: str):
-    """Set the chatroom message for automation."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_settings"},
-        {"$set": {"chatroom_message": message}},
-        upsert=True
-    )
-
-
-async def set_automation_accounts(user_id: int, accounts):
-    """Set which accounts to use for automation. 'all' or list of token indices."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_settings"},
-        {"$set": {"selected_accounts": accounts}},
-        upsert=True
-    )
-
-
-async def get_automation_log(user_id: int) -> list:
-    """Get automation activity log entries (last 20)."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "automation_log"})
-    if doc:
-        entries = doc.get("entries", [])
-        return entries[-20:]  # Return last 20 entries
-    return []
-
-
-async def add_automation_log(user_id: int, entry: str):
-    """Add an entry to the automation log."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    log_entry = {
-        "text": entry,
-        "time": datetime.datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
-    }
-    await user_db.update_one(
-        {"type": "automation_log"},
-        {"$push": {"entries": {"$each": [log_entry], "$slice": -50}}},
-        upsert=True
-    )
-
-
-async def set_automation_last_request_time(user_id: int, token: str):
-    """Record when a request cycle was last run for a token."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_timers"},
-        {"$set": {f"request_times.{token}": datetime.datetime.utcnow()}},
-        upsert=True
-    )
-
-
-async def get_automation_last_request_time(user_id: int, token: str):
-    """Get when a request cycle was last run for a token."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "automation_timers"})
-    if doc:
-        return doc.get("request_times", {}).get(token)
-    return None
-
-
-async def set_automation_add_time(user_id: int, token: str, person_id: str):
-    """Record when a person was added (for scheduling lounge/chatroom follow-ups)."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_timers"},
-        {"$set": {f"add_times.{token}.{person_id}": datetime.datetime.utcnow()}},
-        upsert=True
-    )
-
-
-async def get_automation_pending_followups(user_id: int) -> dict:
-    """Get all pending follow-up timers."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "automation_timers"})
-    if doc:
-        return {
-            "request_times": doc.get("request_times", {}),
-            "add_times": doc.get("add_times", {}),
-            "lounge_sent": doc.get("lounge_sent", {}),
-            "chatroom_sent": doc.get("chatroom_sent", {}),
-        }
-    return {"request_times": {}, "add_times": {}, "lounge_sent": {}, "chatroom_sent": {}}
-
-
-async def mark_lounge_sent(user_id: int, token: str, person_id: str, wave: int):
-    """Mark that a lounge message wave was sent. wave: 1=20min, 2=1hr, 3=3hr"""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_timers"},
-        {"$set": {f"lounge_sent.{token}.{person_id}.wave_{wave}": datetime.datetime.utcnow()}},
-        upsert=True
-    )
-
-
-async def get_lounge_sent_waves(user_id: int, token: str, person_id: str) -> dict:
-    """Get which lounge waves have been sent for a person."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "automation_timers"})
-    if doc:
-        return doc.get("lounge_sent", {}).get(token, {}).get(person_id, {})
-    return {}
-
-
-async def mark_chatroom_sent(user_id: int, token: str, person_id: str):
-    """Mark that a chatroom message was sent for a person."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "automation_timers"},
-        {"$set": {f"chatroom_sent.{token}.{person_id}": datetime.datetime.utcnow()}},
-        upsert=True
-    )
-
-
-async def is_chatroom_sent(user_id: int, token: str, person_id: str) -> bool:
-    """Check if chatroom message was already sent for a person."""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "automation_timers"})
-    if doc:
-        return person_id in doc.get("chatroom_sent", {}).get(token, {})
-    return False
-
-
-# --- Batch Account Nationality Filters ---
-
-async def set_batch_account_filter(telegram_user_id: int, batch_name: str, token_index: int, nationality_code: str):
-    """Set nationality filter for a specific account within a batch"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
+    elif data == "noop_page":
+        await callback_query.answer("You are on this page.")
     
-    # Initialize batch_account_filters doc if it doesn't exist
-    await user_db.update_one(
-        {"type": "batch_account_filters"},
-        {"$set": {f"{batch_name}.{token_index}": nationality_code}},
-        upsert=True
-    )
-
-
-async def get_batch_account_filter(telegram_user_id: int, batch_name: str, token_index: int) -> str:
-    """Get nationality filter for a specific account within a batch"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
+    elif data == "view_blocked_users":
+        from db import get_blocked_users
+        blocked = await get_blocked_users(user_id)
+        if not blocked:
+            return await callback_query.message.edit_text("<b>No blocked users</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="spam_filter_menu")]]), parse_mode="HTML")
+        blocked_list = "\n".join([f"<code>{uid}</code>" for uid in sorted(list(blocked))[:50]])
+        await callback_query.message.edit_text(f"<b>Blocked Users ({len(blocked)})</b>\n\n{blocked_list}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="spam_filter_menu")]]), parse_mode="HTML")
     
-    doc = await user_db.find_one({"type": "batch_account_filters"})
-    if doc and batch_name in doc:
-        return doc[batch_name].get(str(token_index), "")
-    return ""
-
-
-async def get_all_batch_account_filters(telegram_user_id: int, batch_name: str) -> dict:
-    """Get all account filters for a batch"""
-    await _ensure_user_collection_exists(telegram_user_id)
-    user_db = _get_user_collection(telegram_user_id)
+    elif data == "confirm_clear_blocked":
+        await callback_query.message.edit_text("<b>Clear all blocked users?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Clear", callback_data="clear_blocked_confirm")], [InlineKeyboardButton(text="Cancel", callback_data="spam_filter_menu")]]), parse_mode="HTML")
     
-    doc = await user_db.find_one({"type": "batch_account_filters"})
-    if doc and batch_name in doc:
-        return doc[batch_name]
-    return {}
+    elif data == "clear_blocked_confirm":
+        from db import clear_blocked_users
+        await clear_blocked_users(user_id)
+        await callback_query.answer("✅ All blocked users cleared!")
+        await callback_query.message.edit_text("<b>Spam Filters</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
+    
+    # --- AUTOMATION CALLBACKS ---
+    elif data.startswith(("toggle_automation", "auto_set_lounge", "auto_set_chatroom", "auto_select_accounts", "auto_acc_", "auto_run_action", "auto_view_log", "back_to_automation")):
+        from automation import start_automation, stop_automation, is_automation_running, run_automation_action
+        
+        if data == "toggle_automation":
+            settings = await get_automation_settings(user_id)
+            running = is_automation_running(user_id)
+            if settings["enabled"] and running:
+                await set_automation_enabled(user_id, False)
+                stop_automation(user_id)
+                await callback_query.answer("Automation stopped.")
+            else:
+                if not settings.get("lounge_message") or not settings.get("chatroom_message"):
+                    return await callback_query.answer("Set both messages first!", show_alert=True)
+                await set_automation_enabled(user_id, True)
+                start_automation(user_id, bot)
+                await callback_query.answer("Automation started!")
+        
+        elif data == "auto_set_lounge":
+            await callback_query.message.edit_text("<b>Set Lounge Message</b>\n\nType the message you want to auto-send in lounge:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_to_automation")]]))
+        
+        elif data == "auto_set_chatroom":
+            await callback_query.message.edit_text("<b>Set Chatroom Message</b>\n\nType the message you want to auto-send in chatroom:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_to_automation")]]))
+        
+        elif data == "auto_select_accounts":
+            settings = await get_automation_settings(user_id)
+            selected = settings.get("selected_accounts", "all")
+            
+            mark_current = "✅ " if selected == "current" else ""
+            mark_active  = "✅ " if selected == "active_only" else ""
 
+            buttons = [
+                [InlineKeyboardButton(text=f"{mark_current}Current Account", callback_data="auto_acc_current")],
+                [InlineKeyboardButton(text=f"{mark_active}All Active Accounts", callback_data="auto_acc_active")],
+                [InlineKeyboardButton(text="Back", callback_data="back_to_automation")]
+            ]
+            await callback_query.message.edit_text("<b>Select Automation Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+        
+       # --- OPTION 1: CURRENT ---
+        elif data == "auto_acc_current":
+            await set_automation_accounts(user_id, "current")
+            await callback_query.answer("Current account selected!")
+            callback_query.data = "auto_select_accounts"
+            await callback_handler(callback_query)
+        
+       # --- OPTION 2: ALL ACTIVE ---
+        elif data == "auto_acc_active":
+            await set_automation_accounts(user_id, "active_only")
+            await callback_query.answer("Active accounts selected!")
+            callback_query.data = "auto_select_accounts"
+            await callback_handler(callback_query)
+        
+        elif data == "auto_run_action":
+            status_msg = await callback_query.message.edit_text("<b>Starting automation...</b>", parse_mode="HTML")
+            asyncio.create_task(run_automation_action(user_id, status_msg))
+        
+        elif data == "auto_view_log":
+            log_entries = await get_automation_log(user_id)
+            log_text = "\n".join([f"<code>{e['time']}</code> {html.escape(e['text'])}" for e in log_entries[-15:]]) if log_entries else "<i>No automation activity yet.</i>"
+            await callback_query.message.edit_text(f"<b>Automation Log</b>\n\n{log_text}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Refresh", callback_data="auto_view_log"), InlineKeyboardButton(text="Back", callback_data="back_to_automation")]]), parse_mode="HTML")
+        
+        elif data == "back_to_automation":
+            await automation_command(callback_query.message)
+    
+    # --- SPAM FILTER MANAGEMENT ---
+    elif data == "spam_filter_menu":
+        await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
+    elif data.startswith("toggle_spam_"):
+        filter_type = data.split("_")[-1]
+        if filter_type == "all":
+            new_status = not any((await get_all_spam_filters(user_id)).values())
+            for ft in ["chatroom", "request", "lounge"]: await set_individual_spam_filter(user_id, ft, new_status)
+        else:
+            await set_individual_spam_filter(user_id, filter_type, not await get_individual_spam_filter(user_id, filter_type))
+        await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
+    elif data == "noop_count":
+        await callback_query.answer("This is the count of spam-filtered IDs.")
+    elif data.startswith("confirm_clear_spam_"):
+        category = data.split("_")[-1]
+        await callback_query.message.edit_text(f"<b>Confirm:</b> Clear {category} spam?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Clear", callback_data=f"clear_spam_{category}"), InlineKeyboardButton(text="Cancel", callback_data="spam_filter_menu")]]), parse_mode="HTML")
+    elif data.startswith("clear_spam_"):
+        await clear_spam_records(user_id, data.split("_")[-1])
+        await callback_query.answer("Cleared.")
+        await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
+    
+    # --- BATCH MANAGEMENT ---
+    elif data == "batch_management":
+        await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
+    elif data.startswith("view_batch_"):
+        batch_name = data.replace("view_batch_", "")
+        await show_batch_accounts_menu(callback_query, batch_name)
+    elif data.startswith("batch_select|"):
+        try:
+            _, batch_name, idx_str = original_data.split("|", 2)
+            idx = int(idx_str)
+            tokens = await get_tokens(user_id)
+            if 0 <= idx < len(tokens):
+                await set_current_account(user_id, tokens[idx]["token"])
+                await show_batch_accounts_menu(callback_query, batch_name)
+        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
+    elif data.startswith("batch_toggle|"):
+        try:
+            _, batch_name, idx_str = original_data.split("|", 2)
+            idx = int(idx_str)
+            tokens = await get_tokens(user_id)
+            if 0 <= idx < len(tokens):
+                await toggle_token_status(user_id, tokens[idx]["token"])
+                await show_batch_accounts_menu(callback_query, batch_name)
+        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
+    elif data.startswith("batch_view|"):
+        try:
+            _, batch_name, idx_str = original_data.split("|", 2)
+            idx = int(idx_str)
+            tokens = await get_tokens(user_id)
+            if 0 <= idx < len(tokens):
+                token_obj = tokens[idx]
+                info = await get_info_card(user_id, token_obj["token"])
+                text = f"<b>Name:</b> {html.escape(token_obj.get('name','N/A'))}\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n{info or 'No profile card.'}"
+                await callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")]]))
+        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
+    elif data.startswith("toggle_batch_"):
+        batch_name = data.replace("toggle_batch_", "")
+        if await toggle_batch_status(user_id, batch_name):
+            await callback_query.answer("Toggled.")
+            await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
+    
+    # --- BATCH ACCOUNT FILTER LOGIC ---
+    elif data.startswith("batch_acc_filter|"):
+        parts = data.split("|")
+        if len(parts) >= 3:
+            batch_name = parts[1]
+            try:
+                global_index = int(parts[2])
+                tokens = await get_tokens(user_id)
+                if 0 <= global_index < len(tokens):
+                    tok = tokens[global_index]
+                    token_filters = await get_user_filters(user_id, tok['token']) or {}
+                    current_nat = token_filters.get("filterNationalityCode", "")
+                    
+                    buttons = []
+                    all_mark = "✅ " if not current_nat else ""
+                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_acc_nat_all|{batch_name}|{global_index}")])
+                    
+                    row = []
+                    for i, (code, name) in enumerate(NATIONALITY_LIST):
+                        mark = "✅ " if current_nat == code else ""
+                        row.append(InlineKeyboardButton(text=f"{mark}{name}", callback_data=f"batch_acc_nat_{code}|{batch_name}|{global_index}"))
+                        if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
+                            buttons.append(row)
+                            row = []
+                    buttons.append([InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")])
+                    await callback_query.message.edit_text(f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+            except (ValueError, IndexError): await callback_query.answer("Invalid account.", show_alert=True)
 
-# --- Blocked Users ---
+    elif data.startswith("batch_acc_nat_"):
+        parts = data.split("|")
+        if len(parts) >= 3:
+            nat_code = parts[0].replace("batch_acc_nat_", "")
+            batch_name = parts[1]
+            try:
+                global_index = int(parts[2])
+                tokens = await get_tokens(user_id)
+                if 0 <= global_index < len(tokens):
+                    tok = tokens[global_index]
+                    user_filters = await get_user_filters(user_id, tok['token']) or {}
+                    if nat_code == "all":
+                        user_filters["filterNationalityCode"] = ""
+                        display_text = "All Countries"
+                    else:
+                        user_filters["filterNationalityCode"] = nat_code
+                        display_text = nat_code
+                    await set_user_filters(user_id, tok['token'], user_filters)
+                    if await apply_filter_for_account(tok['token'], user_id):
+                        await callback_query.answer(f"Filter set to {display_text}")
+                    else:
+                        await callback_query.answer("Saved, but API update failed.", show_alert=True)
+                    await show_batch_accounts_menu(callback_query, batch_name)
+            except (ValueError, IndexError): await callback_query.answer("Invalid account.", show_alert=True)
+    
+    elif data.startswith("batch_filter_"):
+        batch_name = data.replace("batch_filter_", "")
+        await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
 
-async def block_user(user_id: int, blocked_meeff_id: str):
-    """Add a user to the block list (block_meeff_id format: "meeff_id")"""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "blocked_users"},
-        {"$addToSet": {"blocked_ids": blocked_meeff_id}},
-        upsert=True
-    )
+    elif data.startswith("refresh_batch_"):
+        batch_name = data.replace("refresh_batch_", "")
+        batch = await get_batch_by_name(user_id, batch_name)
+        if not batch:
+            return await callback_query.answer("Batch not found.", show_alert=True)
 
+        indices = batch.get("token_indices", [])
+        all_tokens = await get_tokens(user_id)
 
-async def unblock_user(user_id: int, blocked_meeff_id: str):
-    """Remove a user from the block list"""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.update_one(
-        {"type": "blocked_users"},
-        {"$pull": {"blocked_ids": blocked_meeff_id}},
-        upsert=True
-    )
+        await callback_query.answer("Refreshing batch...")
+        status_msg = await callback_query.message.answer("<b>🔄 Refreshing batch tokens...</b>", parse_mode="HTML")
 
+        success, failed, banned, no_creds = 0, 0, 0, 0
 
-async def get_blocked_users(user_id: int) -> set:
-    """Get all blocked user IDs as a set"""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    doc = await user_db.find_one({"type": "blocked_users"})
-    if doc:
-        return set(doc.get("blocked_ids", []))
-    return set()
+        for idx in indices:
+            if idx >= len(all_tokens):
+                continue
+            token_data = all_tokens[idx]
+            email = token_data.get("email")
+            password = token_data.get("password")
+            name = token_data.get("name", f"Account {idx}")
 
+            if not email or not password:
+                no_creds += 1
+                continue
 
-async def clear_blocked_users(user_id: int):
-    """Clear all blocked users"""
-    await _ensure_user_collection_exists(user_id)
-    user_db = _get_user_collection(user_id)
-    await user_db.delete_one({"type": "blocked_users"})
+            try:
+                from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
+                device_info = await get_or_create_device_info_for_email(user_id, email)
+                base_payload = {"provider": "email", "providerId": email, "providerToken": password, "locale": "en"}
+                payload = get_api_payload_with_device_info(base_payload, device_info)
+
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        "https://api.meeff.com/user/login/v4",
+                        json=payload,
+                        headers={'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"},
+                        timeout=10
+                    ) as resp:
+                        if resp.status == 200:
+                            result = await resp.json()
+                            new_token = result.get("accessToken")
+                            if new_token:
+                                await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
+                                success += 1
+                            else:
+                                failed += 1
+                        elif resp.status == 403:
+                            result = await resp.json()
+                            err_msg = result.get("errorMessage", "").lower()
+                            if any(k in err_msg for k in ("ban", "suspend", "block")):
+                                banned += 1
+                            else:
+                                failed += 1
+                        else:
+                            failed += 1
+            except Exception as e:
+                logger.error(f"Refresh failed for {name}: {e}")
+                failed += 1
+
+            await asyncio.sleep(0.5)
+
+        result_text = f"<b>🔄 Batch Refresh Complete</b>\n\n✅ Refreshed: {success}\n🚫 Banned: {banned}\n❌ Failed: {failed}"
+        if no_creds:
+            result_text += f"\n⚠️ Skipped (no credentials): {no_creds}"
+        await status_msg.edit_text(result_text, parse_mode="HTML")
+
+    elif data.startswith("batch_nat_"):
+        parts = data.split("_")
+        if len(parts) >= 3:
+            nat_code = parts[2]
+            batch_name = "_".join(parts[3:])
+            if nat_code == "all": nat_code = ""
+            await set_batch_filter(user_id, batch_name, nat_code)
+            batch = await get_batch_by_name(user_id, batch_name)
+            if batch:
+                tokens = await get_tokens(user_id)
+                token_indices = batch.get("token_indices", [])
+                count = 0
+                for idx in token_indices:
+                    if idx < len(tokens):
+                        tok = tokens[idx]
+                        u_filters = await get_user_filters(user_id, tok['token']) or {}
+                        u_filters["filterNationalityCode"] = nat_code
+                        await set_user_filters(user_id, tok['token'], u_filters)
+                        await apply_filter_for_account(tok['token'], user_id)
+                        count += 1
+                await callback_query.answer(f"Applied to {count} accounts!")
+            await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
+
+    elif data == "back_to_menu":
+        await callback_query.message.edit_text("<b>Meeff Bot Dashboard</b>", reply_markup=start_markup, parse_mode="HTML")
+        
+    elif data in ("start", "start_all", "stop", "all_countries"):
+        if data in ("start", "start_all", "all_countries") and state.get("running"): return await callback_query.answer("Already running!")
+        if data == "stop" and not state.get("running"): return await callback_query.answer("Not running!")
+        
+        if data == "start":
+            msg = await callback_query.message.edit_text("<b>Initializing Requests...</b>", reply_markup=stop_markup, parse_mode="HTML")
+            state.update({"running": True, "status_message_id": msg.message_id, "pinned_message_id": msg.message_id})
+            await bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+            asyncio.create_task(run_requests(user_id, bot, TARGET_CHANNEL_ID))
+        elif data == "start_all":
+            tokens = await get_active_tokens(user_id)
+            if not tokens: return await callback_query.answer("No active tokens.", show_alert=True)
+            msg = await callback_query.message.edit_text(f"🔄 <b>AIO Starting ({len(tokens)})...</b>", reply_markup=stop_markup, parse_mode="HTML")
+            state.update({"running": True, "status_message_id": msg.message_id, "pinned_message_id": msg.message_id})
+            asyncio.create_task(process_all_tokens(user_id, tokens, bot, TARGET_CHANNEL_ID, initial_status_message=msg))
+        elif data == "stop":
+            state.update({"running": False, "stopped": True})
+            await callback_query.message.edit_text(f"<b>Stopped.</b>", reply_markup=start_markup, parse_mode="HTML")
+            if state.get("pinned_message_id"): await bot.unpin_chat_message(chat_id=user_id, message_id=state["pinned_message_id"])
+        elif data == "all_countries":
+            msg = await callback_query.message.edit_text("<b>Starting All Countries...</b>", reply_markup=stop_markup, parse_mode="HTML")
+            state.update({"running": True, "status_message_id": msg.message_id, "pinned_message_id": msg.message_id, "stop_markup": stop_markup})
+            await bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
+            asyncio.create_task(run_all_countries(user_id, state, bot, get_current_account))
+
+async def set_bot_commands():
+    commands = [BotCommand(command=c, description=d) for c, d in [
+        ("start", "Start the bot"), ("lounge", "Send message in the lounge"),
+        ("send_lounge_all", "Send lounge message to all accounts"), ("chatroom", "Send message in chatrooms"),
+        ("send_chat_all", "Send chatroom message to all accounts"), ("invoke", "Remove disabled accounts"),
+        ("skip", "Unsubscribe from chats"), ("settings", "Bot settings"),
+        ("add", "Add a person by ID"), ("signup", "Create a Meeff account"),
+        ("automation", "Automation settings"), ("block", "Block user from meeff"),
+        ("password", "Enter password for access")]]
+    await bot.set_my_commands(commands)
+
+async def resume_automation_tasks():
+    """Checks all users in DB and restarts automation if it was ON."""
+    try:
+        collections = await list_all_collections()
+        count = 0
+        for col in collections:
+            # Extract user_id from "user_12345"
+            try:
+                user_id = int(col['collection_name'].replace("user_", ""))
+                settings = await get_automation_settings(user_id)
+                if settings.get("enabled"):
+                    start_automation(user_id, bot)
+                    count += 1
+            except ValueError:
+                continue
+        if count > 0:
+            logger.info(f"♻️ Resumed automation for {count} users.")
+    except Exception as e:
+        logger.error(f"Failed to resume tasks: {e}")
+
+async def main():
+    try:
+        await set_bot_commands()
+        
+        # --- RESUME TASKS ---
+        await resume_automation_tasks()
+        
+        dp.include_router(router)
+        logger.info("Starting bot polling...")
+        await dp.start_polling(bot)
+    except Exception as e:
+        logger.error(f"Failed to start bot: {e}", exc_info=True)
+
+if __name__ == "__main__":
+    asyncio.run(main())
