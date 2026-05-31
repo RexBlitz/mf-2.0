@@ -15,7 +15,8 @@ from db import (
     # Line 15: The error is here, or in the indentation immediately before
     #          `set_token` or between the items.
     set_token, set_info_card, set_signup_config, get_signup_config, set_user_filters,
-    get_pending_accounts, add_pending_accounts, remove_pending_account, clear_pending_accounts
+    get_pending_accounts, add_pending_accounts, remove_pending_account, clear_pending_accounts,
+    add_token_to_auto_batch
 )
 from filters import get_nationality_keyboard
 
@@ -624,11 +625,19 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         auto_signup = cfg.get("auto_signup", False)
 
         if not auto_signup:
-            # Manual mode: ask for email and password directly
-            state["stage"] = "manual_signup_email"
+            # Manual mode: just ask for email, rest comes from config
+            if not all(k in cfg for k in ['password', 'gender', 'birth_year', 'nationality']):
+                await callback.message.edit_text(
+                    "<b>Configuration Incomplete</b>\n\nPlease set up password, gender, birth year and nationality in <b>Signup Config</b> first.",
+                    reply_markup=SIGNUP_MENU, parse_mode="HTML"
+                )
+                await callback.answer()
+                return True
+            state["stage"] = "ask_num_accounts"
+            state["manual_mode"] = True
             user_signup_states[user_id] = state
             await callback.message.edit_text(
-                "<b>Manual Sign Up</b>\n\nEnter the email address for the new account:",
+                "<b>Manual Sign Up</b>\n\nEnter the number of accounts to create (1-100):",
                 reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
             )
             await callback.answer()
@@ -647,19 +656,6 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         user_signup_states[user_id] = state
         await callback.message.edit_text(
             "<b>Account Creation</b>\n\nEnter the number of accounts to create (1-100):",
-            reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
-        )
-        await callback.answer()
-        return True
-
-    # ---------- Manual signup gender selection ----------
-    if data.startswith("manual_gender_"):
-        gender = data.replace("manual_gender_", "")  # "M" or "F"
-        state["manual_gender"] = gender
-        state["stage"] = "manual_signup_birth_year"
-        user_signup_states[user_id] = state
-        await callback.message.edit_text(
-            "<b>Birth Year</b>\n\nEnter your birth year (e.g. 1995):",
             reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
         )
         await callback.answer()
@@ -687,10 +683,15 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.message.edit_text("<b>Creating Accounts Concurrently...</b>", parse_mode="HTML")
         cfg = await get_signup_config(user_id) or {}
         num_accounts = state.get("num_accounts", 1)
-        selected_emails = state.get("selected_emails", []) or []
+        manual_mode = state.get("manual_mode", False)
         used_emails = set(cfg.get("used_emails", []))
 
-        if not selected_emails:
+        if manual_mode:
+            selected_emails = [state.get("manual_email")]
+        else:
+            selected_emails = state.get("selected_emails", []) or []
+
+        if not selected_emails or not selected_emails[0]:
             await callback.message.edit_text(
                 "<b>No Available Emails</b>\n\nNo valid email variations found. Please try a different base email in Signup Config.",
                 reply_markup=SIGNUP_MENU, parse_mode="HTML"
@@ -904,74 +905,18 @@ async def signup_message_handler(message: Message) -> bool:
         user_signup_states[user_id] = state
         return True
     
-    # ---------- Manual Sign Up (auto signup OFF) ----------
+    # ---------- Manual Sign Up — enter email after name, before photos ----------
     if stage == "manual_signup_email":
         email = text.strip()
         if "@" not in email or "." not in email:
             await message.answer("Invalid email. Please enter a valid email address:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
             return True
         state["manual_email"] = email
-        state["stage"] = "manual_signup_password"
+        state["stage"] = "ask_photos"
+        state["photos"] = []
+        state["last_photo_message_id"] = None
         user_signup_states[user_id] = state
-        await message.answer("<b>Password</b>\n\nEnter the password for this account:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
-        return True
-
-    if stage == "manual_signup_password":
-        password = text.strip()
-        if len(password) < 6:
-            await message.answer("Password too short (min 6 characters). Try again:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
-            return True
-        state["manual_password"] = password
-        state["stage"] = "manual_signup_name"
-        user_signup_states[user_id] = state
-        await message.answer("<b>Display Name</b>\n\nEnter the display name for this account:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
-        return True
-
-    if stage == "manual_signup_name":
-        state["manual_name"] = text.strip() or "User"
-        state["stage"] = "manual_signup_gender"
-        user_signup_states[user_id] = state
-        gender_kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Male", callback_data="manual_gender_M"),
-             InlineKeyboardButton(text="Female", callback_data="manual_gender_F")]
-        ])
-        await message.answer("<b>Gender</b>\n\nSelect gender:", reply_markup=gender_kb, parse_mode="HTML")
-        return True
-
-    if stage == "manual_signup_birth_year":
-        try:
-            year = int(text.strip())
-            if not (1950 <= year <= 2006):
-                raise ValueError()
-        except ValueError:
-            await message.answer("Invalid year. Enter a year between 1950 and 2006:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
-            return True
-
-        state["manual_birth_year"] = year
-        msg = await message.answer("<b>Creating Account...</b>", parse_mode="HTML")
-
-        acc_state = {
-            "email": state["manual_email"],
-            "password": state["manual_password"],
-            "name": state["manual_name"],
-            "gender": state["manual_gender"],
-            "birth_year": year,
-            "nationality": "US",
-            "desc": get_random_bio(),
-            "photos": [],
-        }
-        res = await try_signup(acc_state, user_id)
-
-        if isinstance(res, dict) and res.get("user", {}).get("_id"):
-            token = res.get("accessToken")
-            creds = {"email": acc_state["email"], "password": acc_state["password"]}
-            await store_token_and_show_card(msg, res, creds)
-        else:
-            err = res.get("errorMessage", "Unknown error.") if isinstance(res, dict) else str(res)
-            await msg.edit_text(f"<b>Sign Up Failed</b>\n\nError: {err}", reply_markup=SIGNUP_MENU, parse_mode="HTML")
-
-        state["stage"] = "menu"
-        user_signup_states[user_id] = state
+        await message.answer("<b>Profile Photos</b>\n\nSend up to 6 photos. Click 'Done' when finished.", reply_markup=DONE_PHOTOS, parse_mode="HTML")
         return True
 
     # ---------- End Manual Sign Up stages ----------
@@ -1046,11 +991,17 @@ async def signup_message_handler(message: Message) -> bool:
     # ask name
     if stage == "ask_name":
         state["name"] = text or "User"
-        state["stage"] = "ask_photos"
-        state["photos"] = []
-        state["last_photo_message_id"] = None
-        user_signup_states[user_id] = state
-        await message.answer("<b>Profile Photos</b>\n\nSend up to 6 photos. Click 'Done' when finished.", reply_markup=DONE_PHOTOS, parse_mode="HTML")
+        # if manual signup, ask for email next; otherwise go straight to photos
+        if state.get("manual_mode"):
+            state["stage"] = "manual_signup_email"
+            user_signup_states[user_id] = state
+            await message.answer("<b>Email</b>\nEnter the email address for this account:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+        else:
+            state["stage"] = "ask_photos"
+            state["photos"] = []
+            state["last_photo_message_id"] = None
+            user_signup_states[user_id] = state
+            await message.answer("<b>Profile Photos</b>\n\nSend up to 6 photos. Click 'Done' when finished.", reply_markup=DONE_PHOTOS, parse_mode="HTML")
         return True
 
     # photo upload stage
@@ -1143,7 +1094,9 @@ async def store_token_and_show_card(msg_obj: Message, login_result: Dict, creds:
     user_data = login_result.get("user")
     if access_token and user_data:
         user_id = msg_obj.chat.id
-        await set_token(user_id, access_token, user_data.get("name", creds.get("email")), creds.get("email"), creds.get("password"))
+        token_index = await set_token(user_id, access_token, user_data.get("name", creds.get("email")), creds.get("email"), creds.get("password"))
+        if token_index != -1:
+            await add_token_to_auto_batch(user_id, token_index)
         user_data.update({
             "email": creds.get("email"),
             "password": creds.get("password"),
