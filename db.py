@@ -24,10 +24,13 @@ def _get_user_collection(telegram_user_id):
     return db[collection_name]
 
 # Helper function to ensure collection exists with basic structure
+_initialized_users: set = set()
+
 async def _ensure_user_collection_exists(telegram_user_id):
-    """Make sure user collection exists with default documents"""
+    """Make sure user collection exists with default documents — skips DB check if already seen this session"""
+    if telegram_user_id in _initialized_users:
+        return
     user_db = _get_user_collection(telegram_user_id)
-    # Check if 'metadata' exists; a simpler check than count_documents({}) == 0
     if await user_db.count_documents({"type": "metadata"}) == 0:
         await user_db.insert_many([
             {"type": "metadata", "created_at": datetime.datetime.utcnow(), "user_id": telegram_user_id},
@@ -35,8 +38,10 @@ async def _ensure_user_collection_exists(telegram_user_id):
             {"type": "settings", "current_token": None, "spam_filter": False},
             {"type": "sent_records", "data": {}},
             {"type": "filters", "data": {}},
-            {"type": "info_cards", "data": {}}
+            {"type": "info_cards", "data": {}},
+            {"type": "batches", "items": []}
         ])
+    _initialized_users.add(telegram_user_id)
 
 async def get_all_user_filters(user_id: int):
     """
@@ -127,8 +132,11 @@ async def transfer_to_user(from_user_id, to_user_id):
 
 async def get_current_collection_info(user_id):
     collection_name = f"user_{user_id}"
-    if collection_name in await db.list_collection_names():
-        return {"collection_name": collection_name, "exists": True, "summary": await get_collection_summary(collection_name)}
+    collection = db[collection_name]
+    tokens_doc = await collection.find_one({"type": "tokens"}, {"items": 1})
+    if tokens_doc:
+        tokens_count = len(tokens_doc.get("items", []))
+        return {"collection_name": collection_name, "exists": True, "summary": {"tokens_count": tokens_count}}
     return {"collection_name": collection_name, "exists": False, "summary": None}
 
 async def set_info_card(telegram_user_id, token, info_text, email=None):
@@ -555,6 +563,13 @@ async def add_token_to_auto_batch(user_id: int, token_index: int):
     new_batch_number = (token_index // 10) + 1
     new_batch_name = f"Batch {new_batch_number}"
 
+    # Ensure batches doc exists with items array
+    await user_db.update_one(
+        {"type": "batches"},
+        {"$setOnInsert": {"type": "batches", "items": []}},
+        upsert=True
+    )
+
     if batches_doc and any(b.get("name") == new_batch_name for b in batches_doc.get("items", [])):
         # Batch exists — append index to it
         await user_db.update_one(
@@ -562,7 +577,7 @@ async def add_token_to_auto_batch(user_id: int, token_index: int):
             {"$push": {"items.$.token_indices": token_index}}
         )
     else:
-        # Batch doesn't exist yet — create it (also creates the batches doc if missing)
+        # Batch doesn't exist yet — create it
         batch_data = {
             "name": new_batch_name,
             "token_indices": [token_index],
@@ -571,8 +586,7 @@ async def add_token_to_auto_batch(user_id: int, token_index: int):
         }
         await user_db.update_one(
             {"type": "batches"},
-            {"$push": {"items": batch_data}},
-            upsert=True
+            {"$push": {"items": batch_data}}
         )
 
 async def create_batch(telegram_user_id: int, batch_name: str, token_indices: list) -> bool:
