@@ -35,7 +35,8 @@ from filters import (
     set_filter, apply_filter_for_account
 )
 from allcountry import run_all_countries
-from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command, user_signup_states
+from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command, user_signup_states, format_user_with_nationality
+from db import set_info_card
 from friend_requests import run_requests, process_all_tokens, user_states, stop_markup
 # --- NEW IMPORT ---
 from automation import start_automation
@@ -961,6 +962,11 @@ async def callback_handler(callback_query: CallbackQuery):
                             new_token = result.get("accessToken")
                             if new_token:
                                 await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
+                                # Rebuild info card with fresh data from login response (includes photoUrls)
+                                user_obj = result.get("user", {})
+                                if user_obj:
+                                    user_obj.update({"email": email, "password": password, "token": new_token})
+                                    await set_info_card(user_id, new_token, format_user_with_nationality(user_obj), email)
                                 success += 1
                             else:
                                 failed += 1
