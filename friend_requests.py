@@ -4,7 +4,7 @@ import logging
 import html
 from aiogram import Bot, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from db import get_individual_spam_filter, bulk_add_sent_ids, get_active_tokens, get_current_account, get_already_sent_ids, get_exclude_filter, get_exclude_filter_enabled
+from db import get_individual_spam_filter, bulk_add_sent_ids, get_active_tokens, get_current_account, get_already_sent_ids, get_exclude_filter
 from filters import apply_filter_for_account, is_request_filter_enabled
 from collections import defaultdict
 from dateutil import parser
@@ -146,14 +146,6 @@ async def process_users(session, users, token, user_id, bot, token_name, already
 
         try:
             async with session.get(url, headers=headers) as response:
-                if response.status == 401:
-                    logging.error(f"Token invalid (401) for {token_name}, stopping.")
-                    limit_reached = True
-                    break
-                if response.status != 200:
-                    logging.warning(f"undoableAnswer returned {response.status} for {token_name}, skipping user.")
-                    await asyncio.sleep(PER_ERROR_DELAY)
-                    continue
                 data = await response.json()
 
                 if data.get("errorCode") == "LikeExceeded":
@@ -203,14 +195,10 @@ async def run_requests(user_id, bot, target_channel_id):
     """Main function to run the request process for a single token."""
     state = user_states[user_id]
     state.update({"total_added_friends": 0, "batch_index": 0, "running": True, "stopped": False})
-    empty_batches = 0
     
     token = await get_current_account(user_id)
     if not token:
-        if state.get("status_message_id"):
-            await bot.edit_message_text(chat_id=user_id, message_id=state["status_message_id"], text="No active account found.")
-        else:
-            await bot.send_message(chat_id=user_id, text="No active account found.")
+        await bot.edit_message_text(chat_id=user_id, message_id=state["status_message_id"], text="No active account found.")
         state["running"] = False
         return
 
@@ -226,8 +214,7 @@ async def run_requests(user_id, bot, target_channel_id):
         already_sent_ids = set()
     # ----------------------
 
-    _exclude_enabled = await get_exclude_filter_enabled(user_id)
-    exclude_codes = set(await get_exclude_filter(user_id)) if _exclude_enabled else set()
+    exclude_codes = set(await get_exclude_filter(user_id))
     lock = asyncio.Lock()
 
     async with aiohttp.ClientSession() as session:
@@ -239,40 +226,35 @@ async def run_requests(user_id, bot, target_channel_id):
                     await asyncio.sleep(1)
                 # ---------------------
                 
-                if state.get("status_message_id"):
-                    await bot.edit_message_text(
-                        chat_id=user_id,
-                        message_id=state["status_message_id"],
-                        text=f"{token_name}: Requests sent: {state['total_added_friends']}",
-                        reply_markup=stop_markup
-                    )
+                await bot.edit_message_text(
+                    chat_id=user_id,
+                    message_id=state["status_message_id"],
+                    text=f"{token_name}: Requests sent: {state['total_added_friends']}",
+                    reply_markup=stop_markup
+                )
 
                 users = await fetch_users(session, token, user_id)
                 state["batch_index"] += 1
                 
                 if users is None:
-                    if state.get("status_message_id"):
-                        await bot.edit_message_text(
-                            chat_id=user_id, message_id=state["status_message_id"],
-                            text=f"{token_name}: Token is invalid (401 Unauthorized). Stopping."
-                        )
+                    await bot.edit_message_text(
+                        chat_id=user_id, message_id=state["status_message_id"],
+                        text=f"{token_name}: Token is invalid (401 Unauthorized). Stopping."
+                    )
                     state["running"] = False
                     break
 
                 if not users:
-                    empty_batches += 1
-                    logging.info(f"Empty batch #{empty_batches} for {token_name}.")
-                    if empty_batches >= 10:
-                        if state.get("status_message_id"):
-                            await bot.edit_message_text(
-                                chat_id=user_id, message_id=state["status_message_id"],
-                                text=f"{token_name}: No more users found. Total: {state['total_added_friends']}"
-                            )
+                    logging.info(f"No users found for batch {state['batch_index']}.")
+                    if state["batch_index"] > 10:
+                        await bot.edit_message_text(
+                            chat_id=user_id, message_id=state["status_message_id"],
+                            text=f"{token_name}: No more users found. Total: {state['total_added_friends']}"
+                        )
                         state["running"] = False
                         break
                     await asyncio.sleep(EMPTY_BATCH_DELAY)
                     continue
-                empty_batches = 0
                 
                 limit_reached, _, _ = await process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes)
                 
@@ -327,8 +309,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
         session_sent_ids = await get_already_sent_ids(user_id, "request")
     else:
         session_sent_ids = set()
-    _exclude_enabled = await get_exclude_filter_enabled(user_id)
-    exclude_codes = set(await get_exclude_filter(user_id)) if _exclude_enabled else set()
+    exclude_codes = set(await get_exclude_filter(user_id))
     # ----------------------
 
     lock = asyncio.Lock()
