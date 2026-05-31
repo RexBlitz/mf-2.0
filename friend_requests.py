@@ -4,7 +4,15 @@ import logging
 import html
 from aiogram import Bot, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from db import get_individual_spam_filter, bulk_add_sent_ids, get_active_tokens, get_current_account, get_already_sent_ids, get_exclude_filter
+from db import (
+    get_individual_spam_filter,
+    bulk_add_sent_ids,
+    get_active_tokens,
+    get_current_account,
+    get_already_sent_ids,
+    get_exclude_filter,
+    get_exclude_filter_enabled
+)
 from filters import apply_filter_for_account, is_request_filter_enabled
 from collections import defaultdict
 from dateutil import parser
@@ -214,7 +222,11 @@ async def run_requests(user_id, bot, target_channel_id):
         already_sent_ids = set()
     # ----------------------
 
-    exclude_codes = set(await get_exclude_filter(user_id))
+    if await get_exclude_filter_enabled(user_id):
+        exclude_codes = set(await get_exclude_filter(user_id))
+    else:
+        exclude_codes = set()
+        
     lock = asyncio.Lock()
 
     async with aiohttp.ClientSession() as session:
@@ -309,7 +321,11 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
         session_sent_ids = await get_already_sent_ids(user_id, "request")
     else:
         session_sent_ids = set()
-    exclude_codes = set(await get_exclude_filter(user_id))
+        
+    if await get_exclude_filter_enabled(user_id):
+        exclude_codes = set(await get_exclude_filter(user_id))
+    else:
+        exclude_codes = set()
     # ----------------------
 
     lock = asyncio.Lock()
