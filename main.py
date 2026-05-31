@@ -35,7 +35,7 @@ from filters import (
     set_filter, apply_filter_for_account
 )
 from allcountry import run_all_countries
-from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command
+from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command, user_signup_states
 from friend_requests import run_requests, process_all_tokens, user_states, stop_markup
 # --- NEW IMPORT ---
 from automation import start_automation
