@@ -13,7 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from db import (
     set_token, resign_token_at_position, get_tokens, set_current_account, get_current_account, delete_token,
-    get_exclude_filter, set_exclude_filter,
+    get_exclude_filter, set_exclude_filter, get_exclude_filter_enabled, set_exclude_filter_enabled,
     set_user_filters, get_user_filters, get_all_user_filters, set_spam_filter, get_spam_filter,
     is_already_sent, toggle_token_status, get_active_tokens,
     get_token_status, set_account_active, get_info_card,
@@ -654,15 +654,42 @@ async def callback_handler(callback_query: CallbackQuery):
         await callback_query.message.edit_text("<b>Send Request Options</b>", reply_markup=send_request_markup, parse_mode="HTML")
     elif data == "exclude_filter_menu":
         codes = await get_exclude_filter(user_id)
+        enabled = await get_exclude_filter_enabled(user_id)
         codes_text = ", ".join(codes) if codes else "None"
+        toggle_label = "✅ ON  |  OFF" if enabled else "ON  |  ❌ OFF"
         await callback_query.message.edit_text(
             f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
+            f"<b>Status:</b> {'<b>Enabled</b>' if enabled else '<b>Disabled</b>'}\n"
             f"<b>Current excluded:</b> <code>{codes_text}</code>\n\n"
             f"Send country codes to set (comma separated, e.g. <code>US, KR, JP</code>)\nOr send <code>clear</code> to remove all.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="settings_menu")]]),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=toggle_label, callback_data="toggle_exclude_filter")],
+                [InlineKeyboardButton(text="Back", callback_data="settings_menu")]
+            ]),
             parse_mode="HTML"
         )
         user_signup_states[user_id] = {"stage": "set_exclude_filter"}
+
+    elif data == "toggle_exclude_filter":
+        enabled = await get_exclude_filter_enabled(user_id)
+        await set_exclude_filter_enabled(user_id, not enabled)
+        # Re-render the menu with updated status
+        codes = await get_exclude_filter(user_id)
+        new_enabled = not enabled
+        codes_text = ", ".join(codes) if codes else "None"
+        toggle_label = "✅ ON  |  OFF" if new_enabled else "ON  |  ❌ OFF"
+        await callback_query.message.edit_text(
+            f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
+            f"<b>Status:</b> {'<b>Enabled</b>' if new_enabled else '<b>Disabled</b>'}\n"
+            f"<b>Current excluded:</b> <code>{codes_text}</code>\n\n"
+            f"Send country codes to set (comma separated, e.g. <code>US, KR, JP</code>)\nOr send <code>clear</code> to remove all.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text=toggle_label, callback_data="toggle_exclude_filter")],
+                [InlineKeyboardButton(text="Back", callback_data="settings_menu")]
+            ]),
+            parse_mode="HTML"
+        )
+        await callback_query.answer("✅ ON" if new_enabled else "❌ OFF")
 
     elif data == "settings_menu":
         await callback_query.message.edit_text("<b>Settings Menu</b>", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
