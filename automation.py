@@ -1,6 +1,7 @@
 """
 Automation Module — Pure Scheduler
 
+
 """
 
 import asyncio
@@ -22,9 +23,9 @@ from friend_requests import run_requests, process_all_tokens
 
 logger = logging.getLogger(__name__)
 
-# --- GLOBAL STATE ---
-monitor_task: asyncio.Task = None
-user_bots: Dict[int, object] = {}
+# --- GLOBAL STATE (per-user) ---
+monitor_tasks: Dict[int, asyncio.Task] = {}   # user_id -> Task
+user_bots:     Dict[int, object]       = {}   # user_id -> Bot
 
 WAVES = [
     ("wave_1_lounge", True,  False, 15,  59),
@@ -35,20 +36,20 @@ WAVES = [
 
 
 # =============================================================================
-# WAVE TRACKING
+# WAVE TRACKING  (pid = token so each account has independent wave state)
 # =============================================================================
 
-async def _is_wave_done(db_data: dict, token: str, pid: str, wave_key: str) -> bool:
-    return wave_key in db_data.get("lounge_sent", {}).get(token, {}).get(pid, {})
+async def _is_wave_done(db_data: dict, token: str, wave_key: str) -> bool:
+    return wave_key in db_data.get("lounge_sent", {}).get(token, {}).get(token, {})
 
-async def _mark_wave_done(user_id: int, token: str, pid: str, wave_key: str):
+async def _mark_wave_done(user_id: int, token: str, wave_key: str):
     from db import _get_user_collection, _ensure_user_collection_exists
     import datetime as dt
     await _ensure_user_collection_exists(user_id)
     user_db = _get_user_collection(user_id)
     await user_db.update_one(
         {"type": "automation_timers"},
-        {"$set": {f"lounge_sent.{token}.{pid}.{wave_key}": dt.datetime.utcnow()}},
+        {"$set": {f"lounge_sent.{token}.{token}.{wave_key}": dt.datetime.utcnow()}},
         upsert=True
     )
 
@@ -61,7 +62,9 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
     token  = token_obj["token"]
     name   = token_obj.get("name", "Acc")[:15]
     bot    = user_bots.get(user_id)
-    is_all = settings.get("selected_accounts") == "active_only"
+
+    # FIX: "all" means all active tokens; anything else means current account only
+    is_all = settings.get("selected_accounts") == "all"
 
     db_data = await get_automation_pending_followups(user_id)
     now = datetime.utcnow()
@@ -69,35 +72,29 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
     # ── 1. REQUESTS TRIGGER LOGIC ──────────────────────────────────────────
     last_req_str = db_data.get("request_times", {}).get(token)
     should_req   = force_run or not last_req_str
-    
+
     if not should_req:
         last_req = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
         should_req = (now - last_req).total_seconds() > 24 * 3600
 
     if should_req and bot:
-        # TRIGGER HOTE HI TIME SAVE KARO (Ab yahan shift kar diya hai)
         if is_all:
             for t in target_tokens:
                 await set_automation_last_request_time(user_id, t["token"])
             await add_automation_log(user_id, "All tokens requests triggered")
-            
-            # Background mein process chalao taake loop ruka na rahe
             asyncio.create_task(process_all_tokens(user_id, target_tokens, bot, user_id))
         else:
             await set_automation_last_request_time(user_id, token)
             await add_automation_log(user_id, f"[{name}] Requests triggered")
-            
-            # Background mein process chalao
             asyncio.create_task(run_requests(user_id, bot, user_id))
 
-        # Update last_req_str for the wave calculation in the same loop
         last_req_str = now
 
-    # ── 2. WAVES LOGIC (Last Request Time Based) ───────────────────────────
+    # ── 2. WAVES LOGIC ─────────────────────────────────────────────────────
     if not last_req_str:
         return
 
-    last_req_dt = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
+    last_req_dt  = last_req_str if isinstance(last_req_str, datetime) else datetime.fromisoformat(str(last_req_str))
     elapsed_mins = (now - last_req_dt).total_seconds() / 60
 
     lounge_msg  = settings.get("lounge_message")
@@ -106,36 +103,54 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, target_
     chat_spam   = await get_individual_spam_filter(user_id, "chatroom")
 
     for wave_key, do_lounge, do_chat, min_m, max_m in WAVES:
-        # Timer check
         if elapsed_mins < min_m or elapsed_mins >= max_m:
             continue
-            
-        # Deduplication check (Account level par)
-        if not force_run and await _is_wave_done(db_data, token, "ACCOUNT_LEVEL", wave_key):
+
+        # FIX: dedup per-token (not hardcoded "ACCOUNT_LEVEL")
+        if not force_run and await _is_wave_done(db_data, token, wave_key):
             continue
 
         # Lounge Trigger
         if do_lounge and lounge_msg and bot:
-            lounge_status = await bot.send_message(user_id, f"⏳ {wave_key} Lounge...", parse_mode="HTML")
-            if is_all:
-                await send_lounge_all_tokens(target_tokens, lounge_msg, lounge_status, bot, user_id, lounge_spam, user_id)
-            else:
-                await send_lounge(token, lounge_msg, lounge_status, bot, user_id, lounge_spam, user_id)
+            status_msg = await bot.send_message(user_id, f"⏳ {wave_key} Lounge...", parse_mode="HTML")
+            try:
+                if is_all:
+                    await send_lounge_all_tokens(target_tokens, lounge_msg, status_msg, bot, user_id, lounge_spam, user_id)
+                else:
+                    await send_lounge(token, lounge_msg, status_msg, bot, user_id, lounge_spam, user_id)
+            finally:
+                # FIX: clean up status message so chat doesn't fill up
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
 
         # Chatroom Trigger
         if do_chat and chat_msg and bot:
-            chat_status = await bot.send_message(user_id, f"⏳ {wave_key} Chatroom...", parse_mode="HTML")
-            if is_all:
-                token_names = {t["token"]: t.get("name", "Acc") for t in target_tokens}
-                await send_message_to_everyone_all_tokens([t["token"] for t in target_tokens], chat_msg, chat_status, bot, user_id, chat_spam, token_names, chat_spam, user_id)
-            else:
-                sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if chat_spam else set()
-                await send_message_to_everyone(token, chat_msg, user_id, chat_spam, user_id, sent_ids, asyncio.Lock())
+            status_msg = await bot.send_message(user_id, f"⏳ {wave_key} Chatroom...", parse_mode="HTML")
+            try:
+                if is_all:
+                    token_names = {t["token"]: t.get("name", "Acc") for t in target_tokens}
+                    await send_message_to_everyone_all_tokens(
+                        [t["token"] for t in target_tokens],
+                        chat_msg, status_msg, bot, user_id,
+                        chat_spam, token_names, chat_spam, user_id
+                    )
+                else:
+                    # FIX: correct signature — shared lock, no extra sent_ids prefetch
+                    sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if chat_spam else set()
+                    lock = asyncio.Lock()
+                    await send_message_to_everyone(token, chat_msg, user_id, chat_spam, user_id, sent_ids, lock)
+            finally:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
 
-        # Mark Done
-        await _mark_wave_done(user_id, token, "ACCOUNT_LEVEL", wave_key)
+        await _mark_wave_done(user_id, token, wave_key)
         await add_automation_log(user_id, f"[{name}] {wave_key} triggered")
         break
+
 
 # =============================================================================
 # MONITOR LOOP
@@ -148,17 +163,20 @@ async def monitor_loop(user_id: int, force_run: bool = False):
     if bot:
         try:
             await bot.send_message(user_id, "🤖 <b>Automation Started</b>", parse_mode="HTML")
-        except: pass
+        except Exception:
+            pass
 
     while True:
         try:
             settings = await get_automation_settings(user_id)
-            if not settings.get("enabled"): break
+            if not settings.get("enabled"):
+                break
 
-            selected   = settings.get("selected_accounts", "active_only")
+            selected   = settings.get("selected_accounts", "all")
             all_tokens = await get_tokens(user_id)
 
-            if selected == "active_only":
+            # FIX: "all" → use all active tokens; anything else → current account only
+            if selected == "all":
                 target_tokens = await get_active_tokens(user_id)
                 if target_tokens:
                     await process_account(user_id, target_tokens[0], settings, target_tokens, force_run=force_run)
@@ -174,37 +192,38 @@ async def monitor_loop(user_id: int, force_run: bool = False):
         except asyncio.CancelledError:
             break
         except Exception as e:
-            logger.error(f"Monitor Error: {e}")
+            logger.error(f"Monitor Error for {user_id}: {e}")
             await asyncio.sleep(60)
 
 
 # =============================================================================
-# CONTROL
+# CONTROL  (FIX: per-user task dict instead of single global)
 # =============================================================================
 
 async def run_automation_action(user_id: int, status_msg):
     """Run Action Now button — force bypass timestamps."""
-    global monitor_task
-    if hasattr(status_msg, 'bot'):
+    if hasattr(status_msg, "bot"):
         user_bots[user_id] = status_msg.bot
     await set_automation_enabled(user_id, True)
-    if monitor_task and not monitor_task.done(): monitor_task.cancel()
-    monitor_task = asyncio.create_task(monitor_loop(user_id, force_run=True))
+    existing = monitor_tasks.get(user_id)
+    if existing and not existing.done():
+        existing.cancel()
+    monitor_tasks[user_id] = asyncio.create_task(monitor_loop(user_id, force_run=True))
 
 def start_automation(user_id: int, bot):
-    global monitor_task
     user_bots[user_id] = bot
     asyncio.create_task(set_automation_enabled(user_id, True))
-    if monitor_task and not monitor_task.done(): return
-    monitor_task = asyncio.create_task(monitor_loop(user_id))
+    existing = monitor_tasks.get(user_id)
+    if existing and not existing.done():
+        return  # already running for THIS user
+    monitor_tasks[user_id] = asyncio.create_task(monitor_loop(user_id))
 
 def stop_automation(user_id: int):
-    global monitor_task
     asyncio.create_task(set_automation_enabled(user_id, False))
-    if monitor_task:
-        monitor_task.cancel()
-        monitor_task = None
+    existing = monitor_tasks.pop(user_id, None)
+    if existing:
+        existing.cancel()
 
 def is_automation_running(user_id: int) -> bool:
-    global monitor_task
-    return monitor_task is not None and not monitor_task.done()
+    task = monitor_tasks.get(user_id)
+    return task is not None and not task.done()
