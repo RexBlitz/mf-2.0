@@ -13,6 +13,7 @@ from aiogram.exceptions import TelegramBadRequest
 
 from db import (
     set_token, resign_token_at_position, get_tokens, set_current_account, get_current_account, delete_token,
+    get_exclude_filter, set_exclude_filter,
     set_user_filters, get_user_filters, get_all_user_filters, set_spam_filter, get_spam_filter,
     is_already_sent, toggle_token_status, get_active_tokens,
     get_token_status, set_account_active, get_info_card,
@@ -77,6 +78,7 @@ async def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="Manage Accounts", callback_data="manage_accounts|0"), InlineKeyboardButton(text="Meeff Filters", callback_data="show_filters")],
         [InlineKeyboardButton(text="Batch Management", callback_data="batch_management")],
         [InlineKeyboardButton(text=f"Spam Filters: {'ON' if any_spam_on else 'OFF'}", callback_data="spam_filter_menu")],
+        [InlineKeyboardButton(text="🚫 Exclude Filter", callback_data="exclude_filter_menu")],
         [InlineKeyboardButton(text="DB Settings", callback_data="db_settings"), InlineKeyboardButton(text="Back", callback_data="back_to_menu")]
     ])
 
@@ -386,6 +388,20 @@ async def handle_new_token(message: Message):
     if message.from_user.is_bot: return
     if await signup_message_handler(message): return
 
+    # --- Exclude filter input ---
+    signup_state = user_signup_states.get(user_id, {})
+    if signup_state.get("stage") == "set_exclude_filter":
+        text = message.text.strip()
+        if text.lower() == "clear":
+            await set_exclude_filter(user_id, [])
+            await message.answer("✅ Exclude filter cleared.", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
+        else:
+            codes = [c.strip().upper() for c in text.replace(",", " ").split() if c.strip()]
+            await set_exclude_filter(user_id, codes)
+            await message.answer(f"✅ Excluded countries set: <code>{', '.join(codes)}</code>", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
+        user_signup_states.pop(user_id, None)
+        return
+
     state = db_operation_states.get(user_id)
     if state:
         operation, text = state.get("operation"), message.text.strip()
@@ -636,6 +652,18 @@ async def callback_handler(callback_query: CallbackQuery):
         await msg.edit_text(f"<b>Unsubscribe Complete</b>\nSuccessfully unsubscribed {len(active_tokens)} accounts.", parse_mode="HTML")
     elif data == "send_request_menu":
         await callback_query.message.edit_text("<b>Send Request Options</b>", reply_markup=send_request_markup, parse_mode="HTML")
+    elif data == "exclude_filter_menu":
+        codes = await get_exclude_filter(user_id)
+        codes_text = ", ".join(codes) if codes else "None"
+        await callback_query.message.edit_text(
+            f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
+            f"<b>Current excluded:</b> <code>{codes_text}</code>\n\n"
+            f"Send country codes to set (comma separated, e.g. <code>US, KR, JP</code>)\nOr send <code>clear</code> to remove all.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="settings_menu")]]),
+            parse_mode="HTML"
+        )
+        user_signup_states[user_id] = {"stage": "set_exclude_filter"}
+
     elif data == "settings_menu":
         await callback_query.message.edit_text("<b>Settings Menu</b>", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
     elif data == "show_filters":
