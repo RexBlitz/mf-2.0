@@ -927,33 +927,28 @@ async def callback_handler(callback_query: CallbackQuery):
         all_tokens = await get_tokens(user_id)
 
         await callback_query.answer("Refreshing batch...")
-        status_msg = await callback_query.message.answer("<b>🔄 Refreshing batch tokens...</b>", parse_mode="HTML")
+        status_msg = await callback_query.message.answer("<b>🔄 Refreshing batch tokens in parallel...</b>", parse_mode="HTML")
 
-        success, failed, banned, no_creds = 0, 0, 0, 0
+        from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
 
-        for idx in indices:
+        async def refresh_one(idx):
             if idx >= len(all_tokens):
-                continue
+                return ("skip", None)
             token_data = all_tokens[idx]
             email = token_data.get("email")
             password = token_data.get("password")
             name = token_data.get("name", f"Account {idx}")
-
             if not email or not password:
-                no_creds += 1
-                continue
-
+                return ("no_creds", None)
             try:
-                from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
                 device_info = await get_or_create_device_info_for_email(user_id, email)
                 base_payload = {"provider": "email", "providerId": email, "providerToken": password, "locale": "en"}
                 payload = get_api_payload_with_device_info(base_payload, device_info)
-
                 async with aiohttp.ClientSession() as session:
                     async with session.post(
                         "https://api.meeff.com/user/login/v4",
                         json=payload,
-                        headers={'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"},
+                        headers={"User-Agent": "okhttp/5.0.0-alpha.14", "Content-Type": "application/json; charset=utf-8"},
                         timeout=10
                     ) as resp:
                         if resp.status == 200:
@@ -961,27 +956,46 @@ async def callback_handler(callback_query: CallbackQuery):
                             new_token = result.get("accessToken")
                             if new_token:
                                 await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
-                                success += 1
+                                return ("success", email)
                             else:
-                                failed += 1
+                                return ("failed", email)
                         elif resp.status == 403:
                             result = await resp.json()
                             err_msg = result.get("errorMessage", "").lower()
                             if any(k in err_msg for k in ("ban", "suspend", "block")):
-                                banned += 1
-                            else:
-                                failed += 1
+                                return ("banned", email)
+                            return ("failed", email)
                         else:
-                            failed += 1
+                            return ("failed", email)
             except Exception as e:
-                logger.error(f"Refresh failed for {name}: {e}")
-                failed += 1
+                logger.error(f"Refresh failed for {name} ({email}): {e}")
+                return ("failed", email)
 
-            await asyncio.sleep(0.5)
+        results = await asyncio.gather(*[refresh_one(idx) for idx in indices])
+
+        success, failed, banned, no_creds = 0, 0, 0, 0
+        failed_emails, banned_emails = [], []
+        for status, email in results:
+            if status == "success":
+                success += 1
+            elif status in ("no_creds", "skip"):
+                no_creds += 1
+            elif status == "failed":
+                failed += 1
+                if email:
+                    failed_emails.append(email)
+            elif status == "banned":
+                banned += 1
+                if email:
+                    banned_emails.append(email)
 
         result_text = f"<b>🔄 Batch Refresh Complete</b>\n\n✅ Refreshed: {success}\n🚫 Banned: {banned}\n❌ Failed: {failed}"
         if no_creds:
             result_text += f"\n⚠️ Skipped (no credentials): {no_creds}"
+        if failed_emails:
+            result_text += "\n\n<b>❌ Failed accounts:</b>\n" + "\n".join(f"• <code>{e}</code>" for e in failed_emails)
+        if banned_emails:
+            result_text += "\n\n<b>🚫 Banned accounts:</b>\n" + "\n".join(f"• <code>{e}</code>" for e in banned_emails)
         await status_msg.edit_text(result_text, parse_mode="HTML")
 
     elif data.startswith("batch_nat_"):
