@@ -434,6 +434,23 @@ async def get_spam_menu_data(telegram_user_id: int) -> dict:
     }
     return data
 
+async def get_exclude_filter(telegram_user_id: int) -> list:
+    """Returns list of excluded nationality codes e.g. ['US', 'KR']"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    doc = await col.find_one({"type": "settings"})
+    return doc.get("exclude_nationalities", []) if doc else []
+
+async def set_exclude_filter(telegram_user_id: int, codes: list):
+    """Save list of excluded nationality codes"""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "settings"},
+        {"$set": {"exclude_nationalities": codes}},
+        upsert=True
+    )
+
 async def get_spam_filter(telegram_user_id: int) -> bool:
     await _ensure_user_collection_exists(telegram_user_id)
     settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
