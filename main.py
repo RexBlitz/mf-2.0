@@ -656,7 +656,7 @@ async def callback_handler(callback_query: CallbackQuery):
         codes = await get_exclude_filter(user_id)
         enabled = await get_exclude_filter_enabled(user_id)
         codes_text = ", ".join(codes) if codes else "None"
-        toggle_label = "✅ ON  |  OFF" if enabled else "ON  |  ❌ OFF"
+        toggle_label = "✅ Enabled" if enabled else "❌ Disabled"
         await callback_query.message.edit_text(
             f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
             f"<b>Status:</b> {'<b>Enabled</b>' if enabled else '<b>Disabled</b>'}\n"
@@ -677,7 +677,7 @@ async def callback_handler(callback_query: CallbackQuery):
         codes = await get_exclude_filter(user_id)
         new_enabled = not enabled
         codes_text = ", ".join(codes) if codes else "None"
-        toggle_label = "✅ ON  |  OFF" if new_enabled else "ON  |  ❌ OFF"
+        toggle_label = "✅ Enabled" if new_enabled else "❌ Disabled"
         await callback_query.message.edit_text(
             f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
             f"<b>Status:</b> {'<b>Enabled</b>' if new_enabled else '<b>Disabled</b>'}\n"
