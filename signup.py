@@ -425,7 +425,13 @@ async def try_signin(email: str, password: str, telegram_user_id: int, session: 
     try:
         status, body = await _post_json(session, url, payload, headers=headers)
         if status is None:
+            logger.error(f"SIGNIN FAILED (network) email={email}")
             return {"errorMessage": "Network error during signin"}
+        if body.get("accessToken"):
+            logger.info(f"SIGNIN OK email={email} status={status}")
+        else:
+            err = body.get("errorMessage") or body.get("message") or "unknown"
+            logger.warning(f"SIGNIN FAILED email={email} status={status} reason={err!r}")
         return body
     finally:
         if close_session:
