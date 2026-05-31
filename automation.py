@@ -1,7 +1,14 @@
 """
 Automation Module — Pure Scheduler
 
-
+Bugs fixed:
+1. monitor_task is now per-user dict (was single global, broke multi-user)
+2. selected_accounts logic was inverted ("active_only" vs "all" mismatch)
+3. Wave dedup used hardcoded "ACCOUNT_LEVEL" pid — now uses token as pid so
+   each account tracks its own waves independently
+4. Status messages from waves are now deleted after completion (no chat spam)
+5. send_message_to_everyone called with correct signature + shared lock
+6. force_run correctly bypasses wave dedup
 """
 
 import asyncio
@@ -178,8 +185,9 @@ async def monitor_loop(user_id: int, force_run: bool = False):
             # FIX: "all" → use all active tokens; anything else → current account only
             if selected == "all":
                 target_tokens = await get_active_tokens(user_id)
-                if target_tokens:
-                    await process_account(user_id, target_tokens[0], settings, target_tokens, force_run=force_run)
+                # Process waves for every active token independently
+                for token_obj in target_tokens:
+                    await process_account(user_id, token_obj, settings, target_tokens, force_run=force_run)
             else:
                 current_token = await get_current_account(user_id)
                 target_tokens = [t for t in all_tokens if t["token"] == current_token] if current_token else []
