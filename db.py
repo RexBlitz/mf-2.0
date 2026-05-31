@@ -155,6 +155,30 @@ async def get_info_card(telegram_user_id, token):
         return cards_doc["data"][token].get("info")
     return None
 
+async def migrate_info_card(telegram_user_id, old_token: str, new_token: str):
+    """
+    Move the info card keyed by old_token to new_token.
+    Called whenever a token string is replaced (re-signin / email-duplicate path)
+    so the profile card survives the token rotation.
+    """
+    if old_token == new_token:
+        return
+    user_db = _get_user_collection(telegram_user_id)
+    cards_doc = await user_db.find_one({"type": "info_cards"})
+    if not cards_doc:
+        return
+    old_card = cards_doc.get("data", {}).get(old_token)
+    if old_card is None:
+        return
+    # Write the card under the new token key and remove the old key atomically
+    await user_db.update_one(
+        {"type": "info_cards"},
+        {
+            "$set":   {f"data.{new_token}": old_card},
+            "$unset": {f"data.{old_token}": ""},
+        }
+    )
+
 async def set_token(telegram_user_id, token, name, email=None, password=None, filters=None, active=True) -> int:
     """
     Saves or updates a Meeff token. 
@@ -178,10 +202,14 @@ async def set_token(telegram_user_id, token, name, email=None, password=None, fi
 
     # 2. Prevent email-based duplicates
     if email and email_index != -1 and token_index != email_index:
+        # Capture old token string BEFORE the pull so we can migrate its info card
+        old_token_for_email = tokens_list[email_index]["token"]
         await user_db.update_one(
             {"type": "tokens"},
             {"$pull": {"items": {"email": email}}}
         )
+        # Migrate info card: old token key -> new token key so profile card survives rotation
+        await migrate_info_card(telegram_user_id, old_token_for_email, token)
         # Refresh the list and recalculate index
         tokens_doc = await user_db.find_one({"type": "tokens"})
         tokens_list = tokens_doc.get("items", []) if tokens_doc else []
@@ -241,6 +269,9 @@ async def resign_token_at_position(
     if position < 0 or position >= len(tokens_list):
         raise ValueError(f"Invalid position {position}, tokens list length is {len(tokens_list)}")
     
+    # Capture the old token string BEFORE overwriting so we can migrate its info card
+    old_token = tokens_list[position].get("token")
+
     # Build new token entry
     token_data = {
         "token": new_token,
@@ -262,6 +293,10 @@ async def resign_token_at_position(
         {"$set": {"items": tokens_list}},
         upsert=True
     )
+
+    # Migrate info card from old token key to new token key so profile card survives re-signin
+    if old_token and old_token != new_token:
+        await migrate_info_card(user_id, old_token, new_token)
 async def toggle_token_status(telegram_user_id, token):
     await _ensure_user_collection_exists(telegram_user_id)
     user_db = _get_user_collection(telegram_user_id)
