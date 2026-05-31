@@ -486,6 +486,27 @@ async def set_exclude_filter(telegram_user_id: int, codes: list):
         upsert=True
     )
 
+async def get_exclude_filter_enabled(telegram_user_id: int) -> bool:
+    """Returns whether the exclude filter is active."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    doc = await col.find_one({"type": "settings"})
+    if doc is None:
+        return False
+    if "exclude_filter_enabled" not in doc:
+        return bool(doc.get("exclude_nationalities"))
+    return doc.get("exclude_filter_enabled", False)
+
+async def set_exclude_filter_enabled(telegram_user_id: int, enabled: bool):
+    """Toggle the exclude filter on or off without clearing the codes."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "settings"},
+        {"$set": {"exclude_filter_enabled": enabled}},
+        upsert=True
+    )
+
 async def get_spam_filter(telegram_user_id: int) -> bool:
     await _ensure_user_collection_exists(telegram_user_id)
     settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
