@@ -519,7 +519,9 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
             if isinstance(res, dict) and res.get("accessToken") and res.get("user"):
                 # SUCCESS: Save and count
                 token = res["accessToken"]
-                await set_token(user_id, token, res["user"].get("name", email), email, password)
+                token_index = await set_token(user_id, token, res["user"].get("name", email), email, password)
+                if token_index != -1:
+                    await add_token_to_auto_batch(user_id, token_index)
                 await set_user_filters(user_id, token, {"filterNationalityCode": ""}) # set default filter
                 user_obj = res.get("user", {})
                 user_obj.update({"email": email, "password": password, "token": token})
