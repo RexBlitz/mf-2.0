@@ -637,7 +637,6 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
         ])
 
     buttons.append([
-        InlineKeyboardButton(text="🔄 Refresh Batch", callback_data=f"refresh_batch_{batch_name}"),
         InlineKeyboardButton(text="Back", callback_data="batch_management")
     ])
     await callback_query.message.edit_text(f"<b>{html.escape(batch_name)} - Manage Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
@@ -1070,94 +1069,6 @@ async def callback_handler(callback_query: CallbackQuery):
     elif data.startswith("batch_filter_"):
         batch_name = data.replace("batch_filter_", "")
         await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
-
-    elif data.startswith("refresh_batch_"):
-        batch_name = data.replace("refresh_batch_", "")
-        batch = await get_batch_by_name(user_id, batch_name)
-        if not batch:
-            return await callback_query.answer("Batch not found.", show_alert=True)
-
-        indices = batch.get("token_indices", [])
-        all_tokens = await get_tokens(user_id)
-
-        await callback_query.answer("Refreshing batch...")
-        status_msg = await callback_query.message.answer("<b>🔄 Refreshing batch tokens in parallel...</b>", parse_mode="HTML")
-
-        from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
-
-        async def refresh_one(idx):
-            if idx >= len(all_tokens):
-                return ("skip", None)
-            token_data = all_tokens[idx]
-            email = token_data.get("email")
-            password = token_data.get("password")
-            name = token_data.get("name", f"Account {idx}")
-            if not email or not password:
-                return ("no_creds", None)
-            try:
-                device_info = await get_or_create_device_info_for_email(user_id, email)
-                base_payload = {"provider": "email", "providerId": email, "providerToken": password, "locale": "en"}
-                payload = get_api_payload_with_device_info(base_payload, device_info)
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(
-                        "https://api.meeff.com/user/login/v4",
-                        json=payload,
-                        headers={"User-Agent": "okhttp/5.0.0-alpha.14", "Content-Type": "application/json; charset=utf-8"},
-                        timeout=10
-                    ) as resp:
-                        if resp.status == 200:
-                            result = await resp.json()
-                            new_token = result.get("accessToken")
-                            if new_token:
-                                old_token = all_tokens[idx].get("token")
-                                await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
-                                # Migrate card: re-key from old token to new token
-                                if old_token and old_token != new_token:
-                                    from db import get_info_card, set_info_card
-                                    old_card = await get_info_card(user_id, old_token)
-                                    if old_card:
-                                        await set_info_card(user_id, new_token, old_card, email)
-                                return ("success", email)
-                            else:
-                                return ("failed", email)
-                        elif resp.status == 403:
-                            result = await resp.json()
-                            err_msg = result.get("errorMessage", "").lower()
-                            if any(k in err_msg for k in ("ban", "suspend", "block")):
-                                return ("banned", email)
-                            return ("failed", email)
-                        else:
-                            return ("failed", email)
-            except Exception as e:
-                logger.error(f"Refresh failed for {name} ({email}): {e}")
-                return ("failed", email)
-
-        results = await asyncio.gather(*[refresh_one(idx) for idx in indices])
-
-        success, failed, banned, no_creds = 0, 0, 0, 0
-        failed_emails, banned_emails = [], []
-        for status, email in results:
-            if status == "success":
-                success += 1
-            elif status in ("no_creds", "skip"):
-                no_creds += 1
-            elif status == "failed":
-                failed += 1
-                if email:
-                    failed_emails.append(email)
-            elif status == "banned":
-                banned += 1
-                if email:
-                    banned_emails.append(email)
-
-        result_text = f"<b>🔄 Batch Refresh Complete</b>\n\n✅ Refreshed: {success}\n🚫 Banned: {banned}\n❌ Failed: {failed}"
-        if no_creds:
-            result_text += f"\n⚠️ Skipped (no credentials): {no_creds}"
-        if failed_emails:
-            result_text += "\n\n<b>❌ Failed accounts:</b>\n" + "\n".join(f"• <code>{e}</code>" for e in failed_emails)
-        if banned_emails:
-            result_text += "\n\n<b>🚫 Banned accounts:</b>\n" + "\n".join(f"• <code>{e}</code>" for e in banned_emails)
-        await status_msg.edit_text(result_text, parse_mode="HTML")
 
     elif data.startswith("batch_nat_"):
         parts = data.split("_")
