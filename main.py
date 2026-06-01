@@ -709,7 +709,7 @@ async def callback_handler(callback_query: CallbackQuery):
             token_obj = tokens[idx]
             info_card = await get_info_card(user_id, token_obj['token'])
             details = f"<b>Name:</b> <code>{html.escape(token_obj.get('name', 'N/A'))}</code>\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n"
-            details += info_card if info_card else "No profile card found."
+            details += info_card if info_card else f"<code>{html.escape(token_obj['token'])}</code>"
             await callback_query.message.edit_text(details, reply_markup=get_account_view_menu(idx, page_idx), parse_mode="HTML", disable_web_page_preview=True)
             
     elif data.startswith("confirm_delete_"):
@@ -880,7 +880,7 @@ async def callback_handler(callback_query: CallbackQuery):
             if 0 <= idx < len(tokens):
                 token_obj = tokens[idx]
                 info = await get_info_card(user_id, token_obj["token"])
-                text = f"<b>Name:</b> {html.escape(token_obj.get('name','N/A'))}\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n{info or 'No profile card.'}"
+                text = f"<b>Name:</b> {html.escape(token_obj.get('name','N/A'))}\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n{info or '<code>' + html.escape(token_obj['token']) + '</code>'}"
                 await callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")]]))
         except Exception: await callback_query.answer("Invalid data.", show_alert=True)
     elif data.startswith("toggle_batch_"):
