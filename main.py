@@ -434,7 +434,10 @@ async def refresh_tokens_command(message: Message):
 
             # Fetch or create device fingerprint for this token
             device_info = await get_or_create_device_info_for_token(user_id, old_token)
-            device_payload = {**device_info, "appVersion": "7.0.5", "locale": "en"}
+            from device_info import get_api_payload_with_device_info
+            device_payload = get_api_payload_with_device_info(
+                {"appVersion": "7.0.5", "locale": "en"}, device_info
+            )
 
             # Login call — old token in header, device payload in body
             j: dict = {}
