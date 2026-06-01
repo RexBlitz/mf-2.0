@@ -427,10 +427,27 @@ async def handle_new_token(message: Message):
         if len(token) < 100: return await message.reply("Invalid token format.")
         
         status_msg = await message.reply("<b>Saving Token...</b>", parse_mode="HTML")
-        account_name = token_data[1] if len(token_data) > 1 else f"Account {len(await get_tokens(user_id)) + 1}"
+
+        # Fetch live profile to build card
+        from signup import fetch_user_profile, format_user_with_nationality
+        profile = await fetch_user_profile(token)
+        if profile:
+            account_name = token_data[1] if len(token_data) > 1 else profile.get("name", f"Account {len(await get_tokens(user_id)) + 1}")
+        else:
+            account_name = token_data[1] if len(token_data) > 1 else f"Account {len(await get_tokens(user_id)) + 1}"
+
         token_index = await set_token(user_id, token, account_name)
-        if token_index != -1: await add_token_to_auto_batch(user_id, token_index)
-        await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>'.", parse_mode="HTML")
+        if token_index != -1:
+            await add_token_to_auto_batch(user_id, token_index)
+
+        # Save profile card if we got profile data
+        if profile:
+            from db import set_info_card
+            card_text = format_user_with_nationality(profile)
+            await set_info_card(user_id, token, card_text)
+            await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>'\n\n" + card_text, parse_mode="HTML", disable_web_page_preview=True)
+        else:
+            await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>' (profile fetch failed)", parse_mode="HTML")
 
 async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int = 0):
     user_id = callback_query.from_user.id
@@ -982,7 +999,14 @@ async def callback_handler(callback_query: CallbackQuery):
                             result = await resp.json()
                             new_token = result.get("accessToken")
                             if new_token:
+                                old_token = tokens[idx].get("token")
                                 await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
+                                # Migrate card: re-key from old token to new token
+                                if old_token and old_token != new_token:
+                                    from db import get_info_card, set_info_card
+                                    old_card = await get_info_card(user_id, old_token)
+                                    if old_card:
+                                        await set_info_card(user_id, new_token, old_card, email)
                                 return ("success", email)
                             else:
                                 return ("failed", email)
