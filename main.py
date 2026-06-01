@@ -381,6 +381,119 @@ async def add_person_command(message: Message):
     except Exception as e:
         await message.reply(f"Error: {e}")
 
+@router.message(Command("refresh"))
+async def refresh_tokens_command(message: Message):
+    user_id = message.chat.id
+    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
+
+    from device_info import get_or_create_device_info_for_token, store_device_info_for_token
+
+    all_tokens = await get_tokens(user_id)
+    active_tokens = [t for t in all_tokens if t.get("active", True)]
+    if not active_tokens:
+        return await message.reply("No active accounts found.")
+
+    status_msg = await message.reply(
+        f"<b>🔄 Refreshing {len(active_tokens)} active account(s)...</b>",
+        parse_mode="HTML"
+    )
+
+    success, failed, banned = 0, 0, 0
+    failed_names = []
+    banned_names = []
+
+    async with aiohttp.ClientSession() as session:
+        for idx, token_info in enumerate(active_tokens):
+            old_token = token_info["token"]
+            name = token_info.get("name", f"Account {idx + 1}")
+            email = token_info.get("email")
+
+            await status_msg.edit_text(
+                f"<b>🔄 Refreshing tokens...</b>\n[{idx+1}/{len(active_tokens)}] Processing: <b>{html.escape(name)}</b>",
+                parse_mode="HTML"
+            )
+
+            # Build headers with old token (m-auto2 style — no email/password needed)
+            headers = {
+                "User-Agent": "okhttp/5.3.2",
+                "Accept-Encoding": "gzip",
+                "meeff-access-token": old_token,
+                "content-type": "application/json; charset=utf-8",
+            }
+
+            # Warm-up call (m-auto2 style)
+            try:
+                async with session.post(
+                    "https://api.meeff.com/api/init/v2",
+                    json={"platform": "android", "version": "7.0.5", "locale": "en"},
+                    headers=headers,
+                ) as resp:
+                    await resp.text()
+            except Exception as e:
+                logger.warning("Warm-up call failed for %s: %s", name, e)
+
+            # Fetch or create device fingerprint for this token
+            device_info = await get_or_create_device_info_for_token(user_id, old_token)
+            device_payload = {**device_info, "appVersion": "7.0.5", "locale": "en"}
+
+            # Login call — old token in header, device payload in body
+            j: dict = {}
+            try:
+                async with session.post(
+                    "https://api.meeff.com/user/login/v4",
+                    json=device_payload,
+                    headers=headers,
+                ) as resp:
+                    j = await resp.json(content_type=None)
+            except Exception as e:
+                logger.error("Login failed for %s: %s", name, e)
+                j = {"errorMessage": str(e)}
+
+            new_token = j.get("accessToken")
+            if new_token:
+                # Find position in full token list (preserve order — mf-2.0 style)
+                position = next(
+                    (i for i, t in enumerate(all_tokens) if t["token"] == old_token), None
+                )
+                if position is not None:
+                    try:
+                        await resign_token_at_position(
+                            user_id, position, new_token, name,
+                            email=email,
+                            password=token_info.get("password"),
+                            filters=token_info.get("filters"),
+                        )
+                        # Re-key device info to new token
+                        await store_device_info_for_token(user_id, new_token, device_info)
+                        success += 1
+                    except Exception as e:
+                        logger.error("Failed to save refreshed token for %s: %s", name, e)
+                        failed += 1
+                        failed_names.append(name)
+                else:
+                    failed += 1
+                    failed_names.append(name)
+            else:
+                err_code = j.get("errorCode", "")
+                err_msg = (j.get("errorMessage") or "").lower()
+                if any(k in err_msg for k in ("ban", "suspend", "block")):
+                    banned += 1
+                    banned_names.append(name)
+                else:
+                    failed += 1
+                    failed_names.append(f"{name} ({err_code or err_msg})")
+
+            await asyncio.sleep(1)
+
+    # Final summary
+    lines = [f"<b>🔄 Refresh Complete</b>\n\n✅ Refreshed: {success}"]
+    if banned:
+        lines.append(f"🚫 Banned: {banned} — {', '.join(html.escape(n) for n in banned_names)}")
+    if failed:
+        lines.append(f"❌ Failed: {failed} — {', '.join(html.escape(n) for n in failed_names)}")
+    await status_msg.edit_text("\n".join(lines), parse_mode="HTML")
+
+
 @router.message()
 async def handle_new_token(message: Message):
     if message.text and message.text.startswith("/"): return
@@ -1102,6 +1215,7 @@ async def set_bot_commands():
         ("skip", "Unsubscribe from chats"), ("settings", "Bot settings"),
         ("add", "Add a person by ID"), ("signup", "Create a Meeff account"),
         ("automation", "Automation settings"), ("block", "Block user from meeff"),
+        ("refresh", "Refresh tokens for all active accounts"),
         ("password", "Enter password for access")]]
     await bot.set_my_commands(commands)
 
