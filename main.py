@@ -709,7 +709,16 @@ async def callback_handler(callback_query: CallbackQuery):
             token_obj = tokens[idx]
             info_card = await get_info_card(user_id, token_obj['token'])
             details = f"<b>Name:</b> <code>{html.escape(token_obj.get('name', 'N/A'))}</code>\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n"
-            details += info_card if info_card else f"<code>{html.escape(token_obj['token'])}</code>"
+            if info_card:
+                details += info_card
+            else:
+                email = token_obj.get('email', '')
+                password = token_obj.get('password', '')
+                details += f"<code>{html.escape(token_obj['token'])}</code>"
+                if email:
+                    details += f"\n\n<b>Email:</b> <code>{html.escape(email)}</code>"
+                if password:
+                    details += f"\n<b>Password:</b> <code>{html.escape(password)}</code>"
             await callback_query.message.edit_text(details, reply_markup=get_account_view_menu(idx, page_idx), parse_mode="HTML", disable_web_page_preview=True)
             
     elif data.startswith("confirm_delete_"):
