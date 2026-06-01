@@ -1097,28 +1097,6 @@ async def meeff_upload_image(img_bytes: bytes) -> Optional[str]:
         logger.error(f"Error uploading image to Meeff: {e}")
         return None
 
-async def fetch_user_profile(token: str) -> dict | None:
-    """Fetch the profile of the account owning this token from Meeff API."""
-    import aiohttp
-    headers = {
-        "meeff-access-token": token,
-        "User-Agent": "okhttp/5.0.0-alpha.14"
-    }
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                "https://api.meeff.com/user/me/v1?locale=en",
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10)
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return data.get("user") or data.get("me") or data
-                return None
-    except Exception as e:
-        logger.warning(f"fetch_user_profile failed: {e}")
-        return None
-
 async def store_token_and_show_card(msg_obj: Message, login_result: Dict, creds: Dict) -> None:
     access_token = login_result.get("accessToken")
     user_data = login_result.get("user")
