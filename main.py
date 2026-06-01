@@ -993,7 +993,7 @@ async def callback_handler(callback_query: CallbackQuery):
                             result = await resp.json()
                             new_token = result.get("accessToken")
                             if new_token:
-                                old_token = tokens[idx].get("token")
+                                old_token = all_tokens[idx].get("token")
                                 await resign_token_at_position(user_id, idx, new_token, name, email=email, password=password)
                                 # Migrate card: re-key from old token to new token
                                 if old_token and old_token != new_token:
