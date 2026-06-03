@@ -240,9 +240,9 @@ async def send_message_to_everyone_all_tokens(
     
     # Show message parts count in final summary
     message_parts = [part.strip() for part in message.split(',') if part.strip()]
-    header = f"{emoji} <b>Chatroom AIO Completed</b> - {successful_tokens}/{len(tokens)} ({success_rate:.1f}%)"
-    if len(message_parts) > 1:
-        header += f" ({len(message_parts)} messages per room)"
+    total_users_sent = sum(s.get("sent", 0) for s in token_status.values())
+    total_rooms = sum(s.get("rooms", 0) for s in token_status.values())
+    header = f"{emoji} <b>Chatroom AIO Completed</b> - {successful_tokens}/{len(tokens)} | Total Sent: {total_users_sent} (Rooms: {total_rooms})"
     
     final_lines = [header, "<pre>Account   │Rooms │Sent  │Filter│Status</pre>"]
     for status in token_status.values():
