@@ -72,8 +72,10 @@ async def fetch_users(session, token, user_id):
             if error_code == "AuthRequired":
                 raise AuthRequiredError("AuthRequired from API")
             users = body.get("users", [])
+            if not users and not body.get("hasMore", True):
+                raise NoMoreUsersError()
             return users
-    except AuthRequiredError:
+    except (AuthRequiredError, NoMoreUsersError):
         raise
     except Exception as e:
         logging.error(f"Fetch users failed: {e}")
@@ -266,6 +268,15 @@ async def run_requests(user_id, bot, target_channel_id):
                 state["running"] = False
                 break
 
+            except NoMoreUsersError:
+                await bot.edit_message_text(
+                    chat_id=user_id, message_id=state["status_message_id"],
+                    text=f"✅ <b>{token_name}: No more users available.</b>\n\nTotal sent: {state['total_added_friends']}",
+                    parse_mode="HTML"
+                )
+                state["running"] = False
+                break
+
             except LikeExceededError:
                 await bot.edit_message_text(
                     chat_id=user_id, message_id=state["status_message_id"],
@@ -341,16 +352,10 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
                     users = await fetch_users(session, token, user_id)
 
-                    if not users or len(users) < 5:
-                        empty_batches += 1
-                        token_status[token]["status"] = f"Waiting ({empty_batches}/10)"
+                    if not users:
                         await asyncio.sleep(EMPTY_BATCH_DELAY)
-                        if empty_batches >= 10:
-                            token_status[token]["status"] = "No users"
-                            return
                         continue
 
-                    empty_batches = 0
                     token_status[token]["status"] = "Processing"
 
                     batch_added, batch_filtered = await process_users(
@@ -364,11 +369,15 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
                 except AuthRequiredError:
                     logging.warning(f"{name}: AuthRequiredError — token expired")
-                    token_status[token]["status"] = "🔒 Logged Out"
+                    token_status[token]["status"] = "Logged Out"
+                    return
+
+                except NoMoreUsersError:
+                    token_status[token]["status"] = " No Users"
                     return
 
                 except LikeExceededError:
-                    token_status[token]["status"] = "⏳ Limit Full"
+                    token_status[token]["status"] = "Limit Full"
                     return
 
                 except Exception as e:
