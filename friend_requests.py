@@ -13,7 +13,7 @@ from db import (
     get_exclude_filter,
     get_exclude_filter_enabled
 )
-from filters import apply_filter_for_account, is_request_filter_enabled
+from filters import is_request_filter_enabled, get_user_filters
 from collections import defaultdict
 from dateutil import parser
 from datetime import datetime, timezone
@@ -24,6 +24,34 @@ PER_USER_DELAY = 0.5
 PER_BATCH_DELAY = 1
 EMPTY_BATCH_DELAY = 2
 PER_ERROR_DELAY = 5
+
+async def _push_filters(session, user_id, token):
+    """Push stored filter settings to Meeff API using existing session."""
+    try:
+        user_filters = await get_user_filters(user_id, token) or {}
+        filter_data = {
+            "filterGenderType": user_filters.get("filterGenderType", 5),
+            "filterBirthYearFrom": user_filters.get("filterBirthYearFrom", 1979),
+            "filterBirthYearTo": 2006,
+            "filterDistance": 510,
+            "filterLanguageCodes": user_filters.get("filterLanguageCodes", ""),
+            "filterNationalityBlock": user_filters.get("filterNationalityBlock", 0),
+            "filterNationalityCode": user_filters.get("filterNationalityCode", ""),
+            "locale": "en"
+        }
+        headers = {
+            'User-Agent': "okhttp/5.1.0",
+            'Accept-Encoding': "gzip",
+            'meeff-access-token': token,
+            'content-type': "application/json; charset=utf-8"
+        }
+        async with session.post("https://api.meeff.com/user/updateFilter/v1", json=filter_data, headers=headers) as resp:
+            if resp.status != 200:
+                logging.warning(f"Filter push failed: {resp.status}")
+    except Exception as e:
+        logging.warning(f"Filter push error: {e}")
+
+_FILTER_PUSH_INTERVAL = 7  # push filters every N successful sends
 
 # ─── Custom exceptions (from mauto) ───────────────────────────────────────────
 class AuthRequiredError(Exception):
@@ -119,7 +147,7 @@ def format_user(user):
     )
 
 
-async def process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes=None, cross_seen=None, cross_lock=None):
+async def process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes=None, cross_seen=None, cross_lock=None, filter_counter=None):
     """
     Process a batch of users.
     Raises LikeExceededError when daily limit is hit.
@@ -189,6 +217,12 @@ async def process_users(session, users, token, user_id, bot, token_name, already
                 added_count += 1
                 state["total_added_friends"] += 1
                 await asyncio.sleep(PER_USER_DELAY)
+                # push filters every N sends
+                if filter_counter is not None:
+                    filter_counter[0] += 1
+                    if is_request_filter_enabled(user_id) and filter_counter[0] >= _FILTER_PUSH_INTERVAL:
+                        filter_counter[0] = 0
+                        await _push_filters(session, user_id, token)
 
         except LikeExceededError:
             if is_spam_filter_enabled and ids_to_persist:
@@ -224,15 +258,17 @@ async def run_requests(user_id, bot, target_channel_id):
     exclude_codes = set(await get_exclude_filter(user_id)) if await get_exclude_filter_enabled(user_id) else set()
 
     lock = asyncio.Lock()
+    filter_counter = [0]  # mutable counter shared with process_users
 
     # Single session for the entire run
     connector = aiohttp.TCPConnector(limit=10)
     async with aiohttp.ClientSession(connector=connector) as session:
+        # Push filters once at start
+        if is_request_filter_enabled(user_id):
+            await _push_filters(session, user_id, token)
         while state["running"]:
             try:
-                if is_request_filter_enabled(user_id):
-                    await apply_filter_for_account(token, user_id)
-                    await asyncio.sleep(1)
+
 
                 try:
                     await bot.edit_message_text(
@@ -259,7 +295,7 @@ async def run_requests(user_id, bot, target_channel_id):
                     await asyncio.sleep(EMPTY_BATCH_DELAY)
                     continue
 
-                await process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes)
+                await process_users(session, users, token, user_id, bot, token_name, already_sent_ids, lock, exclude_codes, filter_counter=filter_counter)
                 await asyncio.sleep(PER_BATCH_DELAY)
 
             except AuthRequiredError:
@@ -349,9 +385,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
         async with aiohttp.ClientSession(connector=connector) as session:
             while state["running"]:
                 try:
-                    if is_request_filter_enabled(user_id):
-                        await apply_filter_for_account(token, user_id)
-                        await asyncio.sleep(1)
+
 
                     users = await fetch_users(session, token, user_id)
 
@@ -363,7 +397,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
                     batch_added, batch_filtered = await process_users(
                         session, users, token, user_id, bot, name, account_sent_ids, lock, exclude_codes,
-                        cross_seen=cross_account_seen, cross_lock=cross_lock
+                        cross_seen=cross_account_seen, cross_lock=cross_lock, filter_counter=filter_counter
                     )
 
                     token_status[token]["added"] += batch_added
