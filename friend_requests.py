@@ -62,8 +62,7 @@ async def fetch_users(session, token, user_id):
             if response.status == 401:
                 raise AuthRequiredError(f"Token {token[:10]}... is invalid or expired")
             if response.status == 429:
-                logging.error("Request limit exceeded while fetching users.")
-                return []
+                raise LikeExceededError("429 rate limit")
             if response.status != 200:
                 logging.error(f"Failed to fetch users: {response.status}")
                 return []
@@ -75,7 +74,7 @@ async def fetch_users(session, token, user_id):
             if not users and not body.get("hasMore", True):
                 raise NoMoreUsersError()
             return users
-    except (AuthRequiredError, NoMoreUsersError):
+    except (AuthRequiredError, NoMoreUsersError, LikeExceededError):
         raise
     except Exception as e:
         logging.error(f"Fetch users failed: {e}")
@@ -235,12 +234,16 @@ async def run_requests(user_id, bot, target_channel_id):
                     await apply_filter_for_account(token, user_id)
                     await asyncio.sleep(1)
 
-                await bot.edit_message_text(
-                    chat_id=user_id,
-                    message_id=state["status_message_id"],
-                    text=f"{token_name}: Requests sent: {state['total_added_friends']}",
-                    reply_markup=stop_markup
-                )
+                try:
+                    await bot.edit_message_text(
+                        chat_id=user_id,
+                        message_id=state["status_message_id"],
+                        text=f"{token_name}: Requests sent: {state['total_added_friends']}",
+                        reply_markup=stop_markup
+                    )
+                except Exception as e:
+                    if "message is not modified" not in str(e):
+                        logging.error(f"Status update error: {e}")
 
                 users = await fetch_users(session, token, user_id)
                 state["batch_index"] += 1
@@ -373,7 +376,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
                     return
 
                 except NoMoreUsersError:
-                    token_status[token]["status"] = " No Users"
+                    token_status[token]["status"] = "No Users"
                     return
 
                 except LikeExceededError:
