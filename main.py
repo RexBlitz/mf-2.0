@@ -1113,8 +1113,7 @@ async def callback_handler(callback_query: CallbackQuery):
             asyncio.create_task(process_all_tokens(user_id, tokens, bot, TARGET_CHANNEL_ID, initial_status_message=msg))
         elif data == "stop":
             state.update({"running": False, "stopped": True})
-            await callback_query.message.edit_text(f"<b>Stopped.</b>", reply_markup=start_markup, parse_mode="HTML")
-            if state.get("pinned_message_id"): await bot.unpin_chat_message(chat_id=user_id, message_id=state["pinned_message_id"])
+            await callback_query.answer("Stopping... summary will appear shortly.")
         elif data == "all_countries":
             msg = await callback_query.message.edit_text("<b>Starting All Countries...</b>", reply_markup=stop_markup, parse_mode="HTML")
             state.update({"running": True, "status_message_id": msg.message_id, "pinned_message_id": msg.message_id, "stop_markup": stop_markup})
