@@ -11,9 +11,10 @@ from db import (
     get_current_account,
     get_already_sent_ids,
     get_exclude_filter,
-    get_exclude_filter_enabled
+    get_exclude_filter_enabled,
+    get_user_filters
 )
-from filters import is_request_filter_enabled, get_user_filters
+from filters import is_request_filter_enabled
 from collections import defaultdict
 from dateutil import parser
 from datetime import datetime, timezone
