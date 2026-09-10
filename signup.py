@@ -327,7 +327,13 @@ async def signup_command(message: Message) -> None:
 # -------------------------
 async def show_signup_preview(message: Message, user_id: int, state: Dict) -> None:
     config = await get_signup_config(user_id) or {}
-    if not all(k in config for k in ['email', 'password', 'gender', 'birth_year', 'nationality']):
+    manual_mode = state.get("manual_mode", False)
+
+    # Manual mode only needs password/gender/birth_year/nationality from config;
+    # the email itself comes from state["manual_email"], not the auto base email.
+    required_keys = ['password', 'gender', 'birth_year', 'nationality'] if manual_mode else \
+                     ['email', 'password', 'gender', 'birth_year', 'nationality']
+    if not all(k in config for k in required_keys):
         await message.edit_text(
             "<b>Configuration Incomplete</b>\n\nYou must set up all details in 'Signup Config' first.",
             reply_markup=SIGNUP_MENU,
@@ -335,14 +341,20 @@ async def show_signup_preview(message: Message, user_id: int, state: Dict) -> No
         )
         return
 
-    await message.edit_text("<b>Checking email availability concurrently...</b> This may take a moment.")
+    if manual_mode:
+        # Don't touch the auto base email / auto email-generation logic at all.
+        manual_email = state.get("manual_email", "")
+        state["selected_emails"] = [manual_email] if manual_email else []
+        available_emails = state["selected_emails"]
+    else:
+        await message.edit_text("<b>Checking email availability concurrently...</b> This may take a moment.")
 
-    num_accounts = state.get('num_accounts', 1)
-    pending_emails = [acc['email'] for acc in state.get('pending_accounts', [])]
-    used_emails = config.get("used_emails", [])
+        num_accounts = state.get('num_accounts', 1)
+        pending_emails = [acc['email'] for acc in state.get('pending_accounts', [])]
+        used_emails = config.get("used_emails", [])
 
-    available_emails = await select_available_emails(config.get("email", ""), num_accounts, pending_emails, used_emails)
-    state["selected_emails"] = available_emails
+        available_emails = await select_available_emails(config.get("email", ""), num_accounts, pending_emails, used_emails)
+        state["selected_emails"] = available_emails
 
     email_list = '\n'.join([f"{i+1}. <code>{email}</code>{' (Pending)' if email in pending_emails else ''}" for i, email in enumerate(available_emails)]) if available_emails else "No available emails found!"
     preview_text = (
