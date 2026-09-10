@@ -22,9 +22,9 @@ class MeeffClientSession(aiohttp.ClientSession):
 
 def create_meeff_session(**kwargs: Any) -> aiohttp.ClientSession:
     """Create an aiohttp session for Meeff traffic using the configured proxy."""
-    proxy = os.getenv("MEEFF_PROXY_URL")
+    proxy = os.getenv("PROXY")
     if proxy:
         logger.info("Meeff proxy enabled")
     else:
-        logger.warning("MEEFF_PROXY_URL is not set; Meeff requests will connect directly")
+        logger.warning("PROXY is not set; Meeff requests will connect directly")
     return MeeffClientSession(proxy=proxy, **kwargs)
