@@ -341,6 +341,8 @@ async def show_signup_preview(message: Message, user_id: int, state: Dict) -> No
         )
         return
 
+    pending_emails = [acc['email'] for acc in state.get('pending_accounts', [])]
+
     if manual_mode:
         # Don't touch the auto base email / auto email-generation logic at all.
         manual_email = state.get("manual_email", "")
@@ -350,7 +352,6 @@ async def show_signup_preview(message: Message, user_id: int, state: Dict) -> No
         await message.edit_text("<b>Checking email availability concurrently...</b> This may take a moment.")
 
         num_accounts = state.get('num_accounts', 1)
-        pending_emails = [acc['email'] for acc in state.get('pending_accounts', [])]
         used_emails = config.get("used_emails", [])
 
         available_emails = await select_available_emails(config.get("email", ""), num_accounts, pending_emails, used_emails)
