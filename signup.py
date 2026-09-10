@@ -1,5 +1,6 @@
 import aiohttp
 import json
+from meeff_http import create_meeff_session
 import random
 import itertools
 import logging
@@ -265,7 +266,7 @@ async def select_available_emails(base_email: str, num_accounts: int, pending_em
     # check pending first
     pending_to_check = [e for e in pending_emails if e not in used_emails_set]
     if pending_to_check:
-        async with aiohttp.ClientSession() as s:
+        async with create_meeff_session() as s:
             tasks = [ _post_json(s, "https://api.meeff.com/user/checkEmail/v1", {"email": e, "locale":"en"}) for e in pending_to_check ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
             for i, r in enumerate(results):
@@ -283,7 +284,7 @@ async def select_available_emails(base_email: str, num_accounts: int, pending_em
         variants = generate_email_variations(base_email, num_accounts * 10)
         candidates = [e for e in variants if e not in pending_emails and e not in available_emails and e not in used_emails_set]
         if candidates:
-            async with aiohttp.ClientSession() as s:
+            async with create_meeff_session() as s:
                 tasks = [ _post_json(s, "https://api.meeff.com/user/checkEmail/v1", {"email": e, "locale":"en"}) for e in candidates ]
                 results = await asyncio.gather(*tasks, return_exceptions=True)
                 for i, r in enumerate(results):
@@ -411,7 +412,7 @@ async def try_signup(state: Dict, telegram_user_id: int) -> Dict:
     payload = get_api_payload_with_device_info(base_payload, device_info)
     headers = {'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"}
 
-    async with aiohttp.ClientSession() as session:
+    async with create_meeff_session() as session:
         status, body = await _post_json(session, url, payload, headers=headers)
         if status is None:
             return {"errorMessage": "Network error during signup"}
@@ -432,7 +433,7 @@ async def try_signin(email: str, password: str, telegram_user_id: int, session: 
     # allow passing a shared session
     close_session = False
     if session is None:
-        session = aiohttp.ClientSession()
+        session = create_meeff_session()
         close_session = True
 
     try:
@@ -466,7 +467,7 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
     BATCH_DELAY_SECONDS = 60 
 
     sem = asyncio.Semaphore(MAX_CONCURRENT)
-    session = aiohttp.ClientSession()
+    session = create_meeff_session()
 
     # Worker takes a tuple: (email, password, retry_count)
     async def worker_login(email, password, current_retries):
@@ -1081,7 +1082,7 @@ async def meeff_upload_image(img_bytes: bytes) -> Optional[str]:
         'Content-Type': "application/json; charset=utf-8"
     }
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_meeff_session() as session:
             async with session.post(url, data=json.dumps(payload), headers=headers) as resp:
                 resp_json = await resp.json()
                 data = resp_json.get("data", {})

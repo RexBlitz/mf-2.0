@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from typing import Dict
 import aiohttp
 import html
+from meeff_http import create_meeff_session
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, CallbackQuery
@@ -306,7 +307,7 @@ async def invoke_command(message: Message):
     
     # Simple check logic...
     disabled = []
-    async with aiohttp.ClientSession() as session:
+    async with create_meeff_session() as session:
         for t in active_tokens:
             try:
                 headers = {"User-Agent": "okhttp/5.0.0-alpha.14", "meeff-access-token": t["token"]}
@@ -374,7 +375,7 @@ async def add_person_command(message: Message):
     headers = {"meeff-access-token": token, "Connection": "keep-alive"}
     
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_meeff_session() as session:
             async with session.get(url, headers=headers) as response:
                 data = await response.json()
                 await message.reply(f"Response: {data.get('errorCode') or 'Success'}")
@@ -402,7 +403,7 @@ async def refresh_tokens_command(message: Message):
     failed_names = []
     banned_names = []
 
-    async with aiohttp.ClientSession() as session:
+    async with create_meeff_session() as session:
         for idx, token_info in enumerate(active_tokens):
             old_token = token_info["token"]
             name = token_info.get("name", f"Account {idx + 1}")

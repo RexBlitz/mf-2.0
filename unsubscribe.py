@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import logging
+from meeff_http import create_meeff_session
 from aiogram import Bot, types
 from aiogram.exceptions import TelegramBadRequest
 from device_info import get_or_create_device_info_for_token, get_headers_with_device_info
@@ -103,7 +104,7 @@ async def unsubscribe_everyone(token: str, status_message: types.Message = None,
         ui_task = asyncio.create_task(_update_ui())
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with create_meeff_session() as session:
             while True:
                 chatrooms, next_from_date = await _fetch_chatroom_batch(session, token, from_date, user_id)
                 if not chatrooms:

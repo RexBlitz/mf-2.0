@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import logging
+from meeff_http import create_meeff_session
 from typing import List, Dict, Set
 from aiogram import types
 from db import bulk_add_sent_ids, is_already_sent
@@ -139,7 +140,7 @@ async def send_lounge(
             pass
 
     await update_status("⏳ <b>Lounge Messaging:</b> Starting...")
-    async with aiohttp.ClientSession() as session:
+    async with create_meeff_session() as session:
         while True:
             await update_status(
                 f"⏳ <b>Lounge Messaging:</b> Fetching new users...\n"
@@ -195,7 +196,7 @@ async def send_lounge_all_tokens(
 
     async def _worker(token_data: Dict):
         token = token_data.get("token")
-        async with aiohttp.ClientSession() as session:
+        async with create_meeff_session() as session:
             while True:
                 token_status[token]["status"] = "Fetching"
                 users = await fetch_lounge_users(session, token, user_id)

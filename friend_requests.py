@@ -1,6 +1,7 @@
 import asyncio
 import aiohttp
 import logging
+from meeff_http import create_meeff_session
 import html
 from aiogram import Bot, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -227,7 +228,7 @@ async def run_requests(user_id, bot, target_channel_id):
 
     # Single session for the entire run
     connector = aiohttp.TCPConnector(limit=10)
-    async with aiohttp.ClientSession(connector=connector) as session:
+    async with create_meeff_session(connector=connector) as session:
         while state["running"]:
             try:
                 if is_request_filter_enabled(user_id):
@@ -347,7 +348,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
         # Single session per worker for the entire run
         connector = aiohttp.TCPConnector(limit=10)
-        async with aiohttp.ClientSession(connector=connector) as session:
+        async with create_meeff_session(connector=connector) as session:
             while state["running"]:
                 try:
 

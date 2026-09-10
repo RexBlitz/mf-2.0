@@ -5,6 +5,7 @@ from db import get_current_account, get_user_filters, set_user_filters, get_toke
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 import asyncio
 import aiohttp
+from meeff_http import create_meeff_session
 
 # Global state for filter settings
 user_filter_states = {}
@@ -161,7 +162,7 @@ async def apply_filter_for_account(token, user_id):
         }
         # --------------------------------------------------------
         
-        async with aiohttp.ClientSession() as session:
+        async with create_meeff_session() as session:
             async with session.post(url, json=filter_data, headers=headers) as response:
                 if response.status == 200:
                     print(f" Filter applied successfully for token: {token[:10]}...")

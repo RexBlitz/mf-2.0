@@ -2,6 +2,7 @@
 import asyncio
 import aiohttp
 import logging
+from meeff_http import create_meeff_session
 
 countries = [
     "AF", "AL", "DZ", "AD", "AO", "AG", "AR", "AM", "AU", "AT", "AZ", "BS", "BH", "BD",
@@ -95,7 +96,7 @@ async def run_all_countries(user_id, state, bot, get_current_account):
     headers = dict(BASE_HEADERS)
     headers["meeff-access-token"] = token
 
-    async with aiohttp.ClientSession() as session:
+    async with create_meeff_session() as session:
         country_index = 0
         state["total_added_friends"] = 0
         state["country_batch_index"] = 0

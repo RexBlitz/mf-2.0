@@ -1,5 +1,6 @@
 import aiohttp
 import asyncio
+from meeff_http import create_meeff_session
 import logging
 import html
 from aiogram import Bot, types
@@ -137,7 +138,7 @@ async def send_message_to_everyone(
     total_rooms, sent_count, filtered_count = 0, 0, 0
     from_date = None
     
-    async with aiohttp.ClientSession() as session:
+    async with create_meeff_session() as session:
         while True:
             # user_id is passed to fetch_chatrooms but is unused inside now
             rooms, next_from = await fetch_chatrooms(session, token, from_date, user_id)
