@@ -13,11 +13,11 @@ from dateutil import parser
 # local modules (must exist)
 from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
 from db import (
-    # Line 15: The error is here, or in the indentation immediately before
-    #          `set_token` or between the items.
     set_token, set_info_card, set_signup_config, get_signup_config, set_user_filters,
     get_pending_accounts, add_pending_accounts, remove_pending_account, clear_pending_accounts,
-    add_token_to_auto_batch
+    add_token_to_auto_batch,
+    # ===== NEW ALIAS FUNCTIONS =====
+    add_available_emails, get_available_emails, move_email_to_used, count_available_emails
 )
 from filters import get_nationality_keyboard
 
@@ -46,7 +46,6 @@ user_signup_states: Dict[int, Dict] = {}
 # -------------------------
 # Keyboard templates
 # -------------------------
-# MODIFIED: Removed Multi Sign In button
 SIGNUP_MENU = InlineKeyboardMarkup(inline_keyboard=[
     [
         InlineKeyboardButton(text="Sign Up", callback_data="signup_go"),
@@ -145,6 +144,9 @@ async def signup_settings_command(message: Message, is_callback: bool = False):
     nationality = cfg.get("nationality", "Not Set")
     auto_signup = cfg.get("auto_signup", False)
 
+    # Available count dikhane ke liye
+    available_count = await count_available_emails(user_id)
+
     text = (
         "<b>⚙️ Signup Configuration</b>\n\n"
         f"<b>Email:</b> <code>{email}</code>\n"
@@ -152,7 +154,8 @@ async def signup_settings_command(message: Message, is_callback: bool = False):
         f"<b>Gender:</b> {gender}\n"
         f"<b>Birth Year:</b> {birth_year}\n"
         f"<b>Nationality:</b> {nationality}\n"
-        f"<b>Auto Signup:</b> {'ON ✅' if auto_signup else 'OFF ❌'}\n\n"
+        f"<b>Auto Signup:</b> {'ON ✅' if auto_signup else 'OFF ❌'}\n"
+        f"<b>Available Aliases:</b> {available_count}\n\n"
         "<b>Update settings below:</b>"
     )
 
@@ -219,29 +222,43 @@ def format_user_with_nationality(user: Dict) -> str:
 
     return card
 
-def generate_email_variations(base_email: str, count: int = 1000) -> List[str]:
+
+def generate_email_variations(base_email: str, count: int = 5000) -> List[str]:
+    """Generate maximum possible Gmail-style dot variations"""
     if '@' not in base_email:
         return []
+    
     username, domain = base_email.split('@', 1)
-    variations = {base_email}
-    max_dots = min(4, max(0, len(username) - 1))
-
-    for i in range(1, max_dots + 1):
-        for positions in itertools.combinations(range(1, len(username)), i):
-            if len(variations) >= count:
-                return list(variations)
+    n = len(username)
+    
+    if n <= 1:
+        return [base_email]
+    
+    variations = set()
+    variations.add(base_email)
+    
+    max_possible_dots = n - 1
+    limit = min(count, 2 ** max_possible_dots)
+    
+    for num_dots in range(1, max_possible_dots + 1):
+        if len(variations) >= limit:
+            break
+        for positions in itertools.combinations(range(1, n), num_dots):
+            if len(variations) >= limit:
+                break
             new_username = list(username)
             for pos in reversed(positions):
                 new_username.insert(pos, '.')
             variations.add(''.join(new_username) + '@' + domain)
+    
+    return list(variations)[:limit]
 
-    return list(variations)[:count]
 
 def get_random_bio() -> str:
     return random.choice(DEFAULT_BIOS)
 
 # -------------------------
-# Async HTTP helpers (shared session optional)
+# Async HTTP helpers
 # -------------------------
 async def _post_json(session: aiohttp.ClientSession, url: str, payload: Dict, headers: Dict = None, timeout: int = 30):
     headers = headers or {}
@@ -259,44 +276,10 @@ async def _post_json(session: aiohttp.ClientSession, url: str, payload: Dict, he
 # -------------------------
 # Signup preview / helpers
 # -------------------------
-async def select_available_emails(base_email: str, num_accounts: int, pending_emails: List[str], used_emails: List[str]) -> List[str]:
-    available_emails = []
-    used_emails_set = set(used_emails or [])
-
-    # check pending first
-    pending_to_check = [e for e in pending_emails if e not in used_emails_set]
-    if pending_to_check:
-        async with create_meeff_session() as s:
-            tasks = [ _post_json(s, "https://api.meeff.com/user/checkEmail/v1", {"email": e, "locale":"en"}) for e in pending_to_check ]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for i, r in enumerate(results):
-                if isinstance(r, tuple):
-                    status, body = r
-                    # treat 406 or explicit message as used
-                    if body.get("errorMessage") and "already in use" in body.get("errorMessage", "").lower():
-                        continue
-                    # available
-                    if len(available_emails) < num_accounts:
-                        available_emails.append(pending_to_check[i])
-
-    # generate new variations if needed
-    if len(available_emails) < num_accounts:
-        variants = generate_email_variations(base_email, num_accounts * 10)
-        candidates = [e for e in variants if e not in pending_emails and e not in available_emails and e not in used_emails_set]
-        if candidates:
-            async with create_meeff_session() as s:
-                tasks = [ _post_json(s, "https://api.meeff.com/user/checkEmail/v1", {"email": e, "locale":"en"}) for e in candidates ]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
-                for i, r in enumerate(results):
-                    if len(available_emails) >= num_accounts:
-                        break
-                    if isinstance(r, tuple):
-                        status, body = r
-                        if body.get("errorMessage") and "already in use" in body.get("errorMessage", "").lower():
-                            continue
-                        available_emails.append(candidates[i])
-
-    return available_emails
+async def select_available_emails(user_id: int, num_accounts: int) -> List[str]:
+    """Ab generate nahi karta — seedha DB se available emails leta hai"""
+    emails = await get_available_emails(user_id, limit=num_accounts)
+    return emails
 
 
 # -------------------------
@@ -308,7 +291,6 @@ async def signup_command(message: Message) -> None:
     pending = await get_pending_accounts(user_id)
     pending_count = len(pending) if pending else 0
     
-    # build menu copy so we can inject buttons
     menu = [row[:] for row in SIGNUP_MENU.inline_keyboard]
     
     if pending_count > 0:
@@ -330,8 +312,6 @@ async def show_signup_preview(message: Message, user_id: int, state: Dict) -> No
     config = await get_signup_config(user_id) or {}
     manual_mode = state.get("manual_mode", False)
 
-    # Manual mode only needs password/gender/birth_year/nationality from config;
-    # the email itself comes from state["manual_email"], not the auto base email.
     required_keys = ['password', 'gender', 'birth_year', 'nationality'] if manual_mode else \
                      ['email', 'password', 'gender', 'birth_year', 'nationality']
     if not all(k in config for k in required_keys):
@@ -342,23 +322,19 @@ async def show_signup_preview(message: Message, user_id: int, state: Dict) -> No
         )
         return
 
-    pending_emails = [acc['email'] for acc in state.get('pending_accounts', [])]
-
     if manual_mode:
-        # Don't touch the auto base email / auto email-generation logic at all.
         manual_email = state.get("manual_email", "")
         state["selected_emails"] = [manual_email] if manual_email else []
         available_emails = state["selected_emails"]
     else:
-        await message.edit_text("<b>Checking email availability concurrently...</b> This may take a moment.")
+        await message.edit_text("<b>Fetching available emails from database...</b>")
 
         num_accounts = state.get('num_accounts', 1)
-        used_emails = config.get("used_emails", [])
-
-        available_emails = await select_available_emails(config.get("email", ""), num_accounts, pending_emails, used_emails)
+        available_emails = await select_available_emails(user_id, num_accounts)
         state["selected_emails"] = available_emails
 
-    email_list = '\n'.join([f"{i+1}. <code>{email}</code>{' (Pending)' if email in pending_emails else ''}" for i, email in enumerate(available_emails)]) if available_emails else "No available emails found!"
+    email_list = '\n'.join([f"{i+1}. <code>{email}</code>" for i, email in enumerate(available_emails)]) if available_emails else "No available emails found!"
+    
     preview_text = (
         f"<b>Signup Preview</b>\n\n"
         f"<b>Name:</b> {state.get('name', 'N/A')}\n"
@@ -383,7 +359,6 @@ async def show_signup_preview(message: Message, user_id: int, state: Dict) -> No
 # Core signing functions
 # -------------------------
 async def try_signup(state: Dict, telegram_user_id: int) -> Dict:
-    # small jitter to avoid bursts
     await asyncio.sleep(random.uniform(0.5, 1.2))
 
     url = "https://api.meeff.com/user/register/email/v4"
@@ -416,10 +391,12 @@ async def try_signup(state: Dict, telegram_user_id: int) -> Dict:
         status, body = await _post_json(session, url, payload, headers=headers)
         if status is None:
             return {"errorMessage": "Network error during signup"}
+        # Exact error preserve karo
+        if status != 200 and "errorMessage" not in body:
+            body["errorMessage"] = body.get("message") or f"HTTP {status}"
         return body
 
 async def try_signin(email: str, password: str, telegram_user_id: int, session: aiohttp.ClientSession = None) -> Dict:
-    # small jitter to avoid bursts
     await asyncio.sleep(random.uniform(0.5, 1.2))
 
     url = "https://api.meeff.com/user/login/v4"
@@ -430,7 +407,6 @@ async def try_signin(email: str, password: str, telegram_user_id: int, session: 
     payload = get_api_payload_with_device_info(base_payload, device_info)
     headers = {'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"}
 
-    # allow passing a shared session
     close_session = False
     if session is None:
         session = create_meeff_session()
@@ -441,35 +417,37 @@ async def try_signin(email: str, password: str, telegram_user_id: int, session: 
         if status is None:
             logger.error(f"SIGNIN FAILED (network) email={email}")
             return {"errorMessage": "Network error during signin"}
-        if status == 200 and body.get("accessToken"):
-            logger.info(f"SIGNIN OK email={email}")
+        
+        # Exact error preserve
+        if status != 200:
+            if "errorMessage" not in body:
+                body["errorMessage"] = body.get("message") or f"HTTP {status}"
+            logger.warning(f"SIGNIN FAILED email={email} status={status} reason={body.get('errorMessage')}")
         else:
-            err = body.get("errorMessage") or body.get("message") or "unknown"
-            logger.warning(f"SIGNIN FAILED email={email} status={status} reason={err!r}")
+            logger.info(f"SIGNIN OK email={email}")
         return body
     finally:
         if close_session:
             await session.close()
 
 # -------------------------
-# New Multi Sign In Logic
+# Multi Sign In Logic
 # -------------------------
 async def do_multi_signin(message: Message, user_id: int, accounts_to_login: List[Tuple[str, str]]) -> None:
-    # --- Send a new message from the bot and use it for edits ---
-    msg_to_edit = await message.answer(f"<b>Starting Multi-Login for {len(accounts_to_login)} Accounts...</b>\nProcessing in batches of 5.", parse_mode="HTML")
+    msg_to_edit = await message.answer(
+        f"<b>Starting Multi-Login for {len(accounts_to_login)} Accounts...</b>\nProcessing in batches of 5.",
+        parse_mode="HTML"
+    )
 
     MAX_CONCURRENT = 4
     MAX_RETRIES = 3
     BACKOFF_BASE = 1.0
-    
-    # --- BATCHING CONFIG ---
     BATCH_SIZE = 5
     BATCH_DELAY_SECONDS = 60 
 
     sem = asyncio.Semaphore(MAX_CONCURRENT)
     session = create_meeff_session()
 
-    # Worker takes a tuple: (email, password, retry_count)
     async def worker_login(email, password, current_retries):
         acc = {"email": email, "password": password, "retries": current_retries}
         for attempt in range(1, MAX_RETRIES + 1):
@@ -480,7 +458,7 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
                 sem.release()
 
             if isinstance(res, dict) and res.get("accessToken") and res.get("user"):
-                return res, acc # Success
+                return res, acc
 
             err = (res.get("errorMessage") or "").lower() if isinstance(res, dict) else str(res)
             retryable = ("429" in err) or ("rate" in err) or ("tempor" in err) or ("connection" in err) or ("unverified" in err)
@@ -496,25 +474,19 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
     verified_count = 0
     permanent_failed_emails = []
     
-    # Convert incoming list of (email, password) into (email, password, retry_count=0)
     accounts_remaining = [(email, password, 0) for email, password in accounts_to_login]
     total_accounts = len(accounts_to_login)
     
     batch_number = 0
-    
-    # Pre-calculate total batches based on initial size
     total_batches = (total_accounts // BATCH_SIZE) + (1 if total_accounts % BATCH_SIZE else 0)
 
-    # --- MAIN BATCHING LOGIC WITH LIVE PROGRESS AND RETRIES ---
     while accounts_remaining:
         batch_number += 1
         
-        # Determine the batch size, ensuring we don't exceed the number of remaining accounts
         current_batch_size = min(BATCH_SIZE, len(accounts_remaining))
         batch = accounts_remaining[:current_batch_size]
         accounts_remaining = accounts_remaining[current_batch_size:]
         
-        # --- Live Update 1: Starting the Batch ---
         await msg_to_edit.edit_text(
             f"<b>Batch {batch_number} of {total_batches} in Progress...</b> ⏳\n"
             f"Accounts in this batch: {len(batch)}\n"
@@ -522,7 +494,6 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
             parse_mode="HTML"
         )
         
-        # Run current batch concurrently
         tasks = [worker_login(email, password, retries) for email, password, retries in batch]
         results = await asyncio.gather(*tasks, return_exceptions=False)
         
@@ -530,50 +501,42 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
         current_batch_verified = 0
         current_batch_permanent_failed = 0
         
-        # Process results
         for res, acc in results:
             email = acc.get("email")
             password = acc.get("password")
             retries = acc.get("retries", 0)
             
             if isinstance(res, dict) and res.get("accessToken") and res.get("user"):
-                # SUCCESS: Save and count
                 token = res["accessToken"]
                 token_index = await set_token(user_id, token, res["user"].get("name", email), email, password)
                 if token_index != -1:
                     await add_token_to_auto_batch(user_id, token_index)
-                await set_user_filters(user_id, token, {"filterNationalityCode": ""}) # set default filter
+                await set_user_filters(user_id, token, {"filterNationalityCode": ""})
                 user_obj = res.get("user", {})
                 user_obj.update({"email": email, "password": password, "token": token})
                 await set_info_card(user_id, token, format_user_with_nationality(user_obj), email)
                 
-                # Crucial for pending logic: Remove from DB if successful
                 await remove_pending_account(user_id, email) 
                 
                 verified_count += 1
                 current_batch_verified += 1
             else:
-                # FAILURE: Check if it's a permanent failure or needs re-queuing
-                err = (res.get("errorMessage") or "").lower()
+                # ===== EXACT ERROR MESSAGE =====
+                err = res.get("errorMessage") or res.get("message") or str(res)
                 
-                # Check for common permanent errors (e.g., account blocked, bad password, max retries reached)
-                is_permanent = ("password mismatch" in err) or ("invalid provider token" in err) or ("user not found" in err)
+                is_permanent = ("password mismatch" in err.lower()) or ("invalid provider token" in err.lower()) or ("user not found" in err.lower())
                 
-                # Use a specific retry limit for re-queuing logic (1 re-queue attempt in addition to worker's retries)
                 if is_permanent or retries >= 1: 
-                    # Permanent failure or max retries reached (1 extra retry on top of internal worker retries)
                     current_batch_permanent_failed += 1
-                    permanent_failed_emails.append(f"• <code>{email}</code> (Error: Permanent Failure after {retries} retries: {err})")
-                    # Remove permanently failed from DB pending list to prevent future attempts
+                    permanent_failed_emails.append(
+                        f"• <code>{email}</code>\n  <b>Error:</b> <code>{err}</code>"
+                    )
                     await remove_pending_account(user_id, email) 
                 else:
-                    # Temporary failure (e.g., 'email not verified') - re-queue
                     re_queued_batch.append((email, password, retries + 1))
 
-        # Re-queue failed accounts at the end of the accounts_remaining list
         accounts_remaining.extend(re_queued_batch)
         
-        # --- Live Update 2: After Processing Batch ---
         progress_text = (
             f"<b>Batch {batch_number} Complete.</b> 🎉\n"
             f"Verified in Batch: {current_batch_verified}\n"
@@ -585,19 +548,16 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
         )
         await msg_to_edit.edit_text(progress_text, parse_mode="HTML")
 
-        # Delay for 1 minute before the next batch, but only if there are accounts left to process
         if accounts_remaining:
             await msg_to_edit.edit_text(
                 f"{progress_text}\n\n"
-                f"Pausing for **{BATCH_DELAY_SECONDS} seconds** before continuing... 😴",
+                f"Pausing for <b>{BATCH_DELAY_SECONDS} seconds</b> before continuing... 😴",
                 parse_mode="HTML"
             )
             await asyncio.sleep(BATCH_DELAY_SECONDS)
 
-            
     await session.close()
     
-    # --- Final Result Display ---
     result_summary = f"<b>✅ Sign In Complete!</b>\n\n<b>Total Accounts Logged In:</b> {verified_count} of {total_accounts}"
     if permanent_failed_emails:
         result_summary += f"\n<b>Permanently Failed:</b> {len(permanent_failed_emails)}"
@@ -605,10 +565,10 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
     await msg_to_edit.edit_text(result_summary, reply_markup=SIGNUP_MENU, parse_mode="HTML")
 
     if permanent_failed_emails:
-        details_text = "<b>Detailed Permanently Failed Accounts:</b>\n" + '\n'.join(permanent_failed_emails)
-        # Split details into chunks if needed
+        details_text = "<b>Detailed Permanently Failed Accounts:</b>\n\n" + '\n\n'.join(permanent_failed_emails)
         for i in range(0, len(details_text), 4000):
             await message.answer(details_text[i:i+4000], parse_mode="HTML")
+
 # -------------------------
 # Callback handler
 # -------------------------
@@ -635,7 +595,8 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         state["stage"] = "config_email"
         user_signup_states[user_id] = state
         await callback.message.edit_text(
-            "<b>Setup Email</b>\n\nEnter your base Gmail address (e.g., yourname@gmail.com). This will be used to generate dot variations for multiple accounts.",
+            "<b>Setup Email</b>\n\nEnter your base Gmail address (e.g., yourname@gmail.com).\n\n"
+            "Aliases will be generated and saved automatically.",
             reply_markup=BACK_TO_CONFIG, parse_mode="HTML"
         )
         await callback.answer()
@@ -647,7 +608,6 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         auto_signup = cfg.get("auto_signup", False)
 
         if not auto_signup:
-            # Manual mode: just ask for email, rest comes from config
             if not all(k in cfg for k in ['password', 'gender', 'birth_year', 'nationality']):
                 await callback.message.edit_text(
                     "<b>Configuration Incomplete</b>\n\nPlease set up password, gender, birth year and nationality in <b>Signup Config</b> first.",
@@ -665,7 +625,6 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
             await callback.answer()
             return True
 
-        # Auto signup mode: require full config
         if not all(k in cfg for k in ['email', 'password', 'gender', 'birth_year', 'nationality']):
             await callback.message.edit_text(
                 "<b>Configuration Incomplete</b>\n\nPlease set up all details in <b>Signup Config</b> first.",
@@ -674,10 +633,21 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
             await callback.answer()
             return True
 
+        # Check available aliases
+        available_count = await count_available_emails(user_id)
+        if available_count == 0:
+            await callback.message.edit_text(
+                "<b>No Available Aliases</b>\n\nPlease set/update base email in Signup Config to generate aliases first.",
+                reply_markup=SIGNUP_MENU, parse_mode="HTML"
+            )
+            await callback.answer()
+            return True
+
         state["stage"] = "ask_num_accounts"
         user_signup_states[user_id] = state
         await callback.message.edit_text(
-            "<b>Account Creation</b>\n\nEnter the number of accounts to create (1-100):",
+            f"<b>Account Creation</b>\n\nAvailable Aliases: <b>{available_count}</b>\n\n"
+            f"Enter the number of accounts to create (1-{min(100, available_count)}):",
             reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
         )
         await callback.answer()
@@ -700,13 +670,12 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.answer()
         return True
 
-    # ---------- Create accounts (preview confirmed) ----------
+    # ---------- Create accounts ----------
     if data == "create_accounts_confirm":
         await callback.message.edit_text("<b>Creating Accounts Concurrently...</b>", parse_mode="HTML")
         cfg = await get_signup_config(user_id) or {}
         num_accounts = state.get("num_accounts", 1)
         manual_mode = state.get("manual_mode", False)
-        used_emails = set(cfg.get("used_emails", []))
 
         if manual_mode:
             selected_emails = [state.get("manual_email")]
@@ -715,7 +684,7 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
 
         if not selected_emails or not selected_emails[0]:
             await callback.message.edit_text(
-                "<b>No Available Emails</b>\n\nNo valid email variations found. Please try a different base email in Signup Config.",
+                "<b>No Available Emails</b>\n\nNo emails found in available pool.",
                 reply_markup=SIGNUP_MENU, parse_mode="HTML"
             )
             await callback.answer()
@@ -734,37 +703,44 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
                 "birth_year": cfg.get("birth_year", 2000),
                 "nationality": cfg.get("nationality", "US")
             }
-            if email not in used_emails:
-                signup_tasks.append(try_signup(acc, user_id))
-                accounts_to_create.append(acc)
+            signup_tasks.append(try_signup(acc, user_id))
+            accounts_to_create.append(acc)
 
         results = await asyncio.gather(*signup_tasks)
         created_accounts = []
+        failed_details = []
+
         for i, res in enumerate(results):
             acc = accounts_to_create[i]
             if isinstance(res, dict) and res.get("user", {}).get("_id"):
-                created_accounts.append({"email": acc["email"], "name": acc["name"], "password": acc["password"]})
-            elif isinstance(res, dict) and "already in use" in (res.get("errorMessage") or "").lower():
-                used_emails.add(acc["email"])
+                created_accounts.append({
+                    "email": acc["email"],
+                    "name": acc["name"],
+                    "password": acc["password"]
+                })
+                # ===== MOVE TO USED =====
+                await move_email_to_used(user_id, acc["email"], base_email=cfg.get("email"))
             else:
-                logger.error(f"Signup failed for {acc['email']}: {res}")
-
-        if used_emails:
-            cfg['used_emails'] = list(used_emails)
-            await set_signup_config(user_id, cfg)
+                # ===== EXACT ERROR =====
+                err = res.get("errorMessage") or res.get("message") or str(res)
+                failed_details.append(f"• <code>{acc['email']}</code>\n  Error: <code>{err}</code>")
+                logger.error(f"Signup failed for {acc['email']}: {err}")
 
         state["created_accounts"] = created_accounts
         state["verified_accounts"] = []
         state["pending_accounts"] = created_accounts.copy()
 
         result_text = (
-            f"<b>Account Creation Results</b>\n\n<b>Created:</b> {len(created_accounts)} account{'s' if len(created_accounts) != 1 else ''}\n\n"
+            f"<b>Account Creation Results</b>\n\n"
+            f"<b>Created:</b> {len(created_accounts)} account{'s' if len(created_accounts) != 1 else ''}\n"
         )
         if created_accounts:
-            result_text += "<b>Created Accounts:</b>\n" + '\n'.join([f"• {a['name']} - <code>{a['email']}</code>" for a in created_accounts])
+            result_text += "\n<b>Created Accounts:</b>\n" + '\n'.join(
+                [f"• {a['name']} - <code>{a['email']}</code>" for a in created_accounts]
+            )
 
-        if len(selected_emails) > len(created_accounts):
-            result_text += "\n\n⚠️ Some emails were already in use and have been skipped for future runs."
+        if failed_details:
+            result_text += f"\n\n<b>Failed ({len(failed_details)}):</b>\n" + "\n".join(failed_details)
 
         result_text += "\n\nPlease verify all emails in your mailbox, then either click Verify All Emails or Skip For Now to save them."
 
@@ -773,18 +749,16 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.answer()
         return True
 
-    # ---------- Verify pending accounts (MODIFIED to use do_multi_signin) ----------
+    # ---------- Verify pending accounts ----------
     if data == "verify_accounts" or data == "retry_pending":
         pending_in_memory = state.get("pending_accounts", []) or []
         db_pending = await get_pending_accounts(user_id) or []
         
-        # Combine unique accounts from in-memory state and database pending accounts
         all_accounts_to_process = []
         emails_in_list = set()
         
         for acc in pending_in_memory + db_pending:
             if acc["email"] not in emails_in_list:
-                # Ensure the account dict has the minimum required info for signin
                 if acc.get("email") and acc.get("password"):
                     all_accounts_to_process.append(acc)
                     emails_in_list.add(acc["email"])
@@ -797,20 +771,17 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
             await callback.answer()
             return True
 
-        # Convert account dictionaries to the (email, password) format required by do_multi_signin
         accounts_to_login = [(acc["email"], acc["password"]) for acc in all_accounts_to_process]
         
-        # --- Use the batch-processing function (do_multi_signin) ---
         await do_multi_signin(callback.message, user_id, accounts_to_login)
 
-        # Clear the in-memory pending state as processing is now complete and results are displayed
         state["pending_accounts"] = [] 
         user_signup_states[user_id] = state
 
         await callback.answer("Verification started in batches. Check for progress updates.")
         return True
 
-    # ---------- Skip pending (save pending accounts into DB, do not sign in) ----------
+    # ---------- Skip pending ----------
     if data == "skip_pending":
         pending = state.get("pending_accounts", []) or []
         if pending:
@@ -826,7 +797,7 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.answer()
         return True
 
-    # ---------- Login pending accounts from DB (existing flow, correctly uses do_multi_signin) ----------
+    # ---------- Login pending accounts ----------
     if data == "login_pending":
         db_pending = await get_pending_accounts(user_id) or []
         if not db_pending:
@@ -836,13 +807,11 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
 
         accounts_to_login = [(acc["email"], acc["password"]) for acc in db_pending]
         await do_multi_signin(callback.message, user_id, accounts_to_login)
-        # do_multi_signin updates the pending DB and sends the final message.
         await callback.answer("Login started in batches. Check above for progress.")
         return True
 
-    # ---------- UNIFIED Sign In button logic (replaces multi_signin_go) ----------
+    # ---------- Sign In ----------
     if data == "signin_go":
-        # Redirect to the stage that accepts single or multiple emails
         state["stage"] = "multi_signin_emails" 
         user_signup_states[user_id] = state
         await callback.message.edit_text(
@@ -852,7 +821,7 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.answer()
         return True
         
-    # ---------- Simple menu / signin flow ----------
+    # ---------- Menu ----------
     if data == "signup_menu":
         state["stage"] = "menu"
         user_signup_states[user_id] = state
@@ -867,12 +836,11 @@ async def signup_callback_handler(callback: CallbackQuery) -> bool:
         await callback.answer()
         return True
 
-    # default
     await callback.answer()
     return False
 
 # -------------------------
-# Message handler for flow (text/photo)
+# Message handler for flow
 # -------------------------
 async def signup_message_handler(message: Message) -> bool:
     user_id = message.from_user.id
@@ -885,18 +853,40 @@ async def signup_message_handler(message: Message) -> bool:
     # configuration flow
     if stage.startswith("config_"):
         cfg = await get_signup_config(user_id) or {}
+        
         if stage == "config_email":
             if '@' not in text:
                 await message.answer("Invalid Email. Please try again:", reply_markup=BACK_TO_CONFIG, parse_mode="HTML")
                 return True
+            
             cfg["email"] = text
             cfg["used_emails"] = []
+            
+            # ===== GENERATE + SAVE ALIASES =====
+            wait_msg = await message.answer("<b>Generating email aliases...</b>\nThis may take a few seconds.", parse_mode="HTML")
+            
+            variations = generate_email_variations(text, count=5000)
+            
+            # Optional: pehle purane clear karna ho to uncomment karein
+            # await email_available_col.delete_many({"user_id": user_id})
+            
+            await add_available_emails(user_id, text, variations)
+            
+            await wait_msg.edit_text(
+                f"<b>✅ {len(variations)} aliases generated & saved in available pool!</b>\n\n"
+                f"Ab password enter karein:",
+                reply_markup=BACK_TO_CONFIG,
+                parse_mode="HTML"
+            )
+            # ==================================
+            
             state["stage"] = "config_password"
-            await message.answer("<b>Setup Password</b>\nEnter the password:", reply_markup=BACK_TO_CONFIG, parse_mode="HTML")
+            
         elif stage == "config_password":
             cfg["password"] = text
             state["stage"] = "config_gender"
             await message.answer("<b>Setup Gender</b>\nEnter gender (M/F):", reply_markup=BACK_TO_CONFIG, parse_mode="HTML")
+            
         elif stage == "config_gender":
             if text.upper() not in ("M", "F"):
                 await message.answer("Invalid. Please enter M or F:", parse_mode="HTML")
@@ -904,6 +894,7 @@ async def signup_message_handler(message: Message) -> bool:
             cfg["gender"] = text.upper()
             state["stage"] = "config_birth_year"
             await message.answer("<b>Setup Birth Year</b>\nEnter birth year (e.g., 2000):", reply_markup=BACK_TO_CONFIG, parse_mode="HTML")
+            
         elif stage == "config_birth_year":
             try:
                 year = int(text)
@@ -915,6 +906,7 @@ async def signup_message_handler(message: Message) -> bool:
             except ValueError:
                 await message.answer("Invalid Year (1950-2010). Please try again:", parse_mode="HTML")
                 return True
+                
         elif stage == "config_nationality":
             if len(text) != 2:
                 await message.answer("Invalid. Please enter a 2-letter code:", parse_mode="HTML")
@@ -923,11 +915,12 @@ async def signup_message_handler(message: Message) -> bool:
             state["stage"] = "menu"
             await message.answer("<b>Configuration Saved!</b>", parse_mode="HTML")
             await signup_settings_command(message)
+            
         await set_signup_config(user_id, cfg)
         user_signup_states[user_id] = state
         return True
     
-    # ---------- Manual Sign Up — enter email after name, before photos ----------
+    # ---------- Manual Sign Up email ----------
     if stage == "manual_signup_email":
         email = text.strip()
         if "@" not in email or "." not in email:
@@ -941,9 +934,7 @@ async def signup_message_handler(message: Message) -> bool:
         await message.answer("<b>Profile Photos</b>\n\nSend up to 6 photos. Click 'Done' when finished.", reply_markup=DONE_PHOTOS, parse_mode="HTML")
         return True
 
-    # ---------- End Manual Sign Up stages ----------
-
-    # ---------- UNIFIED Sign In email input (formerly multi_signin_emails) ----------
+    # ---------- UNIFIED Sign In email input ----------
     if stage == "multi_signin_emails":
         emails = [e.strip() for e in text.split('\n') if e.strip() and '@' in e.strip()]
         if not emails:
@@ -951,34 +942,33 @@ async def signup_message_handler(message: Message) -> bool:
             return True
         
         if len(emails) == 1:
-            # Single Sign In Flow
             state["signin_email"] = emails[0]
-            state["stage"] = "signin_password" # Use the specific single-signin stage
+            state["stage"] = "signin_password"
             await message.answer("<b>Password</b>\nEnter your password:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
         else:
-            # Multi Sign In Flow (uses shared password)
             state["multi_signin_emails"] = emails
             state["stage"] = "multi_signin_password"
-            await message.answer(f"<b>{len(emails)} Emails received.</b>\n\nEnter the **single password** to use for all accounts:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
+            await message.answer(
+                f"<b>{len(emails)} Emails received.</b>\n\nEnter the <b>single password</b> to use for all accounts:",
+                reply_markup=BACK_TO_SIGNUP, parse_mode="HTML"
+            )
             
         user_signup_states[user_id] = state
         return True
 
-    # ---------- Multi Sign In Password (Batch Sign In) ----------
+    # ---------- Multi Sign In Password ----------
     if stage == "multi_signin_password":
         password = text
         emails = state.get("multi_signin_emails", [])
         
         accounts_to_login = [(email, password) for email in emails]
-        
-        # Triggers the batch sign-in logic
         await do_multi_signin(message, user_id, accounts_to_login)
 
         state["stage"] = "menu"
         user_signup_states[user_id] = state
         return True
     
-    # ---------- Single Sign In Password (Direct Sign In) ----------
+    # ---------- Single Sign In Password ----------
     if stage == "signin_password":
         msg = await message.answer("<b>Signing In</b>...", parse_mode="HTML")
         email_to_sign_in = state.get("signin_email")
@@ -988,13 +978,17 @@ async def signup_message_handler(message: Message) -> bool:
             creds = {"email": email_to_sign_in, "password": text}
             await store_token_and_show_card(msg, res, creds)
         else:
-            err = res.get("errorMessage", "Unknown error.")
-            await msg.edit_text(f"<b>Sign In Failed</b>\n\nError: {err}", reply_markup=SIGNUP_MENU, parse_mode="HTML")
+            # ===== EXACT ERROR =====
+            err = res.get("errorMessage") or res.get("message") or "Unknown error"
+            await msg.edit_text(
+                f"<b>Sign In Failed</b>\n\n<code>{err}</code>",
+                reply_markup=SIGNUP_MENU,
+                parse_mode="HTML"
+            )
             
         state["stage"] = "menu"
         user_signup_states[user_id] = state
         return True
-    # ---------- END UNIFIED Sign In message flow ----------
 
     # ask number of accounts
     if stage == "ask_num_accounts":
@@ -1002,6 +996,18 @@ async def signup_message_handler(message: Message) -> bool:
             num = int(text)
             if not 1 <= num <= 100:
                 raise ValueError()
+            
+            # Auto mode mein available check
+            if not state.get("manual_mode"):
+                available = await count_available_emails(user_id)
+                if num > available:
+                    await message.answer(
+                        f"Sirf <b>{available}</b> aliases available hain.\n"
+                        f"Kam number enter karein (1-{available}):",
+                        parse_mode="HTML"
+                    )
+                    return True
+            
             state["num_accounts"] = num
             state["stage"] = "ask_name"
             user_signup_states[user_id] = state
@@ -1013,7 +1019,6 @@ async def signup_message_handler(message: Message) -> bool:
     # ask name
     if stage == "ask_name":
         state["name"] = text or "User"
-        # if manual signup, ask for email next; otherwise go straight to photos
         if state.get("manual_mode"):
             state["stage"] = "manual_signup_email"
             user_signup_states[user_id] = state
@@ -1037,13 +1042,15 @@ async def signup_message_handler(message: Message) -> bool:
         photo_url = await upload_tg_photo(message)
         if photo_url:
             state.setdefault("photos", []).append(photo_url)
-            # cleanup previous
             if state.get("last_photo_message_id"):
                 try:
                     await message.bot.delete_message(chat_id=user_id, message_id=state["last_photo_message_id"])
                 except Exception:
                     pass
-            new_message = await message.answer(f"<b>Profile Photos</b>\n\nPhoto uploaded ({len(state['photos'])}/6). Send another or click 'Done'.", reply_markup=DONE_PHOTOS, parse_mode="HTML")
+            new_message = await message.answer(
+                f"<b>Profile Photos</b>\n\nPhoto uploaded ({len(state['photos'])}/6). Send another or click 'Done'.",
+                reply_markup=DONE_PHOTOS, parse_mode="HTML"
+            )
             state["last_photo_message_id"] = new_message.message_id
         else:
             await message.answer("Upload Failed. Please try again.", reply_markup=DONE_PHOTOS, parse_mode="HTML")
@@ -1055,11 +1062,7 @@ async def signup_message_handler(message: Message) -> bool:
 # -------------------------
 # helpers: upload + store
 # -------------------------
-# Note: upload_tg_photo and meeff_upload_image are dependent on bot token and meeff endpoints
-# and are assumed to be implemented correctly elsewhere in the bot environment.
-
 async def upload_tg_photo(message: Message) -> Optional[str]:
-    # Placeholder for actual implementation: this needs message.bot.get_file, which is part of aiogram
     try:
         file = await message.bot.get_file(message.photo[-1].file_id)
         file_url = f"https://api.telegram.org/file/bot{message.bot.token}/{file.file_path}"
@@ -1067,7 +1070,6 @@ async def upload_tg_photo(message: Message) -> Optional[str]:
             async with session.get(file_url) as resp:
                 if resp.status != 200:
                     return None
-                # Assuming meeff_upload_image is defined and working
                 return await meeff_upload_image(await resp.read())
     except Exception as e:
         logger.error(f"Error uploading Telegram photo: {e}")
@@ -1128,5 +1130,5 @@ async def store_token_and_show_card(msg_obj: Message, login_result: Dict, creds:
         await set_info_card(user_id, access_token, text, creds.get("email"))
         await msg_obj.edit_text("<b>Account Signed In & Saved!</b>\n\n" + text, parse_mode="HTML", disable_web_page_preview=True)
     else:
-        error_msg = login_result.get("errorMessage", "Token or user data not received.")
-        await msg_obj.edit_text(f"<b>Error</b>\n\nFailed to save account: {error_msg}", parse_mode="HTML")
+        error_msg = login_result.get("errorMessage") or login_result.get("message") or "Token or user data not received."
+        await msg_obj.edit_text(f"<b>Error</b>\n\n<code>{error_msg}</code>", parse_mode="HTML")
