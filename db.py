@@ -1084,3 +1084,44 @@ async def clear_blocked_users(user_id: int):
     await _ensure_user_collection_exists(user_id)
     user_db = _get_user_collection(user_id)
     await user_db.delete_one({"type": "blocked_users"})
+
+
+async def add_available_emails(user_id: int, base_email: str, emails: list):
+    """Multiple emails ko email_available collection mein insert kare"""
+    if not emails:
+        return
+    docs = [
+        {
+            "email": email,
+            "base_email": base_email,
+            "user_id": user_id
+        }
+        for email in emails
+    ]
+    # Assuming you have a motor/pymongo collection
+    await email_available_col.insert_many(docs, ordered=False)
+
+
+async def get_available_emails(user_id: int, limit: int = 50) -> list:
+    """Available emails return kare"""
+    cursor = email_available_col.find(
+        {"user_id": user_id}
+    ).limit(limit)
+    return [doc["email"] async for doc in cursor]
+
+
+async def move_email_to_used(user_id: int, email: str, base_email: str = None):
+    """Email ko available se hata ke used mein daal de"""
+    doc = await email_available_col.find_one_and_delete(
+        {"user_id": user_id, "email": email}
+    )
+    if doc:
+        await email_used_col.insert_one({
+            "email": email,
+            "base_email": doc.get("base_email") or base_email,
+            "user_id": user_id
+        })
+
+
+async def count_available_emails(user_id: int) -> int:
+    return await email_available_col.count_documents({"user_id": user_id})
