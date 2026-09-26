@@ -895,14 +895,12 @@ async def callback_handler(callback_query: CallbackQuery):
             settings = await get_automation_settings(user_id)
             running = is_automation_running(user_id)
             if settings["enabled"] and running:
-                await set_automation_enabled(user_id, False)
-                stop_automation(user_id)
+                await stop_automation(user_id)
                 await callback_query.answer("Automation stopped.")
             else:
                 if not settings.get("lounge_message") or not settings.get("chatroom_message"):
                     return await callback_query.answer("Set both messages first!", show_alert=True)
-                await set_automation_enabled(user_id, True)
-                start_automation(user_id, bot)
+                await start_automation(user_id, bot)
                 await callback_query.answer("Automation started!")
         
         elif data == "auto_set_lounge":
@@ -916,7 +914,7 @@ async def callback_handler(callback_query: CallbackQuery):
             selected = settings.get("selected_accounts", "all")
             
             mark_current = "✅ " if selected == "current" else ""
-            mark_active  = "✅ " if selected == "active_only" else ""
+            mark_active  = "✅ " if selected == "all" else ""
 
             buttons = [
                 [InlineKeyboardButton(text=f"{mark_current}Current Account", callback_data="auto_acc_current")],
@@ -934,7 +932,12 @@ async def callback_handler(callback_query: CallbackQuery):
         
        # --- OPTION 2: ALL ACTIVE ---
         elif data == "auto_acc_active":
-            await set_automation_accounts(user_id, "active_only")
+            # FIX: automation.py checks selected_accounts == "all" to decide
+            # whether to target every active token. This used to write
+            # "active_only", which never matched that check, so choosing
+            # this option silently kept automation on current-account-only
+            # mode. Now it actually stores "all".
+            await set_automation_accounts(user_id, "all")
             await callback_query.answer("Active accounts selected!")
             callback_query.data = "auto_select_accounts"
             await callback_handler(callback_query)
@@ -1143,7 +1146,7 @@ async def resume_automation_tasks():
                 user_id = int(col['collection_name'].replace("user_", ""))
                 settings = await get_automation_settings(user_id)
                 if settings.get("enabled"):
-                    start_automation(user_id, bot)
+                    await start_automation(user_id, bot)
                     count += 1
             except ValueError:
                 continue
