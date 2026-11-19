@@ -365,6 +365,16 @@ def get_multi_country_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=keyboard)
 
 
+def get_nationality_keyboard(
+    account_index: int = 0,
+    selected_csv: str = "",
+    mode: str = "include",
+    page: int = 0,
+) -> InlineKeyboardMarkup:
+    """Compatibility alias for get_multi_country_keyboard."""
+    return get_multi_country_keyboard(account_index, selected_csv, mode, page)
+
+
 def get_distance_keyboard(account_index: int, current_dist: int = 510) -> InlineKeyboardMarkup:
     rows: List[List[InlineKeyboardButton]] = []
     row: List[InlineKeyboardButton] = []
