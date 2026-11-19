@@ -1,6 +1,6 @@
 import aiohttp
 import json
-from meeff_http import create_meeff_session
+from meeff_http import MEEFF_DEFAULT_LOCALE, MEEFF_USER_AGENT, build_meeff_headers, create_meeff_session
 import random
 import itertools
 import logging
@@ -11,7 +11,11 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from dateutil import parser
 
 # local modules (must exist)
-from device_info import get_or_create_device_info_for_email, get_api_payload_with_device_info
+from device_info import (
+    get_or_create_device_info_for_email,
+    get_api_payload_with_device_info,
+    store_device_info_for_token,
+)
 from db import (
     set_token, set_info_card, set_signup_config, get_signup_config, set_user_filters,
     get_pending_accounts, add_pending_accounts, remove_pending_account, clear_pending_accounts,
@@ -385,7 +389,7 @@ async def try_signup(state: Dict, telegram_user_id: int) -> Dict:
         "interest": "IS000001,IS000002,IS000003,IS000004",
     }
     payload = get_api_payload_with_device_info(base_payload, device_info)
-    headers = {'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"}
+    headers = build_meeff_headers(json_body=True)
 
     async with create_meeff_session() as session:
         status, body = await _post_json(session, url, payload, headers=headers)
@@ -403,9 +407,9 @@ async def try_signin(email: str, password: str, telegram_user_id: int, session: 
     device_info = await get_or_create_device_info_for_email(telegram_user_id, email)
     logger.info(f"SIGNIN using device_id={device_info.get('device_unique_id')} for email={email}")
 
-    base_payload = {"provider": "email", "providerId": email, "providerToken": password, "locale": "en"}
+    base_payload = {"provider": "email", "providerId": email, "providerToken": password, "locale": MEEFF_DEFAULT_LOCALE}
     payload = get_api_payload_with_device_info(base_payload, device_info)
-    headers = {'User-Agent': "okhttp/5.0.0-alpha.14", 'Content-Type': "application/json; charset=utf-8"}
+    headers = build_meeff_headers(json_body=True)
 
     close_session = False
     if session is None:
@@ -508,10 +512,12 @@ async def do_multi_signin(message: Message, user_id: int, accounts_to_login: Lis
             
             if isinstance(res, dict) and res.get("accessToken") and res.get("user"):
                 token = res["accessToken"]
+                device_info = await get_or_create_device_info_for_email(user_id, email)
+                await store_device_info_for_token(user_id, token, device_info)
                 token_index = await set_token(user_id, token, res["user"].get("name", email), email, password)
                 if token_index != -1:
                     await add_token_to_auto_batch(user_id, token_index)
-                await set_user_filters(user_id, token, {"filterNationalityCode": ""})
+                await set_user_filters(user_id, token, {"filterNationalityCode": "", "filterNationalityCodes": ""})
                 user_obj = res.get("user", {})
                 user_obj.update({"email": email, "password": password, "token": token})
                 await set_info_card(user_id, token, format_user_with_nationality(user_obj), email)
@@ -1077,12 +1083,8 @@ async def upload_tg_photo(message: Message) -> Optional[str]:
 
 async def meeff_upload_image(img_bytes: bytes) -> Optional[str]:
     url = "https://api.meeff.com/api/upload/v1"
-    payload = {"category": "profile", "count": 1, "locale": "en"}
-    headers = {
-        'User-Agent': "okhttp/5.0.0-alpha.14",
-        'Accept-Encoding': "gzip",
-        'Content-Type': "application/json; charset=utf-8"
-    }
+    payload = {"category": "profile", "count": 1, "locale": MEEFF_DEFAULT_LOCALE}
+    headers = build_meeff_headers(json_body=True)
     try:
         async with create_meeff_session() as session:
             async with session.post(url, data=json.dumps(payload), headers=headers) as resp:
@@ -1118,7 +1120,11 @@ async def store_token_and_show_card(msg_obj: Message, login_result: Dict, creds:
     user_data = login_result.get("user")
     if access_token and user_data:
         user_id = msg_obj.chat.id
-        token_index = await set_token(user_id, access_token, user_data.get("name", creds.get("email")), creds.get("email"), creds.get("password"))
+        email = creds.get("email")
+        if email:
+            device_info = await get_or_create_device_info_for_email(user_id, email)
+            await store_device_info_for_token(user_id, access_token, device_info)
+        token_index = await set_token(user_id, access_token, user_data.get("name", email), email, creds.get("password"))
         if token_index != -1:
             await add_token_to_auto_batch(user_id, token_index)
         user_data.update({
