@@ -63,6 +63,39 @@ def _is_task_busy(user_id: int) -> bool:
     return task is not None and not task.done()
 
 
+async def _run_fleet_requests_and_record(user_id: int, tokens: List[dict], bot) -> None:
+    """Only start the 24-hour cooldown after the request worker finishes normally."""
+    try:
+        await process_all_tokens(user_id, tokens, bot, user_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Fleet request automation failed for user %s", user_id)
+        return
+    try:
+        for token_obj in tokens:
+            await set_automation_last_request_time(user_id, token_obj["token"])
+        await add_automation_log(user_id, f"Fleet requests completed ({len(tokens)} accounts)")
+    except Exception:
+        logger.exception("Failed to persist fleet automation completion for user %s", user_id)
+
+
+async def _run_account_requests_and_record(user_id: int, token: str, bot) -> None:
+    """Only start the 24-hour cooldown after the request worker finishes normally."""
+    try:
+        await run_requests(user_id, bot, user_id)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception("Request automation failed for user %s", user_id)
+        return
+    try:
+        await set_automation_last_request_time(user_id, token)
+        await add_automation_log(user_id, "Account requests completed")
+    except Exception:
+        logger.exception("Failed to persist account automation completion for user %s", user_id)
+
+
 # =============================================================================
 # WAVE TRACKING  (pid = token so each account has independent wave state)
 # =============================================================================
@@ -175,11 +208,9 @@ async def process_fleet(user_id: int, target_tokens: List[dict], settings: dict,
     )
 
     if needs_requests and not _is_task_busy(user_id):
-        for t in target_tokens:
-            await set_automation_last_request_time(user_id, t["token"])
         await add_automation_log(user_id, f"Fleet requests triggered ({len(target_tokens)} accounts)")
         active_request_tasks[user_id] = asyncio.create_task(
-            process_all_tokens(user_id, target_tokens, bot, user_id)
+            _run_fleet_requests_and_record(user_id, target_tokens, bot)
         )
         anchor_dt = now
     else:
@@ -222,9 +253,10 @@ async def process_account(user_id: int, token_obj: dict, settings: dict, force_r
     should_req = force_run or not last_req_dt or (now - last_req_dt).total_seconds() > 24 * 3600
 
     if should_req and not _is_task_busy(user_id):
-        await set_automation_last_request_time(user_id, token)
         await add_automation_log(user_id, f"[{name}] Requests triggered")
-        active_request_tasks[user_id] = asyncio.create_task(run_requests(user_id, bot, user_id))
+        active_request_tasks[user_id] = asyncio.create_task(
+            _run_account_requests_and_record(user_id, token, bot)
+        )
         last_req_dt = now
 
     if not last_req_dt:

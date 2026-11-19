@@ -1,7 +1,12 @@
+import os
 import asyncio
 import logging
 from datetime import datetime
 from typing import Dict
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import aiohttp
 import html
 from auth import ADMIN_USER_IDS, TEMP_PASSWORD, password_access, is_admin, has_valid_access, grant_password_access
@@ -52,6 +57,10 @@ db_operation_states: Dict[int, Dict[str, str]] = defaultdict(dict)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+API_TOKEN = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN")
+if not API_TOKEN:
+    raise RuntimeError("Set API_TOKEN (or BOT_TOKEN) in the environment before starting the bot")
 
 bot = Bot(token=API_TOKEN)
 router = Router()
@@ -207,6 +216,9 @@ back_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="
 @router.message(Command("password"))
 async def password_command(message: Message):
     try:
+        if not TEMP_PASSWORD:
+            await message.reply("Password access is not configured on this server.")
+            return
         if message.text.split()[1] == TEMP_PASSWORD:
             grant_password_access(message.chat.id, hours=1)
             await message.reply("Access granted for one hour.")

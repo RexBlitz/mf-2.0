@@ -425,7 +425,7 @@ async def redeem_promo_command(message: types.Message):
         return await message.reply("âŒ No accounts found.")
 
     status_msg = await message.reply(
-        f"<b>í ¼í¾Ÿï¸ Redeeming promo code <code>{escaped_code}</code></b> across {len(tokens)} accounts...",
+        f"<b>ï¸ Redeeming promo code <code>{escaped_code}</code></b> across {len(tokens)} accounts...",
         parse_mode="HTML",
     )
 

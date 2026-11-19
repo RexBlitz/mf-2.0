@@ -6,7 +6,10 @@ from typing import Dict, Optional, Tuple, Any
 
 
 # MongoDB connection using the asynchronous Motor client
-client = AsyncIOMotorClient("mongodb+srv://irexanon:12312320Pk..@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB")
+MONGODB_URI = os.getenv("MONGODB_URI")
+if not MONGODB_URI:
+    raise RuntimeError("Set MONGODB_URI in the environment before starting the bot")
+client = AsyncIOMotorClient(MONGODB_URI)
 db = client.meeff_bot
 email_available_col = db["email_available"]
 email_used_col = db["email_used"]

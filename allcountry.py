@@ -48,12 +48,23 @@ async def update_country_filter(session, token, country_code, denied_codes=None)
     )
     try:
         async with session.post(url, json=data, headers=headers, timeout=15) as response:
-            if response.status == 200:
-                logging.info("Switched to country: %s", country_code)
-            else:
+            if response.status != 200:
                 logging.error("Failed to update country %s, status=%s", country_code, response.status)
+                return False
+            try:
+                result = await response.json(content_type=None)
+            except Exception:
+                logging.exception("Could not parse country filter response for %s", country_code)
+                return False
+            if not isinstance(result, dict) or result.get("errorCode"):
+                error = result.get("errorCode") if isinstance(result, dict) else "invalid response"
+                logging.error("Meeff rejected country filter %s: %s", country_code, error)
+                return False
+            logging.info("Switched to country: %s", country_code)
+            return True
     except Exception as e:
         logging.error("Exception updating country filter for %s: %s", country_code, e)
+        return False
 
 
 async def fetch_users(session, token, unreachable_ids):

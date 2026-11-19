@@ -1,8 +1,9 @@
 from datetime import datetime, timedelta
 from typing import Dict
+import os
 
 ADMIN_USER_IDS = {7405203657, 7725409374, 7691399254, 7795345443}
-TEMP_PASSWORD = "11223344"
+TEMP_PASSWORD = os.getenv("TEMP_PASSWORD")
 password_access: Dict[int, datetime] = {}
 
 
