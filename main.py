@@ -1,16 +1,30 @@
 import asyncio
 import logging
-from datetime import datetime, timedelta
-from typing import Dict
+import os
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 import aiohttp
 import html
-from meeff_http import create_meeff_session
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except Exception:
+    pass
+
+from meeff_http import (
+    MEEFF_APP_VERSION,
+    MEEFF_DEFAULT_LOCALE,
+    build_meeff_headers,
+    create_meeff_session,
+    normalize_codes_csv,
+    normalize_single_country,
+)
 from aiogram import Bot, Dispatcher, Router
 from aiogram.filters import Command
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BotCommand, CallbackQuery
 from collections import defaultdict
 from aiogram.exceptions import TelegramBadRequest
-
 
 from db import (
     set_token, resign_token_at_position, get_tokens, set_current_account, get_current_account, delete_token,
@@ -18,43 +32,39 @@ from db import (
     set_user_filters, get_user_filters, get_all_user_filters, set_spam_filter, get_spam_filter,
     is_already_sent, toggle_token_status, get_active_tokens,
     get_token_status, set_account_active, get_info_card,
-    set_individual_spam_filter, get_individual_spam_filter, get_all_spam_filters,get_spam_menu_data,
+    set_individual_spam_filter, get_individual_spam_filter, get_all_spam_filters, get_spam_menu_data,
     list_all_collections, get_collection_summary, connect_to_collection,
     rename_user_collection, transfer_to_user, get_current_collection_info,
     get_spam_record_count, clear_spam_records,
     get_batches, create_batch, toggle_batch_status, set_batch_filter, get_batch_by_name,
     add_token_to_auto_batch, block_user, get_blocked_users, clear_blocked_users,
-    get_automation_settings, set_automation_enabled, set_automation_lounge_message, 
-    set_automation_chatroom_message, set_automation_accounts, add_automation_log, get_automation_log
+    get_automation_settings, set_automation_enabled, set_automation_lounge_message,
+    set_automation_chatroom_message, set_automation_accounts, add_automation_log, get_automation_log,
+    get_user_location, set_user_location,
 )
-# Make sure these other local modules are compatible if they also perform I/O
 from lounge import send_lounge, send_lounge_all_tokens
 from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
 from unsubscribe import unsubscribe_everyone
 from filters import (
-    meeff_filter_command, set_account_filter, get_meeff_filter_main_keyboard, 
-    set_filter, apply_filter_for_account
+    meeff_filter_command, set_account_filter, get_meeff_filter_main_keyboard,
+    set_filter, apply_filter_for_account, handle_filter_text_input,
 )
 from allcountry import run_all_countries
 from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command, user_signup_states
 from friend_requests import run_requests, process_all_tokens, user_states, stop_markup
-# --- NEW IMPORT ---
 from automation import start_automation
 
 # --- Configuration & Setup ---
-API_TOKEN = "7916536914:AAHwtvO8hfGl2U4xcfM1fAjMLNypPFEW5JQ"
-ADMIN_USER_IDS = {7405203657, 7725409374, 7691399254, 7795345443}
-TEMP_PASSWORD = "11223344"
 TARGET_CHANNEL_ID = -1002610862940
-ACCOUNTS_PER_PAGE = 10 # Adjusted for extra button row
+ACCOUNTS_PER_PAGE = 10
 
-password_access: Dict[int, datetime] = {}
 db_operation_states: Dict[int, Dict[str, str]] = defaultdict(dict)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
-bot = Bot(token=API_TOKEN)
+API_TOKEN = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN") or ""
+bot: Optional[Bot] = Bot(token=API_TOKEN) if API_TOKEN else None
 router = Router()
 dp = Dispatcher()
 
@@ -66,11 +76,89 @@ NATIONALITY_LIST = [
     ("AU", "🇦🇺 Australia"), ("IT", "🇮🇹 Italy"), ("ES", "🇪🇸 Spain"), ("ZA", "🇿🇦 South Africa"), ("TR", "🇹🇷 Turkey")
 ]
 
-# --- Utility & Keyboards ---
-def is_admin(user_id: int) -> bool: return user_id in ADMIN_USER_IDS
-def has_valid_access(user_id: int) -> bool:
-    if is_admin(user_id): return True
-    return user_id in password_access and password_access[user_id] > datetime.now()
+LOCATION_PRESETS: List[Tuple[str, str, float, float]] = [
+    ("kr_seoul", "🇰🇷 Seoul", 37.5665, 126.9780),
+    ("jp_tokyo", "🇯🇵 Tokyo", 35.6762, 139.6503),
+    ("us_nyc", "🇺🇸 New York", 40.7128, -74.0060),
+    ("gb_london", "🇬🇧 London", 51.5074, -0.1278),
+    ("fr_paris", "🇫🇷 Paris", 48.8566, 2.3522),
+    ("de_berlin", "🇩🇪 Berlin", 52.5200, 13.4050),
+    ("ph_manila", "🇵🇭 Manila", 14.5995, 120.9842),
+    ("th_bangkok", "🇹🇭 Bangkok", 13.7563, 100.5018),
+    ("BR_sp", "🇧🇷 São Paulo", -23.5505, -46.6333),
+    ("tr_istanbul", "🇹🇷 Istanbul", 41.0082, 28.9784),
+    ("ru_moscow", "🇷🇺 Moscow", 55.7558, 37.6173),
+    ("pk_isb", "🇵🇰 Islamabad", 33.6844, 73.0479),
+]
+LOCATION_PRESET_MAP = {key: (label, lat, lng) for key, label, lat, lng in LOCATION_PRESETS}
+
+
+def get_spoof_location_keyboard() -> InlineKeyboardMarkup:
+    rows: List[List[InlineKeyboardButton]] = []
+    row: List[InlineKeyboardButton] = []
+    for key, label, _, _ in LOCATION_PRESETS:
+        row.append(InlineKeyboardButton(text=label, callback_data=f"spoof_preset:{key}"))
+        if len(row) == 3:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def execute_spoof_location(user_id: int, lat: float, lng: float, label: str = "Custom") -> str:
+    """
+    Save GPS coordinates in DB (used by explore/v4) and push POST /user/updateLocation/v1
+    to all active accounts concurrently.
+    """
+    await set_user_location(user_id, lat, lng, label=label)
+    tokens = await get_active_tokens(user_id)
+    if not tokens:
+        tokens = await get_tokens(user_id)
+
+    if not tokens:
+        return (
+            f"🌍 <b>GPS Location Saved ({html.escape(label)})</b>\n"
+            f"• <b>Coordinates:</b> <code>{lat:.5f}, {lng:.5f}</code>\n\n"
+            f"<i>No accounts found yet — new requests will use these coordinates automatically.</i>"
+        )
+
+    url = "https://api.meeff.com/user/updateLocation/v1"
+    payload = {"lat": float(lat), "lng": float(lng), "locale": MEEFF_DEFAULT_LOCALE}
+
+    async def _update_one(sess: aiohttp.ClientSession, tok_obj: dict) -> Tuple[str, bool, str]:
+        name = tok_obj.get("name", "Account")
+        headers = build_meeff_headers(token=tok_obj["token"], json_body=True)
+        try:
+            async with sess.post(url, json=payload, headers=headers, timeout=15) as resp:
+                body = {}
+                try:
+                    body = await resp.json(content_type=None) or {}
+                except Exception:
+                    pass
+                err = body.get("errorCode") or body.get("errorMessage")
+                if resp.status == 200 and not err:
+                    return name, True, "OK"
+                return name, False, str(err or f"HTTP {resp.status}")
+        except Exception as e:
+            return name, False, str(e)
+
+    async with create_meeff_session() as session:
+        results = await asyncio.gather(*(_update_one(session, t) for t in tokens))
+
+    ok_count = sum(1 for _, ok, _ in results if ok)
+    fail_list = [f"{html.escape(n)} ({html.escape(reason)})" for n, ok, reason in results if not ok]
+
+    lines = [
+        f"🌍 <b>GPS Location Updated — {html.escape(label)}</b>",
+        f"• <b>Coordinates:</b> <code>{lat:.5f}, {lng:.5f}</code>",
+        f"• <b>Accounts Updated:</b> <b>{ok_count}/{len(tokens)}</b>",
+        f"• <b>Explore / Requests GPS:</b> Synced ✅",
+    ]
+    if fail_list:
+        lines.append(f"• <b>Failed:</b> {', '.join(fail_list[:8])}")
+    return "\n".join(lines)
+
 
 async def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
     spam_filters = await get_all_spam_filters(user_id)
@@ -83,14 +171,35 @@ async def get_settings_menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="DB Settings", callback_data="db_settings"), InlineKeyboardButton(text="Back", callback_data="back_to_menu")]
     ])
 
+
+async def _build_exclude_filter_menu(user_id: int) -> tuple[str, InlineKeyboardMarkup]:
+    codes = await get_exclude_filter(user_id)
+    enabled = await get_exclude_filter_enabled(user_id)
+    codes_text = ", ".join(codes) if codes else "None"
+    toggle_label = "✅ Exclude Filter: ON" if enabled else "❌ Exclude Filter: OFF"
+    text = (
+        f"<b>🚫 Custom Exclude Filter</b>\n\n"
+        f"Status: {'<b>ON</b>' if enabled else '<b>OFF</b>'}\n"
+        f"Excluded Nationalities: <code>{codes_text}</code>\n\n"
+        f"Send country codes to exclude (e.g. <code>US, KR, JP</code>)\n"
+        f"Or send <code>clear</code> to remove all."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=toggle_label, callback_data="toggle_exclude_filter")],
+        [InlineKeyboardButton(text="Back", callback_data="settings_menu")],
+    ])
+    return text, markup
+
+
 def get_db_settings_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Connect DB", callback_data="db_connect"), InlineKeyboardButton(text="Rename DB", callback_data="db_rename")], [InlineKeyboardButton(text="View DB", callback_data="db_view"), InlineKeyboardButton(text="Transfer DB", callback_data="db_transfer")], [InlineKeyboardButton(text="Back", callback_data="settings_menu")]])
+
 
 def get_unsubscribe_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Unsubscribe Current", callback_data="unsub_current"), InlineKeyboardButton(text="Unsubscribe All", callback_data="unsub_all")], [InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
 
+
 async def get_spam_filter_menu(user_id: int) -> InlineKeyboardMarkup:
-    # Fetch spam data and blocked users in parallel
     menu_data, blocked_users = await asyncio.gather(
         get_spam_menu_data(user_id),
         get_blocked_users(user_id)
@@ -125,25 +234,26 @@ async def get_spam_filter_menu(user_id: int) -> InlineKeyboardMarkup:
         ]
     ])
 
+
 def get_account_view_menu(account_idx: int, page_idx: int) -> InlineKeyboardMarkup:
-    # MODIFIED: Added page_idx to return button
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="Delete Account", callback_data=f"confirm_delete_{account_idx}|{page_idx}")],
         [InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{page_idx}")]
     ])
 
+
 def get_confirmation_menu(action_type: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes", callback_data=f"confirm_{action_type}"), InlineKeyboardButton(text="Cancel", callback_data="back_to_menu")]])
 
+
 async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
     batches = await get_batches(user_id)
-    tokens = await get_tokens(user_id)
     buttons = []
     for batch in batches:
         batch_name = batch.get("name", "Unnamed")
         is_active = batch.get("active", True)
         status = "ON" if is_active else "OFF"
-        filter_nat = batch.get("filter_nationality", "")
+        filter_nat = normalize_single_country(batch.get("filter_nationality", ""))
         nat_display = f" ({filter_nat})" if filter_nat else " (All)"
 
         buttons.append([
@@ -154,194 +264,227 @@ async def get_batch_management_menu(user_id: int) -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
-def get_batch_filter_menu(batch_name: str) -> InlineKeyboardMarkup:
+
+def get_batch_filter_menu(batch_name: str, current_nat: str = "") -> InlineKeyboardMarkup:
     countries = [
-        ("RU", "Russia"), ("UA", "Ukraine"), ("BY", "Belarus"), ("IR", "Iran"), ("PH", "Philippines"),
-        ("PK", "Pakistan"), ("US", "USA"), ("IN", "India"), ("DE", "Germany"), ("FR", "France"),
-        ("BR", "Brazil"), ("CN", "China"), ("JP", "Japan"), ("KR", "Korea"), ("CA", "Canada"),
-        ("AU", "Australia"), ("IT", "Italy"), ("ES", "Spain"), ("ZA", "South Africa"), ("TR", "Turkey")
+        ("KR", "KR"), ("JP", "JP"), ("US", "US"), ("GB", "GB"),
+        ("RU", "RU"), ("UA", "UA"), ("BY", "BY"), ("TR", "TR"),
+        ("DE", "DE"), ("FR", "FR"), ("ES", "ES"), ("IT", "IT"),
+        ("BR", "BR"), ("CA", "CA"), ("AU", "AU"), ("PH", "PH"),
+        ("PK", "PK"), ("IN", "IN"), ("ID", "ID"), ("VN", "VN"),
+        ("TH", "TH"), ("CN", "CN"), ("IR", "IR"), ("ZA", "ZA"),
     ]
-    buttons = []
-    buttons.append([InlineKeyboardButton(text="All Countries", callback_data=f"batch_nat_all_{batch_name}")])
+    selected = normalize_single_country(current_nat)
+    all_mark = "✅ " if not selected else ""
+    buttons = [[InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_nat_all_{batch_name}")]]
     row = []
-    for i, (code, name) in enumerate(countries):
-        row.append(InlineKeyboardButton(text=code, callback_data=f"batch_nat_{code}_{batch_name}"))
+    for i, (code, label) in enumerate(countries):
+        mark = "✅ " if code == selected else ""
+        row.append(InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"batch_nat_{code}_{batch_name}"))
         if len(row) == 4 or i == len(countries) - 1:
             buttons.append(row)
             row = []
     buttons.append([InlineKeyboardButton(text="Back", callback_data="batch_management")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
+
 start_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Current Request", callback_data="send_request_menu"), InlineKeyboardButton(text="Request All", callback_data="start_all")]])
 send_request_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Start Request", callback_data="start"), InlineKeyboardButton(text="All Countries", callback_data="all_countries")], [InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
 back_markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="back_to_menu")]])
 
-# --- Command Handlers ---
-@router.message(Command("password"))
-async def password_command(message: Message):
-    try:
-        if message.text.split()[1] == TEMP_PASSWORD:
-            password_access[message.chat.id] = datetime.now() + timedelta(hours=1)
-            await message.reply("Access granted for one hour.")
-        else:
-            await message.reply("Incorrect password.")
-    except IndexError: await message.reply("Usage: /password <password>")
-    finally:
-        try: await bot.delete_message(chat_id=message.chat.id, message_id=message.message_id)
-        except Exception as e: logger.error(f"Failed to delete password message: {e}")
 
+# --- Command Handlers ---
 @router.message(Command("start"))
 async def start_command(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized. Use /password to get access.")
     state = user_states.setdefault(message.chat.id, {})
     status = await message.reply("<b>Meeff Bot Dashboard</b>...", reply_markup=start_markup, parse_mode="HTML")
     state.update({"status_message_id": status.message_id, "pinned_message_id": None})
 
+
+@router.message(Command("spoof_loc"))
+async def spoof_loc_command(message: Message):
+    user_id = message.chat.id
+    parts = (message.text or "").strip().split()
+
+    # If user passed /spoof_loc <lat> <lng>
+    if len(parts) >= 3:
+        try:
+            lat = float(parts[1].replace(",", ""))
+            lng = float(parts[2].replace(",", ""))
+            if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
+                raise ValueError("Coordinates out of range")
+        except ValueError:
+            await message.reply(
+                "⚠️ <b>Invalid coordinates.</b>\n"
+                "Usage: <code>/spoof_loc 37.5665 126.9780</code>\n"
+                "Or run <code>/spoof_loc</code> to pick a city preset.",
+                parse_mode="HTML",
+            )
+            return
+
+        status_msg = await message.reply("🌍 <b>Updating GPS location across accounts...</b>", parse_mode="HTML")
+        summary = await execute_spoof_location(user_id, lat, lng, label="Custom GPS")
+        await status_msg.edit_text(summary, reply_markup=get_spoof_location_keyboard(), parse_mode="HTML")
+        return
+
+    # Otherwise show current saved coordinates + city preset buttons
+    cur = await get_user_location(user_id)
+    text = (
+        f"🌍 <b>GPS Location Spoofer</b>\n\n"
+        f"• <b>Current Saved GPS:</b> <code>{cur['lat']:.5f}, {cur['lng']:.5f}</code> ({html.escape(cur.get('label', 'Default'))})\n\n"
+        f"Select a city preset below to update all active accounts &amp; explore requests, "
+        f"or send custom coordinates:\n"
+        f"<code>/spoof_loc 37.5665 126.9780</code>"
+    )
+    await message.reply(text, reply_markup=get_spoof_location_keyboard(), parse_mode="HTML")
+
+
 @router.message(Command("signup"))
 async def signup_cmd(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
     await signup_command(message)
+
 
 @router.message(Command("signup_settings"))
 async def signup_settings_cmd(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
     await signup_settings_command(message)
+
 
 @router.message(Command("signin"))
 async def signin_cmd(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
     from signup import user_signup_states, BACK_TO_SIGNUP
-    # Redirect signin command to the unified email input stage
     user_signup_states[message.from_user.id] = {"stage": "multi_signin_emails"}
     await message.reply("<b>Sign In (Single or Multi)</b>\n\nEnter one or more emails:", reply_markup=BACK_TO_SIGNUP, parse_mode="HTML")
 
+
 @router.message(Command("skip"))
 async def skip_command(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
     await message.reply("<b>Unsubscribe Options</b>...", reply_markup=get_unsubscribe_menu(), parse_mode="HTML")
+
 
 @router.message(Command("send_lounge_all"))
 async def send_lounge_all(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
     parts = message.text.split(maxsplit=1)
-    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/send_lounge_all &lt;message&gt;</code>", parse_mode="HTML")
-    
+    if len(parts) != 2:
+        return await message.reply("<b>Usage</b>\n<code>/send_lounge_all &lt;message&gt;</code>", parse_mode="HTML")
+
     custom_message = parts[1]
     active_tokens_data = await get_active_tokens(user_id)
-    if not active_tokens_data: return await message.reply("No active tokens found.")
+    if not active_tokens_data:
+        return await message.reply("No active tokens found.")
 
     spam_enabled = await get_individual_spam_filter(user_id, "lounge")
     status = await message.reply(f"<b>Starting Lounge Messages</b> for {len(active_tokens_data)} accounts...", parse_mode="HTML")
     await send_lounge_all_tokens(active_tokens_data, custom_message, status, bot, user_id, spam_enabled, user_id)
 
+
 @router.message(Command("lounge"))
 async def lounge_command(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
     token = await get_current_account(user_id)
-    if not token: return await message.reply("No active account found.")
-    
+    if not token:
+        return await message.reply("No active account found.")
+
     parts = message.text.split(maxsplit=1)
-    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/lounge &lt;message&gt;</code>", parse_mode="HTML")
-    
+    if len(parts) != 2:
+        return await message.reply("<b>Usage</b>\n<code>/lounge &lt;message&gt;</code>", parse_mode="HTML")
+
     custom_message = parts[1]
     spam_enabled = await get_individual_spam_filter(user_id, "lounge")
-    status_message = await message.reply(f"<b>Starting Lounge Messaging...</b>", parse_mode="HTML")
+    status_message = await message.reply("<b>Starting Lounge Messaging...</b>", parse_mode="HTML")
     await send_lounge(token, custom_message, status_message, bot, user_id, spam_enabled, user_id)
 
 
 @router.message(Command("chatroom"))
 async def send_to_all_command(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
     token = await get_current_account(user_id)
-    if not token: return await message.reply("No active account found.")
+    if not token:
+        return await message.reply("No active account found.")
 
     parts = message.text.split(maxsplit=1)
-    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/chatroom &lt;message&gt;</code>", parse_mode="HTML")
-    
+    if len(parts) != 2:
+        return await message.reply("<b>Usage</b>\n<code>/chatroom &lt;message&gt;</code>", parse_mode="HTML")
+
     custom_message = parts[1]
     spam_enabled = await get_individual_spam_filter(user_id, "chatroom")
     status_message = await message.reply("<b>Starting Chatroom Messages...</b>", parse_mode="HTML")
 
     sent_ids = await is_already_sent(user_id, "chatroom", None, bulk=True) if spam_enabled else set()
     sent_ids_lock = asyncio.Lock()
-    
+
     total, sent, filtered = await send_message_to_everyone(
         token, custom_message, user_id, spam_enabled, user_id,
         sent_ids, sent_ids_lock
     )
     await status_message.edit_text(f"<b>Complete</b>\nTotal: {total}, Sent: {sent}, Filtered: {filtered}", parse_mode="HTML")
 
+
 @router.message(Command("send_chat_all"))
 async def send_chat_all(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
     parts = message.text.split(maxsplit=1)
-    if len(parts) != 2: return await message.reply("<b>Usage</b>\n<code>/send_chat_all &lt;message&gt;</code>", parse_mode="HTML")
+    if len(parts) != 2:
+        return await message.reply("<b>Usage</b>\n<code>/send_chat_all &lt;message&gt;</code>", parse_mode="HTML")
 
     custom_message = parts[1]
     active_tokens = await get_active_tokens(user_id)
-    if not active_tokens: return await message.reply("No active tokens found.")
+    if not active_tokens:
+        return await message.reply("No active tokens found.")
 
     tokens = [t["token"] for t in active_tokens]
     token_names = {t["token"]: t["name"] for t in active_tokens}
     spam_enabled = await get_individual_spam_filter(user_id, "chatroom")
     status = await message.reply(f"<b>Starting Multi-Account Chatroom ({len(tokens)})...</b>", parse_mode="HTML")
-    
+
     await send_message_to_everyone_all_tokens(
         tokens, custom_message, status, bot, user_id, spam_enabled, token_names, True, user_id
     )
 
+
 @router.message(Command("invoke"))
 async def invoke_command(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
-    
-    # ... (Same invoke logic as before, abbreviated for space)
-    # Default behavior: check active
     active_tokens = await get_active_tokens(user_id)
-    if not active_tokens: return await message.reply("No active accounts.")
+    if not active_tokens:
+        return await message.reply("No active accounts.")
     status_msg = await message.reply("<b>Checking Active Accounts...</b>", parse_mode="HTML")
-    
-    # Simple check logic...
+
     disabled = []
     async with create_meeff_session() as session:
         for t in active_tokens:
             try:
-                headers = {"User-Agent": "okhttp/5.0.0-alpha.14", "meeff-access-token": t["token"]}
-                async with session.get("https://api.meeff.com/facetalk/vibemeet/history/count/v1", params={"locale": "en"}, headers=headers) as resp:
+                headers = build_meeff_headers(token=t["token"], json_body=False)
+                async with session.get("https://api.meeff.com/facetalk/vibemeet/history/count/v1", params={"locale": MEEFF_DEFAULT_LOCALE}, headers=headers, timeout=15) as resp:
                     data = await resp.json(content_type=None)
-                    if data.get("errorCode") == "AuthRequired": disabled.append(t)
-            except: pass
-    
+                    if data.get("errorCode") == "AuthRequired":
+                        disabled.append(t)
+            except Exception:
+                pass
+
     if disabled:
-        for acc in disabled: await delete_token(user_id, acc["token"])
+        for acc in disabled:
+            await delete_token(user_id, acc["token"])
         await status_msg.edit_text(f"<b>Cleanup:</b> Removed {len(disabled)} disabled accounts.", parse_mode="HTML")
     else:
         await status_msg.edit_text("<b>All active accounts operational.</b>", parse_mode="HTML")
 
+
 @router.message(Command("settings"))
 async def settings_command(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
     await message.reply("<b>Settings Menu</b>", reply_markup=await get_settings_menu(message.chat.id), parse_mode="HTML")
 
-@router.message(Command("automation"))
-async def automation_command(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
-    user_id = message.chat.id
-    from db import get_automation_settings
+
+async def build_automation_menu(user_id: int) -> InlineKeyboardMarkup:
     from automation import is_automation_running
     settings = await get_automation_settings(user_id)
     running = is_automation_running(user_id)
     enabled = settings["enabled"] and running
-    
+
     lounge_msg = settings.get("lounge_message", "") or "Not set"
     chatroom_msg = settings.get("chatroom_message", "") or "Not set"
-    
     status_icon = "ON" if enabled else "OFF"
-    
+
     buttons = [
         [InlineKeyboardButton(text=f"Automation: {status_icon}", callback_data="toggle_automation")],
         [InlineKeyboardButton(text=f"Lounge Msg: {lounge_msg[:20]}...", callback_data="auto_set_lounge")],
@@ -350,44 +493,54 @@ async def automation_command(message: Message):
         [InlineKeyboardButton(text="Run Action Now", callback_data="auto_run_action")],
         [InlineKeyboardButton(text="View Log", callback_data="auto_view_log")],
     ]
-    await message.reply("<b>Automation Menu</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@router.message(Command("automation"))
+async def automation_command(message: Message):
+    user_id = message.chat.id
+    markup = await build_automation_menu(user_id)
+    await message.reply("<b>Automation Menu</b>", reply_markup=markup, parse_mode="HTML")
+
 
 @router.message(Command("block"))
 async def block_command(message: Message):
-    if not has_valid_access(message.chat.id): return await message.reply("You are not authorized.")
     args = message.text.split()
-    if len(args) < 2: return await message.reply("Usage: /block meeff_user_id")
+    if len(args) < 2:
+        return await message.reply("Usage: /block meeff_user_id")
     await block_user(message.chat.id, args[1])
-    await message.reply(f"✅ Blocked user: <code>{args[1]}</code>", parse_mode="HTML")
+    await message.reply(f"✅ Blocked user: <code>{html.escape(args[1])}</code>", parse_mode="HTML")
+
 
 @router.message(Command("add"))
 async def add_person_command(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
     args = message.text.strip().split()
-    if len(args) < 2: return await message.reply("Usage: /add <person_id>")
-    
+    if len(args) < 2:
+        return await message.reply("Usage: /add <person_id>")
+
     token = await get_current_account(user_id)
-    if not token: return await message.reply("No active account found.")
+    if not token:
+        return await message.reply("No active account found.")
 
     person_id = args[1]
-    url = f"https://api.meeff.com/user/undoableAnswer/v5/?userId={person_id}&isOkay=1"
-    headers = {"meeff-access-token": token, "Connection": "keep-alive"}
-    
+    url = "https://api.meeff.com/user/undoableAnswer/v5"
+    params = {"userId": person_id, "isOkay": "1", "locale": MEEFF_DEFAULT_LOCALE}
+    headers = build_meeff_headers(token=token, json_body=False)
+
     try:
         async with create_meeff_session() as session:
-            async with session.get(url, headers=headers) as response:
-                data = await response.json()
+            async with session.get(url, params=params, headers=headers, timeout=15) as response:
+                data = await response.json(content_type=None) or {}
                 await message.reply(f"Response: {data.get('errorCode') or 'Success'}")
     except Exception as e:
         await message.reply(f"Error: {e}")
 
+
 @router.message(Command("refresh"))
 async def refresh_tokens_command(message: Message):
     user_id = message.chat.id
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
-
-    from device_info import get_or_create_device_info_for_token, store_device_info_for_token
+    from device_info import get_or_create_device_info_for_account, store_device_info_for_token
 
     all_tokens = await get_tokens(user_id)
     active_tokens = [t for t in all_tokens if t.get("active", True)]
@@ -414,33 +567,24 @@ async def refresh_tokens_command(message: Message):
                 parse_mode="HTML"
             )
 
-            # Build headers with old token (m-auto2 style — no email/password needed)
-            headers = {
-                "User-Agent": "okhttp/5.3.2",
-                "Accept-Encoding": "gzip",
-                "meeff-access-token": old_token,
-                "content-type": "application/json; charset=utf-8",
-            }
+            headers = build_meeff_headers(token=old_token, json_body=True)
 
-            # Warm-up call (m-auto2 style)
             try:
                 async with session.post(
                     "https://api.meeff.com/api/init/v2",
-                    json={"platform": "android", "version": "7.0.5", "locale": "en"},
+                    json={"platform": "android", "version": MEEFF_APP_VERSION, "locale": MEEFF_DEFAULT_LOCALE},
                     headers=headers,
                 ) as resp:
                     await resp.text()
             except Exception as e:
                 logger.warning("Warm-up call failed for %s: %s", name, e)
 
-            # Fetch or create device fingerprint for this token
-            device_info = await get_or_create_device_info_for_token(user_id, old_token)
+            device_info = await get_or_create_device_info_for_account(user_id, old_token, email=email)
             from device_info import get_api_payload_with_device_info
             device_payload = get_api_payload_with_device_info(
-                {"appVersion": "7.0.5", "locale": "en"}, device_info
+                {"appVersion": MEEFF_APP_VERSION, "locale": MEEFF_DEFAULT_LOCALE}, device_info
             )
 
-            # Login call — old token in header, device payload in body
             j: dict = {}
             try:
                 async with session.post(
@@ -448,14 +592,13 @@ async def refresh_tokens_command(message: Message):
                     json=device_payload,
                     headers=headers,
                 ) as resp:
-                    j = await resp.json(content_type=None)
+                    j = await resp.json(content_type=None) or {}
             except Exception as e:
                 logger.error("Login failed for %s: %s", name, e)
                 j = {"errorMessage": str(e)}
 
-            new_token = j.get("accessToken")
+            new_token = j.get("accessToken") or j.get("token")
             if new_token:
-                # Find position in full token list (preserve order — mf-2.0 style)
                 position = next(
                     (i for i, t in enumerate(all_tokens) if t["token"] == old_token), None
                 )
@@ -467,7 +610,6 @@ async def refresh_tokens_command(message: Message):
                             password=token_info.get("password"),
                             filters=token_info.get("filters"),
                         )
-                        # Re-key device info to new token
                         await store_device_info_for_token(user_id, new_token, device_info)
                         success += 1
                     except Exception as e:
@@ -489,7 +631,6 @@ async def refresh_tokens_command(message: Message):
 
             await asyncio.sleep(1)
 
-    # Final summary
     lines = [f"<b>🔄 Refresh Complete</b>\n\n✅ Refreshed: {success}"]
     if banned:
         lines.append(f"🚫 Banned: {banned} — {', '.join(html.escape(n) for n in banned_names)}")
@@ -500,23 +641,50 @@ async def refresh_tokens_command(message: Message):
 
 @router.message()
 async def handle_new_token(message: Message):
-    if message.text and message.text.startswith("/"): return
+    if message.text and message.text.startswith("/"):
+        return
     user_id = message.from_user.id
-    if message.from_user.is_bot: return
-    if await signup_message_handler(message): return
+    if message.from_user.is_bot:
+        return
+    if await signup_message_handler(message):
+        return
+    if await handle_filter_text_input(message):
+        return
 
-    # --- Exclude filter input ---
     signup_state = user_signup_states.get(user_id, {})
-    if signup_state.get("stage") == "set_exclude_filter":
-        text = message.text.strip()
+    stage = signup_state.get("stage")
+    if stage == "set_exclude_filter":
+        text = (message.text or "").strip()
         if text.lower() == "clear":
             await set_exclude_filter(user_id, [])
-            await message.answer("✅ Exclude filter cleared.", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
+            await message.answer(
+                "✅ Exclude filter cleared.",
+                reply_markup=await get_settings_menu(user_id),
+                parse_mode="HTML",
+            )
         else:
-            codes = [c.strip().upper() for c in text.replace(",", " ").split() if c.strip()]
+            csv_codes = normalize_codes_csv(text)
+            codes = [c for c in csv_codes.split(",") if c]
             await set_exclude_filter(user_id, codes)
-            await message.answer(f"✅ Excluded countries set: <code>{', '.join(codes)}</code>", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
+            await set_exclude_filter_enabled(user_id, True)
+            await message.answer(
+                f"✅ <b>Exclude Filter Updated:</b> <code>{', '.join(codes)}</code>",
+                reply_markup=await get_settings_menu(user_id),
+                parse_mode="HTML",
+            )
         user_signup_states.pop(user_id, None)
+        return
+
+    if stage == "auto_set_lounge" and message.text:
+        await set_automation_lounge_message(user_id, message.text.strip())
+        user_signup_states.pop(user_id, None)
+        await message.answer("✅ <b>Lounge message updated.</b>", reply_markup=await build_automation_menu(user_id), parse_mode="HTML")
+        return
+
+    if stage == "auto_set_chatroom" and message.text:
+        await set_automation_chatroom_message(user_id, message.text.strip())
+        user_signup_states.pop(user_id, None)
+        await message.answer("✅ <b>Chatroom message updated.</b>", reply_markup=await build_automation_menu(user_id), parse_mode="HTML")
         return
 
     state = db_operation_states.get(user_id)
@@ -530,19 +698,20 @@ async def handle_new_token(message: Message):
         elif operation == "rename_db":
             success, result_msg = await rename_user_collection(user_id, text)
         elif operation == "transfer_db":
-            try: success, result_msg = await transfer_to_user(user_id, int(text))
-            except ValueError: result_msg = "Invalid user ID."
+            try:
+                success, result_msg = await transfer_to_user(user_id, int(text))
+            except ValueError:
+                result_msg = "Invalid user ID."
         await msg.edit_text(f"<b>{'Success' if success else 'Failed'}</b>: {result_msg}", parse_mode="HTML")
         db_operation_states.pop(user_id, None)
         return
 
-    if not has_valid_access(user_id): return await message.reply("You are not authorized.")
-
     if message.text:
         token_data = message.text.strip().split(" ", 1)
         token = token_data[0]
-        if len(token) < 100: return await message.reply("Invalid token format.")
-        
+        if len(token) < 100:
+            return await message.reply("Invalid token format.")
+
         status_msg = await message.reply("<b>Saving Token...</b>", parse_mode="HTML")
 
         account_name = token_data[1] if len(token_data) > 1 else f"Account {len(await get_tokens(user_id)) + 1}"
@@ -550,6 +719,7 @@ async def handle_new_token(message: Message):
         if token_index != -1:
             await add_token_to_auto_batch(user_id, token_index)
         await status_msg.edit_text(f"✅ <b>Token Saved</b>: '<code>{html.escape(account_name)}</code>'.", parse_mode="HTML")
+
 
 async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int = 0):
     user_id = callback_query.from_user.id
@@ -561,7 +731,7 @@ async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int
         return await callback_query.message.edit_text("<b>No Accounts Found</b>...", reply_markup=back_markup, parse_mode="HTML")
 
     total_pages = (total_accounts + ACCOUNTS_PER_PAGE - 1) // ACCOUNTS_PER_PAGE
-    page_idx = max(0, min(page_idx, total_pages - 1)) 
+    page_idx = max(0, min(page_idx, total_pages - 1))
     start_idx = page_idx * ACCOUNTS_PER_PAGE
     end_idx = min(start_idx + ACCOUNTS_PER_PAGE, total_accounts)
 
@@ -570,20 +740,24 @@ async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int
 
     buttons = []
     for i, tok in enumerate(visible_tokens):
-        global_idx = start_idx + i 
+        global_idx = start_idx + i
         is_current = "🔹" if tok['token'] == current_token else "▫️"
-        
+
         token_filters = all_filters.get(tok['token'], {})
-        nationality_code = token_filters.get("filterNationalityCode", "")
-        
+        nationality_code = normalize_single_country(
+            token_filters.get("filterNationalityCode")
+            if token_filters.get("filterNationalityCode") is not None
+            else token_filters.get("filterNationalityCodes", "")
+        )
+        nat_btn = nationality_code if nationality_code else "All"
+
         account_name = html.escape(tok['name'][:15])
         display_name = f"{account_name}"
 
-        # --- UPDATED BUTTON LAYOUT: Added "Nation" button ---
         buttons.append([
             InlineKeyboardButton(text=f"{is_current} {display_name}", callback_data=f"set_account_{global_idx}|{page_idx}"),
             InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"toggle_status_{global_idx}|{page_idx}"),
-            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"manage_acc_filter|{global_idx}|{page_idx}"),
+            InlineKeyboardButton(text=f"Nation: {nat_btn}", callback_data=f"manage_acc_filter|{global_idx}|{page_idx}"),
             InlineKeyboardButton(text="View", callback_data=f"view_account_{global_idx}|{page_idx}")
         ])
 
@@ -593,23 +767,26 @@ async def show_manage_accounts_menu(callback_query: CallbackQuery, page_idx: int
     pagination_row.append(InlineKeyboardButton(text=f"{page_idx + 1}/{total_pages}", callback_data="noop_page"))
     if page_idx < total_pages - 1:
         pagination_row.append(InlineKeyboardButton(text="Next »", callback_data=f"manage_accounts|{page_idx + 1}"))
-    
-    if pagination_row: buttons.append(pagination_row)
+
+    if pagination_row:
+        buttons.append(pagination_row)
     buttons.append([InlineKeyboardButton(text="Back", callback_data="settings_menu")])
-    
+
     menu_text = f"<b>Manage Accounts (Page {page_idx + 1}/{total_pages})</b>\nCurrently selected: {'Yes' if current_token else 'No'}"
 
     try:
         await callback_query.message.edit_text(menu_text, reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
     except TelegramBadRequest as e:
-        if "message is not modified" not in e.message: logger.error(f"Error editing message: {e}")
+        if "message is not modified" not in e.message:
+            logger.error(f"Error editing message: {e}")
         await callback_query.answer()
 
 
 async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: str):
     user_id = callback_query.from_user.id
     batch = await get_batch_by_name(user_id, batch_name)
-    if not batch: return await callback_query.answer("Batch not found.", show_alert=True)
+    if not batch:
+        return await callback_query.answer("Batch not found.", show_alert=True)
 
     tokens = await get_tokens(user_id)
     token_indices = batch.get("token_indices", [])
@@ -627,13 +804,18 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
         global_index = real_indices[i]
         is_current = "🔹" if tok['token'] == current_token else "▫️"
         token_filters = all_filters.get(tok['token'], {})
-        nationality_code = token_filters.get("filterNationalityCode", "")
+        nationality_code = normalize_single_country(
+            token_filters.get("filterNationalityCode")
+            if token_filters.get("filterNationalityCode") is not None
+            else token_filters.get("filterNationalityCodes", "")
+        )
+        nat_btn = nationality_code if nationality_code else "All"
         account_name = html.escape(tok['name'][:20])
 
         buttons.append([
             InlineKeyboardButton(text=f"{is_current} {account_name}", callback_data=f"batch_select|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="ON" if tok.get('active', True) else "OFF", callback_data=f"batch_toggle|{batch_name}|{global_index}"),
-            InlineKeyboardButton(text=f"Nation: {nationality_code or 'All'}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
+            InlineKeyboardButton(text=f"Nation: {nat_btn}", callback_data=f"batch_acc_filter|{batch_name}|{global_index}"),
             InlineKeyboardButton(text="View", callback_data=f"batch_view|{batch_name}|{global_index}")
         ])
 
@@ -647,47 +829,70 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
 async def callback_handler(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data
-    
+
+    if data.startswith("spoof_preset:"):
+        preset_key = data.split(":", 1)[1]
+        preset = LOCATION_PRESET_MAP.get(preset_key)
+        if not preset:
+            await callback_query.answer("Unknown location preset.", show_alert=True)
+            return
+        label, lat, lng = preset
+        await callback_query.answer(f"Updating GPS to {label}...")
+        summary = await execute_spoof_location(user_id, lat, lng, label=label)
+        try:
+            await callback_query.message.edit_text(
+                summary,
+                reply_markup=get_spoof_location_keyboard(),
+                parse_mode="HTML",
+            )
+        except TelegramBadRequest:
+            pass
+        return
+
     page_idx = 0
     original_data = data
-    
-    # Updated pagination check to exclude new filter commands
-    if "|" in data and not data.startswith(("batch_select|", "batch_toggle|", "batch_view|", "batch_acc_filter|", "batch_acc_nat_", "manage_acc_filter|", "manage_acc_nat_")):
+
+    if "|" in data and not data.startswith((
+        "batch_select|", "batch_toggle|", "batch_view|", "batch_acc_filter|",
+        "batch_acc_nat_", "manage_acc_filter|", "manage_acc_nat_"
+    )):
         data_parts = data.split("|")
         try:
             if len(data_parts) > 1 and data_parts[-1].isdigit():
                 page_idx = int(data_parts[-1])
                 data = "|".join(data_parts[:-1])
-        except ValueError: pass
+        except ValueError:
+            pass
 
-    if await signup_callback_handler(callback_query): return
-    if not has_valid_access(user_id): return await callback_query.answer("You are not authorized.")
-    
+    if await signup_callback_handler(callback_query):
+        return
+
     state = user_states.setdefault(user_id, {})
-    
+
     if data == "manage_accounts":
         await show_manage_accounts_menu(callback_query, page_idx)
-    
-    # --- NEW: Main Menu Account Filter Logic ---
+
+    # --- Single-Country Account Nationality Filter in Manage Accounts ---
     elif data.startswith("manage_acc_filter|"):
-        # Format: manage_acc_filter|{global_index}|{page_idx}
         parts = data.split("|")
         if len(parts) >= 3:
             try:
                 global_index = int(parts[1])
-                # Restore page_idx from the button data so we can go back
-                menu_page_idx = int(parts[2]) 
+                menu_page_idx = int(parts[2])
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
                     token_filters = await get_user_filters(user_id, tok['token']) or {}
-                    current_nat = token_filters.get("filterNationalityCode", "")
-                    
+                    current_nat = normalize_single_country(
+                        token_filters.get("filterNationalityCode")
+                        if token_filters.get("filterNationalityCode") is not None
+                        else token_filters.get("filterNationalityCodes", "")
+                    )
+
                     buttons = []
                     all_mark = "✅ " if not current_nat else ""
-                    # Pass page_idx along to the nation selection
                     buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"manage_acc_nat_all|{global_index}|{menu_page_idx}")])
-                    
+
                     row = []
                     for i, (code, name) in enumerate(NATIONALITY_LIST):
                         mark = "✅ " if current_nat == code else ""
@@ -695,12 +900,11 @@ async def callback_handler(callback_query: CallbackQuery):
                         if len(row) == 2 or i == len(NATIONALITY_LIST) - 1:
                             buttons.append(row)
                             row = []
-                    
-                    # Back button returns to the correct page
+
                     buttons.append([InlineKeyboardButton(text="Back", callback_data=f"manage_accounts|{menu_page_idx}")])
-                    
+
                     await callback_query.message.edit_text(
-                        f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:",
+                        f"<b>Select Nationality Filter for {html.escape(tok['name'])}</b>\nCurrent: <b>{current_nat or 'All Countries'}</b>",
                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
                         parse_mode="HTML"
                     )
@@ -708,7 +912,6 @@ async def callback_handler(callback_query: CallbackQuery):
                 await callback_query.answer("Invalid account.", show_alert=True)
 
     elif data.startswith("manage_acc_nat_"):
-        # Format: manage_acc_nat_{CODE}|{global_index}|{page_idx}
         parts = data.split("|")
         if len(parts) >= 3:
             nat_code = parts[0].replace("manage_acc_nat_", "")
@@ -718,27 +921,20 @@ async def callback_handler(callback_query: CallbackQuery):
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
-                    
+                    final_code = "" if nat_code == "all" else nat_code.upper()
+
                     user_filters = await get_user_filters(user_id, tok['token']) or {}
-                    if nat_code == "all":
-                        user_filters["filterNationalityCode"] = ""
-                        display_text = "All Countries"
-                    else:
-                        user_filters["filterNationalityCode"] = nat_code
-                        display_text = nat_code
-                    
+                    user_filters["filterNationalityCode"] = final_code
+                    user_filters["filterNationalityCodes"] = final_code
                     await set_user_filters(user_id, tok['token'], user_filters)
-                    
-                    if await apply_filter_for_account(tok['token'], user_id):
-                        await callback_query.answer(f"Filter set to {display_text}")
-                    else:
-                        await callback_query.answer("Saved, but API update failed.", show_alert=True)
-                    
-                    # Return to the correct page in Manage Accounts
+
+                    ok = await apply_filter_for_account(tok['token'], user_id)
+                    await callback_query.answer(
+                        f"Filter set to {final_code or 'All Countries'}" if ok else "Saved locally (API failed)"
+                    )
                     await show_manage_accounts_menu(callback_query, menu_page_idx)
             except (ValueError, IndexError):
                 await callback_query.answer("Invalid account.", show_alert=True)
-    # -------------------------------------------
 
     elif data == "db_settings":
         current_info = await get_current_collection_info(user_id)
@@ -757,12 +953,14 @@ async def callback_handler(callback_query: CallbackQuery):
         await callback_query.message.edit_text(f"<b>Confirm:</b> Unsubscribe {confirm_text}?", reply_markup=get_confirmation_menu(data), parse_mode="HTML")
     elif data == "confirm_unsub_current":
         token = await get_current_account(user_id)
-        if not token: return await callback_query.message.edit_text("No active account found.", reply_markup=back_markup, parse_mode="HTML")
+        if not token:
+            return await callback_query.message.edit_text("No active account found.", reply_markup=back_markup, parse_mode="HTML")
         msg = await callback_query.message.edit_text("<b>Unsubscribing Current Account...</b>", parse_mode="HTML")
         await unsubscribe_everyone(token, status_message=msg, bot=bot, chat_id=user_id, user_id=user_id)
     elif data == "confirm_unsub_all":
         active_tokens = await get_active_tokens(user_id)
-        if not active_tokens: return await callback_query.message.edit_text("No active accounts found.", reply_markup=back_markup, parse_mode="HTML")
+        if not active_tokens:
+            return await callback_query.message.edit_text("No active accounts found.", reply_markup=back_markup, parse_mode="HTML")
         msg = await callback_query.message.edit_text(f"<b>Unsubscribing All Accounts ({len(active_tokens)})...</b>", parse_mode="HTML")
         for i, token_obj in enumerate(active_tokens, 1):
             await msg.edit_text(f"Processing account {i}/{len(active_tokens)}: {html.escape(token_obj['name'])}", parse_mode="HTML")
@@ -771,55 +969,37 @@ async def callback_handler(callback_query: CallbackQuery):
     elif data == "send_request_menu":
         await callback_query.message.edit_text("<b>Send Request Options</b>", reply_markup=send_request_markup, parse_mode="HTML")
     elif data == "exclude_filter_menu":
-        codes = await get_exclude_filter(user_id)
-        enabled = await get_exclude_filter_enabled(user_id)
-        codes_text = ", ".join(codes) if codes else "None"
-        toggle_label = "✅ Enabled" if enabled else "❌ Disabled"
-        await callback_query.message.edit_text(
-            f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
-            f"<b>Status:</b> {'<b>Enabled</b>' if enabled else '<b>Disabled</b>'}\n"
-            f"<b>Current excluded:</b> <code>{codes_text}</code>\n\n"
-            f"Send country codes to set (comma separated, e.g. <code>US, KR, JP</code>)\nOr send <code>clear</code> to remove all.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=toggle_label, callback_data="toggle_exclude_filter")],
-                [InlineKeyboardButton(text="Back", callback_data="settings_menu")]
-            ]),
-            parse_mode="HTML"
-        )
+        text, markup = await _build_exclude_filter_menu(user_id)
+        await callback_query.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
         user_signup_states[user_id] = {"stage": "set_exclude_filter"}
 
     elif data == "toggle_exclude_filter":
-        enabled = await get_exclude_filter_enabled(user_id)
-        await set_exclude_filter_enabled(user_id, not enabled)
-        # Re-render the menu with updated status
-        codes = await get_exclude_filter(user_id)
-        new_enabled = not enabled
-        codes_text = ", ".join(codes) if codes else "None"
-        toggle_label = "✅ Enabled" if new_enabled else "❌ Disabled"
-        await callback_query.message.edit_text(
-            f"<b>🚫 Exclude Filter</b>\n\nRequests will <b>not</b> be sent to users from these countries.\n\n"
-            f"<b>Status:</b> {'<b>Enabled</b>' if new_enabled else '<b>Disabled</b>'}\n"
-            f"<b>Current excluded:</b> <code>{codes_text}</code>\n\n"
-            f"Send country codes to set (comma separated, e.g. <code>US, KR, JP</code>)\nOr send <code>clear</code> to remove all.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text=toggle_label, callback_data="toggle_exclude_filter")],
-                [InlineKeyboardButton(text="Back", callback_data="settings_menu")]
-            ]),
-            parse_mode="HTML"
-        )
-        await callback_query.answer("✅ ON" if new_enabled else "❌ OFF")
+        new_enabled = not (await get_exclude_filter_enabled(user_id))
+        await set_exclude_filter_enabled(user_id, new_enabled)
+        text, markup = await _build_exclude_filter_menu(user_id)
+        await callback_query.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+        await callback_query.answer(f"Exclude Filter {'ON' if new_enabled else 'OFF'}")
 
     elif data == "settings_menu":
+        user_signup_states.pop(user_id, None)
         await callback_query.message.edit_text("<b>Settings Menu</b>", reply_markup=await get_settings_menu(user_id), parse_mode="HTML")
     elif data == "show_filters":
-        await callback_query.message.edit_text("<b>Filter Settings</b>", reply_markup=await get_meeff_filter_main_keyboard(user_id), parse_mode="HTML")
-    elif data in ("toggle_request_filter", "meeff_filter_main") or data.startswith(("account_filter_", "account_gender_", "account_age_", "account_nationality_")):
+        await callback_query.message.edit_text(
+            "<b>Meeff Filter Settings</b>\n\nSelect an account to configure filters:",
+            reply_markup=await get_meeff_filter_main_keyboard(user_id),
+            parse_mode="HTML",
+        )
+    elif data.startswith("noop_"):
+        await callback_query.answer()
+    elif data in ("toggle_request_filter", "meeff_filter_main") or data.startswith(("flt_", "account_filter_", "account_gender_", "account_age_", "account_nationality_")):
         await set_account_filter(callback_query)
-    
+
     # --- ACCOUNT MANAGEMENT ---
     elif data.startswith("view_account_"):
-        try: idx = int(data.split("_")[-1])
-        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            return await callback_query.answer("Invalid account index.", show_alert=True)
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             token_obj = tokens[idx]
@@ -836,33 +1016,41 @@ async def callback_handler(callback_query: CallbackQuery):
                 if password:
                     details += f"\n<b>Password:</b> <code>{html.escape(password)}</code>"
             await callback_query.message.edit_text(details, reply_markup=get_account_view_menu(idx, page_idx), parse_mode="HTML", disable_web_page_preview=True)
-            
+
     elif data.startswith("confirm_delete_"):
-        try: idx = int(data.split("_")[-1])
-        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            return await callback_query.answer("Invalid account index.", show_alert=True)
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
-            await callback_query.message.edit_text(f"<b>Confirm Deletion</b> of <code>{html.escape(tokens[idx]['name'])}</code>?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Delete", callback_data=f"delete_account_{idx}|{page_idx}"), InlineKeyboardButton(text="Cancel", callback_data=f"manage_accounts|{page_idx}")]]) , parse_mode="HTML")
+            await callback_query.message.edit_text(f"<b>Confirm Deletion</b> of <code>{html.escape(tokens[idx]['name'])}</code>?", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Delete", callback_data=f"delete_account_{idx}|{page_idx}"), InlineKeyboardButton(text="Cancel", callback_data=f"manage_accounts|{page_idx}")]]), parse_mode="HTML")
 
     elif data.startswith("toggle_status_"):
-        try: idx = int(data.split("_")[-1])
-        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            return await callback_query.answer("Invalid account index.", show_alert=True)
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await toggle_token_status(user_id, tokens[idx]["token"])
             await show_manage_accounts_menu(callback_query, page_idx)
-    
+
     elif data.startswith("set_account_"):
-        try: idx = int(data.split("_")[-1])
-        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            return await callback_query.answer("Invalid account index.", show_alert=True)
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await set_current_account(user_id, tokens[idx]["token"])
             await show_manage_accounts_menu(callback_query, page_idx)
-            
+
     elif data.startswith("delete_account_"):
-        try: idx = int(data.split("_")[-1])
-        except ValueError: return await callback_query.answer("Invalid account index.", show_alert=True)
+        try:
+            idx = int(data.split("_")[-1])
+        except ValueError:
+            return await callback_query.answer("Invalid account index.", show_alert=True)
         tokens = await get_tokens(user_id)
         if 0 <= idx < len(tokens):
             await delete_token(user_id, tokens[idx]["token"])
@@ -870,28 +1058,26 @@ async def callback_handler(callback_query: CallbackQuery):
 
     elif data == "noop_page":
         await callback_query.answer("You are on this page.")
-    
+
     elif data == "view_blocked_users":
-        from db import get_blocked_users
         blocked = await get_blocked_users(user_id)
         if not blocked:
             return await callback_query.message.edit_text("<b>No blocked users</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="spam_filter_menu")]]), parse_mode="HTML")
         blocked_list = "\n".join([f"<code>{uid}</code>" for uid in sorted(list(blocked))[:50]])
         await callback_query.message.edit_text(f"<b>Blocked Users ({len(blocked)})</b>\n\n{blocked_list}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data="spam_filter_menu")]]), parse_mode="HTML")
-    
+
     elif data == "confirm_clear_blocked":
         await callback_query.message.edit_text("<b>Clear all blocked users?</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Yes, Clear", callback_data="clear_blocked_confirm")], [InlineKeyboardButton(text="Cancel", callback_data="spam_filter_menu")]]), parse_mode="HTML")
-    
+
     elif data == "clear_blocked_confirm":
-        from db import clear_blocked_users
         await clear_blocked_users(user_id)
         await callback_query.answer("✅ All blocked users cleared!")
         await callback_query.message.edit_text("<b>Spam Filters</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
-    
+
     # --- AUTOMATION CALLBACKS ---
     elif data.startswith(("toggle_automation", "auto_set_lounge", "auto_set_chatroom", "auto_select_accounts", "auto_acc_", "auto_run_action", "auto_view_log", "back_to_automation")):
         from automation import start_automation, stop_automation, is_automation_running, run_automation_action
-        
+
         if data == "toggle_automation":
             settings = await get_automation_settings(user_id)
             running = is_automation_running(user_id)
@@ -905,19 +1091,21 @@ async def callback_handler(callback_query: CallbackQuery):
                 await set_automation_enabled(user_id, True)
                 start_automation(user_id, bot)
                 await callback_query.answer("Automation started!")
-        
+
         elif data == "auto_set_lounge":
+            user_signup_states[user_id] = {"stage": "auto_set_lounge"}
             await callback_query.message.edit_text("<b>Set Lounge Message</b>\n\nType the message you want to auto-send in lounge:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_to_automation")]]))
-        
+
         elif data == "auto_set_chatroom":
+            user_signup_states[user_id] = {"stage": "auto_set_chatroom"}
             await callback_query.message.edit_text("<b>Set Chatroom Message</b>\n\nType the message you want to auto-send in chatroom:", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Cancel", callback_data="back_to_automation")]]))
-        
+
         elif data == "auto_select_accounts":
             settings = await get_automation_settings(user_id)
             selected = settings.get("selected_accounts", "all")
-            
+
             mark_current = "✅ " if selected == "current" else ""
-            mark_active  = "✅ " if selected == "active_only" else ""
+            mark_active = "✅ " if selected in ("all", "active_only") else ""
 
             buttons = [
                 [InlineKeyboardButton(text=f"{mark_current}Current Account", callback_data="auto_acc_current")],
@@ -925,33 +1113,32 @@ async def callback_handler(callback_query: CallbackQuery):
                 [InlineKeyboardButton(text="Back", callback_data="back_to_automation")]
             ]
             await callback_query.message.edit_text("<b>Select Automation Accounts</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-        
-       # --- OPTION 1: CURRENT ---
+
         elif data == "auto_acc_current":
             await set_automation_accounts(user_id, "current")
             await callback_query.answer("Current account selected!")
             callback_query.data = "auto_select_accounts"
             await callback_handler(callback_query)
-        
-       # --- OPTION 2: ALL ACTIVE ---
+
         elif data == "auto_acc_active":
-            await set_automation_accounts(user_id, "active_only")
-            await callback_query.answer("Active accounts selected!")
+            await set_automation_accounts(user_id, "all")
+            await callback_query.answer("All active accounts selected!")
             callback_query.data = "auto_select_accounts"
             await callback_handler(callback_query)
-        
+
         elif data == "auto_run_action":
             status_msg = await callback_query.message.edit_text("<b>Starting automation...</b>", parse_mode="HTML")
             asyncio.create_task(run_automation_action(user_id, status_msg))
-        
+
         elif data == "auto_view_log":
             log_entries = await get_automation_log(user_id)
             log_text = "\n".join([f"<code>{e['time']}</code> {html.escape(e['text'])}" for e in log_entries[-15:]]) if log_entries else "<i>No automation activity yet.</i>"
             await callback_query.message.edit_text(f"<b>Automation Log</b>\n\n{log_text}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Refresh", callback_data="auto_view_log"), InlineKeyboardButton(text="Back", callback_data="back_to_automation")]]), parse_mode="HTML")
-        
+
         elif data == "back_to_automation":
-            await automation_command(callback_query.message)
-    
+            user_signup_states.pop(user_id, None)
+            await callback_query.message.edit_text("<b>Automation Menu</b>", reply_markup=await build_automation_menu(user_id), parse_mode="HTML")
+
     # --- SPAM FILTER MANAGEMENT ---
     elif data == "spam_filter_menu":
         await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
@@ -959,7 +1146,8 @@ async def callback_handler(callback_query: CallbackQuery):
         filter_type = data.split("_")[-1]
         if filter_type == "all":
             new_status = not any((await get_all_spam_filters(user_id)).values())
-            for ft in ["chatroom", "request", "lounge"]: await set_individual_spam_filter(user_id, ft, new_status)
+            for ft in ["chatroom", "request", "lounge"]:
+                await set_individual_spam_filter(user_id, ft, new_status)
         else:
             await set_individual_spam_filter(user_id, filter_type, not await get_individual_spam_filter(user_id, filter_type))
         await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
@@ -972,7 +1160,7 @@ async def callback_handler(callback_query: CallbackQuery):
         await clear_spam_records(user_id, data.split("_")[-1])
         await callback_query.answer("Cleared.")
         await callback_query.message.edit_text("<b>Spam Filter Settings</b>", reply_markup=await get_spam_filter_menu(user_id), parse_mode="HTML")
-    
+
     # --- BATCH MANAGEMENT ---
     elif data == "batch_management":
         await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
@@ -987,7 +1175,8 @@ async def callback_handler(callback_query: CallbackQuery):
             if 0 <= idx < len(tokens):
                 await set_current_account(user_id, tokens[idx]["token"])
                 await show_batch_accounts_menu(callback_query, batch_name)
-        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
+        except Exception:
+            await callback_query.answer("Invalid data.", show_alert=True)
     elif data.startswith("batch_toggle|"):
         try:
             _, batch_name, idx_str = original_data.split("|", 2)
@@ -996,7 +1185,8 @@ async def callback_handler(callback_query: CallbackQuery):
             if 0 <= idx < len(tokens):
                 await toggle_token_status(user_id, tokens[idx]["token"])
                 await show_batch_accounts_menu(callback_query, batch_name)
-        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
+        except Exception:
+            await callback_query.answer("Invalid data.", show_alert=True)
     elif data.startswith("batch_view|"):
         try:
             _, batch_name, idx_str = original_data.split("|", 2)
@@ -1007,14 +1197,15 @@ async def callback_handler(callback_query: CallbackQuery):
                 info = await get_info_card(user_id, token_obj["token"])
                 text = f"<b>Name:</b> {html.escape(token_obj.get('name','N/A'))}\n<b>Status:</b> {'Active' if token_obj.get('active', True) else 'Inactive'}\n\n{info or '<code>' + html.escape(token_obj['token']) + '</code>'}"
                 await callback_query.message.edit_text(text, parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")]]))
-        except Exception: await callback_query.answer("Invalid data.", show_alert=True)
+        except Exception:
+            await callback_query.answer("Invalid data.", show_alert=True)
     elif data.startswith("toggle_batch_"):
         batch_name = data.replace("toggle_batch_", "")
         if await toggle_batch_status(user_id, batch_name):
             await callback_query.answer("Toggled.")
             await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
-    
-    # --- BATCH ACCOUNT FILTER LOGIC ---
+
+    # --- Single-Country Batch Account Nationality Filter ---
     elif data.startswith("batch_acc_filter|"):
         parts = data.split("|")
         if len(parts) >= 3:
@@ -1025,12 +1216,13 @@ async def callback_handler(callback_query: CallbackQuery):
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
                     token_filters = await get_user_filters(user_id, tok['token']) or {}
-                    current_nat = token_filters.get("filterNationalityCode", "")
-                    
-                    buttons = []
-                    all_mark = "✅ " if not current_nat else ""
-                    buttons.append([InlineKeyboardButton(text=f"{all_mark}All Countries", callback_data=f"batch_acc_nat_all|{batch_name}|{global_index}")])
-                    
+                    current_nat = normalize_single_country(
+                        token_filters.get("filterNationalityCode")
+                        if token_filters.get("filterNationalityCode") is not None
+                        else token_filters.get("filterNationalityCodes", "")
+                    )
+
+                    buttons = [[InlineKeyboardButton(text=f"{'✅ ' if not current_nat else ''}All Countries", callback_data=f"batch_acc_nat_all|{batch_name}|{global_index}")]]
                     row = []
                     for i, (code, name) in enumerate(NATIONALITY_LIST):
                         mark = "✅ " if current_nat == code else ""
@@ -1039,8 +1231,13 @@ async def callback_handler(callback_query: CallbackQuery):
                             buttons.append(row)
                             row = []
                     buttons.append([InlineKeyboardButton(text="Back", callback_data=f"view_batch_{batch_name}")])
-                    await callback_query.message.edit_text(f"<b>Filter for {html.escape(tok['name'])}</b>\n\nCurrent: <b>{current_nat or 'All'}</b>\nSelect nationality:", reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons), parse_mode="HTML")
-            except (ValueError, IndexError): await callback_query.answer("Invalid account.", show_alert=True)
+                    await callback_query.message.edit_text(
+                        f"<b>Select Nationality Filter for {html.escape(tok['name'])}</b>\nCurrent: <b>{current_nat or 'All Countries'}</b>",
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+                        parse_mode="HTML",
+                    )
+            except (ValueError, IndexError):
+                await callback_query.answer("Invalid account.", show_alert=True)
 
     elif data.startswith("batch_acc_nat_"):
         parts = data.split("|")
@@ -1052,55 +1249,62 @@ async def callback_handler(callback_query: CallbackQuery):
                 tokens = await get_tokens(user_id)
                 if 0 <= global_index < len(tokens):
                     tok = tokens[global_index]
+                    final_code = "" if nat_code == "all" else nat_code.upper()
                     user_filters = await get_user_filters(user_id, tok['token']) or {}
-                    if nat_code == "all":
-                        user_filters["filterNationalityCode"] = ""
-                        display_text = "All Countries"
-                    else:
-                        user_filters["filterNationalityCode"] = nat_code
-                        display_text = nat_code
+                    user_filters["filterNationalityCode"] = final_code
+                    user_filters["filterNationalityCodes"] = final_code
                     await set_user_filters(user_id, tok['token'], user_filters)
-                    if await apply_filter_for_account(tok['token'], user_id):
-                        await callback_query.answer(f"Filter set to {display_text}")
-                    else:
-                        await callback_query.answer("Saved, but API update failed.", show_alert=True)
+                    ok = await apply_filter_for_account(tok['token'], user_id)
+                    await callback_query.answer(
+                        f"Filter set to {final_code or 'All Countries'}" if ok else "Saved locally (API failed)"
+                    )
                     await show_batch_accounts_menu(callback_query, batch_name)
-            except (ValueError, IndexError): await callback_query.answer("Invalid account.", show_alert=True)
-    
+            except (ValueError, IndexError):
+                await callback_query.answer("Invalid account.", show_alert=True)
+
     elif data.startswith("batch_filter_"):
         batch_name = data.replace("batch_filter_", "")
-        await callback_query.message.edit_text(f"<b>Set Filter for {batch_name}</b>\n\nSelect nationality filter:", reply_markup=get_batch_filter_menu(batch_name), parse_mode="HTML")
+        batch = await get_batch_by_name(user_id, batch_name)
+        cur_nat = normalize_single_country(batch.get("filter_nationality", "")) if batch else ""
+        await callback_query.message.edit_text(
+            f"<b>Select Nationality Filter for {html.escape(batch_name)}</b>\nCurrent: <b>{cur_nat or 'All Countries'}</b>",
+            reply_markup=get_batch_filter_menu(batch_name, cur_nat),
+            parse_mode="HTML",
+        )
 
     elif data.startswith("batch_nat_"):
         parts = data.split("_")
-        if len(parts) >= 3:
+        if len(parts) >= 4:
             nat_code = parts[2]
             batch_name = "_".join(parts[3:])
-            if nat_code == "all": nat_code = ""
-            await set_batch_filter(user_id, batch_name, nat_code)
+            final_code = "" if nat_code == "all" else nat_code.upper()
+            await set_batch_filter(user_id, batch_name, final_code)
             batch = await get_batch_by_name(user_id, batch_name)
             if batch:
                 tokens = await get_tokens(user_id)
                 token_indices = batch.get("token_indices", [])
                 count = 0
                 for idx in token_indices:
-                    if idx < len(tokens):
+                    if 0 <= idx < len(tokens):
                         tok = tokens[idx]
                         u_filters = await get_user_filters(user_id, tok['token']) or {}
-                        u_filters["filterNationalityCode"] = nat_code
+                        u_filters["filterNationalityCode"] = final_code
+                        u_filters["filterNationalityCodes"] = final_code
                         await set_user_filters(user_id, tok['token'], u_filters)
-                        await apply_filter_for_account(tok['token'], user_id)
-                        count += 1
-                await callback_query.answer(f"Applied to {count} accounts!")
+                        if await apply_filter_for_account(tok['token'], user_id):
+                            count += 1
+                await callback_query.answer(f"Applied ({final_code or 'All'}) to {count}/{len(token_indices)} accounts!")
             await callback_query.message.edit_text("<b>Batch Management</b>", reply_markup=await get_batch_management_menu(user_id), parse_mode="HTML")
 
     elif data == "back_to_menu":
         await callback_query.message.edit_text("<b>Meeff Bot Dashboard</b>", reply_markup=start_markup, parse_mode="HTML")
-        
+
     elif data in ("start", "start_all", "stop", "all_countries"):
-        if data in ("start", "start_all", "all_countries") and state.get("running"): return await callback_query.answer("Already running!")
-        if data == "stop" and not state.get("running"): return await callback_query.answer("Not running!")
-        
+        if data in ("start", "start_all", "all_countries") and state.get("running"):
+            return await callback_query.answer("Already running!")
+        if data == "stop" and not state.get("running"):
+            return await callback_query.answer("Not running!")
+
         if data == "start":
             msg = await callback_query.message.edit_text("<b>Initializing Requests...</b>", reply_markup=stop_markup, parse_mode="HTML")
             state.update({"running": True, "status_message_id": msg.message_id, "pinned_message_id": msg.message_id})
@@ -1108,7 +1312,8 @@ async def callback_handler(callback_query: CallbackQuery):
             asyncio.create_task(run_requests(user_id, bot, TARGET_CHANNEL_ID))
         elif data == "start_all":
             tokens = await get_active_tokens(user_id)
-            if not tokens: return await callback_query.answer("No active tokens.", show_alert=True)
+            if not tokens:
+                return await callback_query.answer("No active tokens.", show_alert=True)
             msg = await callback_query.message.edit_text(f"🔄 <b>AIO Starting ({len(tokens)})...</b>", reply_markup=stop_markup, parse_mode="HTML")
             state.update({"running": True, "status_message_id": msg.message_id, "pinned_message_id": msg.message_id})
             asyncio.create_task(process_all_tokens(user_id, tokens, bot, TARGET_CHANNEL_ID, initial_status_message=msg))
@@ -1121,17 +1326,26 @@ async def callback_handler(callback_query: CallbackQuery):
             await bot.pin_chat_message(chat_id=user_id, message_id=msg.message_id)
             asyncio.create_task(run_all_countries(user_id, state, bot, get_current_account))
 
+
 async def set_bot_commands():
     commands = [BotCommand(command=c, description=d) for c, d in [
-        ("start", "Start the bot"), ("lounge", "Send message in the lounge"),
-        ("send_lounge_all", "Send lounge message to all accounts"), ("chatroom", "Send message in chatrooms"),
-        ("send_chat_all", "Send chatroom message to all accounts"), ("invoke", "Remove disabled accounts"),
-        ("skip", "Unsubscribe from chats"), ("settings", "Bot settings"),
-        ("add", "Add a person by ID"), ("signup", "Create a Meeff account"),
-        ("automation", "Automation settings"), ("block", "Block user from meeff"),
+        ("start", "Start the bot"),
+        ("lounge", "Send message in the lounge"),
+        ("send_lounge_all", "Send lounge message to all accounts"),
+        ("chatroom", "Send message in chatrooms"),
+        ("send_chat_all", "Send chatroom message to all accounts"),
+        ("invoke", "Remove disabled accounts"),
+        ("skip", "Unsubscribe from chats"),
+        ("settings", "Bot settings"),
+        ("add", "Add a person by ID"),
+        ("signup", "Create a Meeff account"),
+        ("automation", "Automation settings"),
+        ("block", "Block user from meeff"),
         ("refresh", "Refresh tokens for all active accounts"),
-        ("password", "Enter password for access")]]
+        ("spoof_loc", "🌍 Update GPS location"),
+    ]]
     await bot.set_my_commands(commands)
+
 
 async def resume_automation_tasks():
     """Checks all users in DB and restarts automation if it was ON."""
@@ -1139,7 +1353,6 @@ async def resume_automation_tasks():
         collections = await list_all_collections()
         count = 0
         for col in collections:
-            # Extract user_id from "user_12345"
             try:
                 user_id = int(col['collection_name'].replace("user_", ""))
                 settings = await get_automation_settings(user_id)
@@ -1153,18 +1366,24 @@ async def resume_automation_tasks():
     except Exception as e:
         logger.error(f"Failed to resume tasks: {e}")
 
+
 async def main():
+    global bot
+    if bot is None:
+        token = os.getenv("API_TOKEN") or os.getenv("BOT_TOKEN") or ""
+        if not token:
+            raise RuntimeError("API_TOKEN environment variable is required to start the Telegram bot.")
+        bot = Bot(token=token)
     try:
         await set_bot_commands()
-        
-        # --- RESUME TASKS ---
         await resume_automation_tasks()
-        
+
         dp.include_router(router)
         logger.info("Starting bot polling...")
         await dp.start_polling(bot)
     except Exception as e:
         logger.error(f"Failed to start bot: {e}", exc_info=True)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

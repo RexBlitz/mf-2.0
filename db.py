@@ -8,6 +8,8 @@ from typing import Dict, Optional, Tuple, Any
 # MongoDB connection using the asynchronous Motor client
 client = AsyncIOMotorClient("mongodb+srv://irexanon:12312320Pk..@rexdb.d9rwo.mongodb.net/?retryWrites=true&w=majority&appName=RexDB")
 db = client.meeff_bot
+email_available_col = db["email_available"]
+email_used_col = db["email_used"]
 
 async def get_user_collection(user_id: int):
     """
@@ -507,6 +509,70 @@ async def set_exclude_filter_enabled(telegram_user_id: int, enabled: bool):
         upsert=True
     )
 
+async def get_custom_exclude_enabled(telegram_user_id: int) -> bool:
+    """Returns whether bot-side (custom) nationality skipping is active (defaults to True)."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    doc = await col.find_one({"type": "settings"})
+    if not doc:
+        return True
+    return bool(doc.get("custom_exclude_enabled", True))
+
+async def set_custom_exclude_enabled(telegram_user_id: int, enabled: bool):
+    """Toggle bot-side (custom) nationality skipping on or off."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "settings"},
+        {"$set": {"custom_exclude_enabled": bool(enabled)}},
+        upsert=True
+    )
+
+async def get_request_filter_enabled(telegram_user_id: int) -> bool:
+    """Returns whether Meeff server filter syncing is enabled (defaults to True)."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    doc = await col.find_one({"type": "settings"})
+    if not doc:
+        return True
+    return bool(doc.get("request_filter_enabled", True))
+
+async def set_request_filter_enabled(telegram_user_id: int, enabled: bool):
+    """Persist whether Meeff server filter syncing is enabled."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "settings"},
+        {"$set": {"request_filter_enabled": bool(enabled)}},
+        upsert=True
+    )
+
+async def get_user_location(telegram_user_id: int, default_lat: float = 29.6264544, default_lng: float = 71.9140141) -> dict:
+    """Return user's saved GPS coordinates for explore/v4 and /spoof_loc."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    doc = await col.find_one({"type": "settings"})
+    if doc and "spoof_lat" in doc and "spoof_lng" in doc:
+        try:
+            return {
+                "lat": float(doc["spoof_lat"]),
+                "lng": float(doc["spoof_lng"]),
+                "label": doc.get("spoof_label", "Custom"),
+            }
+        except (TypeError, ValueError):
+            pass
+    return {"lat": float(default_lat), "lng": float(default_lng), "label": "Default"}
+
+async def set_user_location(telegram_user_id: int, lat: float, lng: float, label: str = "Custom"):
+    """Persist user's chosen GPS coordinates in settings."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "settings"},
+        {"$set": {"spoof_lat": float(lat), "spoof_lng": float(lng), "spoof_label": str(label)}},
+        upsert=True
+    )
+
 async def get_spam_filter(telegram_user_id: int) -> bool:
     await _ensure_user_collection_exists(telegram_user_id)
     settings = await _get_user_collection(telegram_user_id).find_one({"type": "settings"})
@@ -728,6 +794,7 @@ async def set_batch_filter(telegram_user_id: int, batch_name: str, nationality_c
                 if 0 <= idx < len(tokens):
                     filters = await get_user_filters(telegram_user_id, tokens[idx]["token"]) or {}
                     filters["filterNationalityCode"] = nationality_code
+                    filters["filterNationalityCodes"] = nationality_code
                     await set_user_filters(telegram_user_id, tokens[idx]["token"], filters)
 
             await user_db.update_one(
