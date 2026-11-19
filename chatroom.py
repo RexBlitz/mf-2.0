@@ -1,26 +1,21 @@
 import aiohttp
 import asyncio
-from meeff_http import (
-    MEEFF_DEFAULT_LOCALE,
-    MEEFF_USER_AGENT,
-    build_meeff_headers,
-    create_meeff_session,
-)
+from meeff_http import create_meeff_session
 import logging
 import html
 from aiogram import Bot, types
 from typing import List, Dict, Set
-from db import is_already_sent, bulk_add_sent_ids, get_blocked_users
+from db import is_already_sent, bulk_add_sent_ids
 
 # --- Constants ---
 CHATROOM_URL = "https://api.meeff.com/chatroom/dashboard/v1"
 MORE_CHATROOMS_URL = "https://api.meeff.com/chatroom/more/v1"
 SEND_MESSAGE_URL = "https://api.meeff.com/chat/send/v2"
 BASE_HEADERS = {
-    'User-Agent': MEEFF_USER_AGENT,
+    # Using the updated User-Agent for better compatibility
+    'User-Agent': "okhttp/5.1.0",
     'Accept-Encoding': "gzip",
-    'Accept': "application/json",
-    'Content-Type': "application/json; charset=utf-8"
+    'content-type': "application/json; charset=utf-8"
 }
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,28 +24,33 @@ logger = logging.getLogger(__name__)
 # --- Core API Functions (with Session Management) ---
 
 async def fetch_chatrooms(session: aiohttp.ClientSession, token: str, from_date: str = None, user_id: int = None) -> tuple[List[Dict], str | None]:
-    """Fetches chatrooms using Meeff v7.1.7 headers."""
+    """Fetches the initial list of chatrooms using a provided session and simplified headers."""
     url = CHATROOM_URL if not from_date else MORE_CHATROOMS_URL
-    params = {'locale': MEEFF_DEFAULT_LOCALE}
+    params = {'locale': "en"}
     if from_date:
         params['fromDate'] = from_date
     
-    headers = build_meeff_headers(token=token, json_body=bool(from_date))
+    # --- SIMPLIFIED HEADERS ---
+    headers = BASE_HEADERS.copy()
+    headers['meeff-access-token'] = token
+    # --------------------------
     
     try:
         if from_date:
+            # Note: The MORE_CHATROOMS_URL endpoint uses a POST request with JSON payload
             async with session.post(url, json=params, headers=headers, timeout=10) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch more chatrooms: {response.status}")
                     return [], None
-                data = await response.json(content_type=None)
+                data = await response.json()
                 return data.get("rooms", []), data.get("next")
         else:
+            # The initial CHATROOM_URL endpoint uses a GET request with query params
             async with session.get(url, params=params, headers=headers, timeout=10) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch chatrooms: {response.status}")
                     return [], None
-                data = await response.json(content_type=None)
+                data = await response.json()
                 return data.get("rooms", []), data.get("next")
     except Exception as e:
         logger.error(f"Error fetching chatrooms: {e}")
@@ -58,10 +58,14 @@ async def fetch_chatrooms(session: aiohttp.ClientSession, token: str, from_date:
 
 
 async def send_single_message(session: aiohttp.ClientSession, token: str, chatroom_id: str, message: str, user_id: int = None) -> bool:
-    """Sends a single message to a chatroom using Meeff v7.1.7 headers."""
-    headers = build_meeff_headers(token=token, json_body=True)
+    """Sends a single message to a chatroom using a provided session and simplified headers."""
     
-    payload = {"chatRoomId": chatroom_id, "message": message, "locale": MEEFF_DEFAULT_LOCALE}
+    # --- SIMPLIFIED HEADERS ---
+    headers = BASE_HEADERS.copy()
+    headers['meeff-access-token'] = token
+    # --------------------------
+    
+    payload = {"chatRoomId": chatroom_id, "message": message, "locale": "en"}
     try:
         async with session.post(SEND_MESSAGE_URL, json=payload, headers=headers, timeout=10) as response:
             if response.status == 200:
@@ -96,36 +100,21 @@ async def send_message(session: aiohttp.ClientSession, token: str, chatroom_id: 
 
 # --- Processing Logic ---
 
-def _is_room_blocked(room: Dict, blocked_ids: Set[str]) -> bool:
-    if not blocked_ids:
-        return False
-    if room.get("_id") in blocked_ids:
-        return True
-    for key in ("users", "members", "participants"):
-        for u in room.get(key) or []:
-            if isinstance(u, dict) and u.get("_id") in blocked_ids:
-                return True
-            elif isinstance(u, str) and u in blocked_ids:
-                return True
-    return False
-
-
 async def process_chatroom_batch(
     session: aiohttp.ClientSession, token: str, rooms: List[Dict], message: str,
-    chat_id: int, spam_enabled: bool, sent_ids: Set[str], sent_ids_lock: asyncio.Lock,
-    user_id: int = None, blocked_ids: Set[str] = None
+    chat_id: int, spam_enabled: bool, sent_ids: Set[str], sent_ids_lock: asyncio.Lock, user_id: int = None
 ) -> tuple[int, int, int]:
     """Processes a batch of chatrooms concurrently."""
     filtered_rooms = []
-    async with sent_ids_lock:
-        for room in rooms:
-            rid = room.get('_id')
-            if blocked_ids and _is_room_blocked(room, blocked_ids):
-                continue
-            if spam_enabled and rid in sent_ids:
-                continue
-            filtered_rooms.append(room)
+    if spam_enabled:
+        async with sent_ids_lock:
+            for room in rooms:
+                if room.get('_id') not in sent_ids:
+                    filtered_rooms.append(room)
+    else:
+        filtered_rooms = rooms
 
+    # user_id is passed but unused inside send_message now
     tasks = [send_message(session, token, room.get('_id'), message, user_id) for room in filtered_rooms]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     
@@ -143,23 +132,21 @@ async def process_chatroom_batch(
 
 async def send_message_to_everyone(
     token: str, message: str, chat_id: int, spam_enabled: bool, user_id: int,
-    sent_ids: Set[str], sent_ids_lock: asyncio.Lock, status_entry: Dict = None,
-    blocked_ids: Set[str] = None
+    sent_ids: Set[str], sent_ids_lock: asyncio.Lock, status_entry: Dict = None
 ) -> tuple[int, int, int]:
     """Main logic for sending messages for a single token."""
     total_rooms, sent_count, filtered_count = 0, 0, 0
     from_date = None
-    if blocked_ids is None and user_id is not None:
-        blocked_ids = await get_blocked_users(user_id)
     
     async with create_meeff_session() as session:
         while True:
+            # user_id is passed to fetch_chatrooms but is unused inside now
             rooms, next_from = await fetch_chatrooms(session, token, from_date, user_id)
             if not rooms:
                 break
 
             batch_total, batch_sent, batch_filtered = await process_chatroom_batch(
-                session, token, rooms, message, chat_id, spam_enabled, sent_ids, sent_ids_lock, user_id, blocked_ids=blocked_ids
+                session, token, rooms, message, chat_id, spam_enabled, sent_ids, sent_ids_lock, user_id
             )
             total_rooms += batch_total
             sent_count += batch_sent
@@ -187,7 +174,6 @@ async def send_message_to_everyone_all_tokens(
     
     # Shared state for all workers to prevent race conditions
     sent_ids = await is_already_sent(chat_id, "chatroom", None, bulk=True) if use_in_memory_deduplication and spam_enabled else set()
-    blocked_ids = await get_blocked_users(user_id)
     sent_ids_lock = asyncio.Lock()
     running = True
 
@@ -197,9 +183,10 @@ async def send_message_to_everyone_all_tokens(
         token_status[token] = status_entry
 
         try:
+            # user_id is passed but unused inside the API wrappers now
             await send_message_to_everyone(
                 token, message, chat_id, spam_enabled, user_id,
-                sent_ids, sent_ids_lock, status_entry, blocked_ids=blocked_ids
+                sent_ids, sent_ids_lock, status_entry
             )
             status_entry['status'] = "Done"
         except Exception as e:

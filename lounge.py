@@ -1,39 +1,34 @@
 import asyncio
 import aiohttp
 import logging
-from meeff_http import (
-    MEEFF_DEFAULT_LOCALE,
-    MEEFF_USER_AGENT,
-    build_meeff_headers,
-    create_meeff_session,
-)
+from meeff_http import create_meeff_session
 from typing import List, Dict, Set
 from aiogram import types
-from db import bulk_add_sent_ids, get_blocked_users, is_already_sent
+from db import bulk_add_sent_ids, is_already_sent
 
 LOUNGE_URL = "https://api.meeff.com/lounge/dashboard/v1"
 CHATROOM_URL = "https://api.meeff.com/chatroom/open/v2"
 SEND_MESSAGE_URL = "https://api.meeff.com/chat/send/v2"
 BASE_HEADERS = {
-    'User-Agent': MEEFF_USER_AGENT,
+    'User-Agent': "okhttp/4.12.0",
     'Accept-Encoding': "gzip",
-    'Accept': "application/json",
-    'Content-Type': "application/json; charset=utf-8",
+    'content-type': "application/json; charset=utf-8",
 }
 
 # Configure logging
 logger = logging.getLogger(__name__)
 
 async def fetch_lounge_users(session: aiohttp.ClientSession, token: str, user_id: int) -> List[Dict]:
-    """Fetch users from lounge with a persistent session using Meeff v7.1.7 headers."""
-    headers = build_meeff_headers(token=token, json_body=False)
+    """Fetch users from lounge with a persistent session using simplified headers."""
+    headers = BASE_HEADERS.copy()
+    headers['meeff-access-token'] = token
     
     try:
-        async with session.get(LOUNGE_URL, params={'locale': MEEFF_DEFAULT_LOCALE}, headers=headers, timeout=10) as response:
+        async with session.get(LOUNGE_URL, params={'locale': "en"}, headers=headers, timeout=10) as response:
             if response.status != 200:
                 logger.warning(f"Failed to fetch lounge users (Status: {response.status})")
                 return []
-            data = await response.json(content_type=None)
+            data = await response.json()
             return data.get("both", [])
     except Exception as e:
         logger.error(f"Error fetching lounge users: {str(e)}")
@@ -42,12 +37,13 @@ async def fetch_lounge_users(session: aiohttp.ClientSession, token: str, user_id
 async def open_chatroom_and_send(
     session: aiohttp.ClientSession, token: str, target_meeff_id: str, message: str, telegram_user_id: int
 ) -> bool:
-    headers = build_meeff_headers(token=token, json_body=True)
+    headers = BASE_HEADERS.copy()
+    headers['meeff-access-token'] = token
     
     # 1. Open Chatroom
     chatroom_id = None
     try:
-        payload = {"waitingRoomId": target_meeff_id, "locale": MEEFF_DEFAULT_LOCALE}
+        payload = {"waitingRoomId": target_meeff_id, "locale": "en"}
         async with session.post(CHATROOM_URL, json=payload, headers=headers, timeout=10) as response:
             if response.status == 412:
                 logger.info(f"User {target_meeff_id} has disabled chat.")
@@ -55,7 +51,7 @@ async def open_chatroom_and_send(
             if response.status != 200:
                 logger.warning(f"Failed to open chatroom with {target_meeff_id} (Status: {response.status})")
                 return False
-            data = await response.json(content_type=None)
+            data = await response.json()
             chatroom_id = data.get("chatRoom", {}).get("_id")
     except Exception as e:
         logger.error(f"Error opening chatroom with {target_meeff_id}: {e}")
@@ -73,7 +69,7 @@ async def open_chatroom_and_send(
     any_message_sent = False
     for i, msg_part in enumerate(messages_to_send):
         try:
-            payload = {"chatRoomId": chatroom_id, "message": msg_part, "locale": MEEFF_DEFAULT_LOCALE}
+            payload = {"chatRoomId": chatroom_id, "message": msg_part, "locale": "en"}
             async with session.post(SEND_MESSAGE_URL, json=payload, headers=headers, timeout=10) as response:
                 if response.status == 200:
                     any_message_sent = True 
@@ -134,9 +130,6 @@ async def send_lounge(
     total_sent = 0
     total_filtered = 0
     sent_ids = await is_already_sent(chat_id, "lounge", None, bulk=True) if spam_enabled else set()
-    blocked_ids = await get_blocked_users(user_id)
-    if blocked_ids:
-        sent_ids.update(blocked_ids)
     processing_ids = set()
     lock = asyncio.Lock()
 
@@ -197,9 +190,6 @@ async def send_lounge_all_tokens(
     }
     
     sent_ids = await is_already_sent(chat_id, "lounge", None, bulk=True) if spam_enabled else set()
-    blocked_ids = await get_blocked_users(user_id)
-    if blocked_ids:
-        sent_ids.update(blocked_ids)
     processing_ids = set()
     lock = asyncio.Lock()
     running = True

@@ -6,4 +6,4 @@ cachetools
 motor
 requests
 
-python-dotenv
+dotenv

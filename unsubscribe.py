@@ -1,12 +1,7 @@
 import asyncio
 import aiohttp
 import logging
-from meeff_http import (
-    MEEFF_DEFAULT_LOCALE,
-    MEEFF_USER_AGENT,
-    build_meeff_headers,
-    create_meeff_session,
-)
+from meeff_http import create_meeff_session
 from aiogram import Bot, types
 from aiogram.exceptions import TelegramBadRequest
 from device_info import get_or_create_device_info_for_token, get_headers_with_device_info
@@ -16,10 +11,9 @@ UNSUBSCRIBE_URL = "https://api.meeff.com/chatroom/unsubscribe/v1"
 CHATROOM_URL = "https://api.meeff.com/chatroom/dashboard/v1"
 MORE_CHATROOMS_URL = "https://api.meeff.com/chatroom/more/v1"
 BASE_HEADERS = {
-    'User-Agent': MEEFF_USER_AGENT,
+    'User-Agent': "okhttp/4.12.0",
     'Accept-Encoding': "gzip",
-    'Accept': "application/json",
-    'Content-Type': "application/json; charset=utf-8"
+    'content-type': "application/json; charset=utf-8"
 }
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
@@ -29,27 +23,28 @@ logger = logging.getLogger(__name__)
 
 async def _fetch_chatroom_batch(session, token, from_date=None, user_id=None):
     """Fetches a single batch of chatrooms using a persistent session."""
-    headers = build_meeff_headers(token=token, json_body=bool(from_date))
+    headers = BASE_HEADERS.copy()
+    headers['meeff-access-token'] = token
     if user_id:
-        device_info = await get_or_create_device_info_for_token(user_id, token)
+        device_info = get_or_create_device_info_for_token(user_id, token)
         headers = get_headers_with_device_info(headers, device_info)
 
     try:
         if from_date:
-            payload = {"fromDate": from_date, "locale": MEEFF_DEFAULT_LOCALE}
+            payload = {"fromDate": from_date, "locale": "en"}
             async with session.post(MORE_CHATROOMS_URL, json=payload, headers=headers, timeout=15) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch more chatrooms: {response.status}")
                     return [], None
-                data = await response.json(content_type=None)
+                data = await response.json()
                 return data.get("rooms", []), data.get("next")
         else:
-            params = {'locale': MEEFF_DEFAULT_LOCALE}
+            params = {'locale': "en"}
             async with session.get(CHATROOM_URL, params=params, headers=headers, timeout=15) as response:
                 if response.status != 200:
                     logger.error(f"Failed to fetch initial chatrooms: {response.status}")
                     return [], None
-                data = await response.json(content_type=None)
+                data = await response.json()
                 return data.get("rooms", []), data.get("next")
     except Exception as e:
         logger.error(f"Exception while fetching chatrooms: {e}")
@@ -58,12 +53,13 @@ async def _fetch_chatroom_batch(session, token, from_date=None, user_id=None):
 
 async def _unsubscribe_from_room(session, token, chatroom_id, user_id=None):
     """Unsubscribes from a single chatroom using a persistent session."""
-    headers = build_meeff_headers(token=token, json_body=True)
+    headers = BASE_HEADERS.copy()
+    headers['meeff-access-token'] = token
     if user_id:
-        device_info = await get_or_create_device_info_for_token(user_id, token)
+        device_info = get_or_create_device_info_for_token(user_id, token)
         headers = get_headers_with_device_info(headers, device_info)
     
-    payload = {"chatRoomId": chatroom_id, "locale": MEEFF_DEFAULT_LOCALE}
+    payload = {"chatRoomId": chatroom_id, "locale": "en"}
     try:
         async with session.post(UNSUBSCRIBE_URL, json=payload, headers=headers, timeout=10) as response:
             if response.status == 200:
