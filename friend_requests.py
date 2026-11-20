@@ -19,7 +19,7 @@ from db import (
     get_exclude_filter,
     get_exclude_filter_enabled,
     get_individual_spam_filter,
-    get_user_location,
+    get_token_location,
 )
 from filters import apply_filter_for_account, is_request_filter_enabled_async
 from meeff_http import MEEFF_DEFAULT_LOCALE, build_meeff_headers, create_meeff_session
@@ -34,7 +34,7 @@ PER_ERROR_DELAY = 5.0          # ExploreHandler$2$1.onError generic retry = 5000
 REQUEST_EXCEEDED_BACKOFF = 20.0
 DEFAULT_LAT = 29.6264544
 DEFAULT_LNG = 71.9140141
-MAX_UNREACHABLE_WINDOW = 80    # Rolling IDs sent in unreachableUserIds to avoid URL bloat
+MAX_UNREACHABLE_WINDOW = 150   # Rolling IDs sent in unreachableUserIds to avoid re-fetching skipped users
 
 
 class AuthRequiredError(Exception):
@@ -390,12 +390,12 @@ async def run_requests(user_id, bot, target_channel_id):
     already_sent_ids = await get_already_sent_ids(user_id, "request") if is_spam_enabled else set()
     blocked_ids = await get_blocked_users(user_id)
     exclude_codes = set(await get_exclude_filter(user_id)) if await get_exclude_filter_enabled(user_id) else set()
-    loc = await get_user_location(user_id, DEFAULT_LAT, DEFAULT_LNG)
+    loc = await get_token_location(user_id, token, DEFAULT_LAT, DEFAULT_LNG)
     user_lat, user_lng = loc["lat"], loc["lng"]
 
     lock = asyncio.Lock()
     unreachable_ids: Deque[str] = deque(maxlen=MAX_UNREACHABLE_WINDOW)
-    filter_synced = False
+    need_filter_refresh = True
     consecutive_empty = 0
 
     filter_enabled = await is_request_filter_enabled_async(user_id)
@@ -415,7 +415,7 @@ async def run_requests(user_id, bot, target_channel_id):
                         logging.error("Status update error: %s", e)
 
                 # Custom logic: apply filter before each 7-user explore batch to refresh pool
-                if filter_enabled:
+                if filter_enabled and need_filter_refresh:
                     await apply_filter_for_account(token, user_id, session=session)
                     await asyncio.sleep(0.3)
 
@@ -431,7 +431,8 @@ async def run_requests(user_id, bot, target_channel_id):
 
                 if not users:
                     consecutive_empty += 1
-                    if consecutive_empty > 5:
+                    need_filter_refresh = (consecutive_empty % 2 == 0)
+                    if consecutive_empty > 8:
                         await bot.edit_message_text(
                             chat_id=user_id,
                             message_id=state["status_message_id"],
@@ -443,7 +444,7 @@ async def run_requests(user_id, bot, target_channel_id):
                     continue
 
                 consecutive_empty = 0
-                await process_users(
+                batch_added, _ = await process_users(
                     session,
                     users,
                     token,
@@ -457,6 +458,7 @@ async def run_requests(user_id, bot, target_channel_id):
                     blocked_ids=blocked_ids,
                     is_spam_filter_enabled=is_spam_enabled,
                 )
+                need_filter_refresh = batch_added > 0
                 await asyncio.sleep(PER_BATCH_DELAY)
 
             except AuthRequiredError as e:
@@ -548,9 +550,6 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
     persisted_sent_ids = await get_already_sent_ids(user_id, "request") if is_spam_enabled else set()
     blocked_ids = await get_blocked_users(user_id)
     exclude_codes = set(await get_exclude_filter(user_id)) if await get_exclude_filter_enabled(user_id) else set()
-    loc = await get_user_location(user_id, DEFAULT_LAT, DEFAULT_LNG)
-    user_lat, user_lng = loc["lat"], loc["lng"]
-
     filter_enabled = await is_request_filter_enabled_async(user_id)
     cross_account_seen = set()
     cross_lock = asyncio.Lock()
@@ -561,18 +560,21 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
         token = token_obj["token"]
         name = token_status[token]["name"]
+        loc = await get_token_location(user_id, token, DEFAULT_LAT, DEFAULT_LNG)
+        user_lat, user_lng = loc["lat"], loc["lng"]
         account_sent_ids = set()
         lock = asyncio.Lock()
         unreachable_ids: Deque[str] = deque(maxlen=MAX_UNREACHABLE_WINDOW)
         consecutive_empty = 0
         req_exceeded_hits = 0
+        need_filter_refresh = True
 
         connector = aiohttp.TCPConnector(limit=10)
         async with create_meeff_session(connector=connector) as session:
             while state["running"]:
                 try:
                     # Custom logic: apply filter before every 7-user explore batch to refresh pool
-                    if filter_enabled:
+                    if filter_enabled and need_filter_refresh:
                         await apply_filter_for_account(token, user_id, session=session)
                         await asyncio.sleep(0.3)
 
@@ -587,7 +589,8 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
                     if not users:
                         consecutive_empty += 1
-                        if consecutive_empty > 5:
+                        need_filter_refresh = (consecutive_empty % 2 == 0)
+                        if consecutive_empty > 8:
                             token_status[token]["status"] = "No Users"
                             token_status[token]["error"] = ""
                             return
@@ -619,6 +622,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
 
                     token_status[token]["added"] += batch_added
                     token_status[token]["filtered"] += batch_filtered
+                    need_filter_refresh = batch_added > 0
                     await asyncio.sleep(PER_BATCH_DELAY)
 
                 except AuthRequiredError as e:
@@ -641,9 +645,9 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
                     req_exceeded_hits += 1
                     token_status[token]["status"] = e.short_label
                     token_status[token]["error"] = str(e)
-                    if req_exceeded_hits >= 3:
+                    if req_exceeded_hits >= 6:
                         return
-                    await asyncio.sleep(REQUEST_EXCEEDED_BACKOFF)
+                    await asyncio.sleep(min(REQUEST_EXCEEDED_BACKOFF * req_exceeded_hits, 60.0))
 
                 except ApiResponseError as e:
                     logging.warning("API error on %s: %s", name, e)

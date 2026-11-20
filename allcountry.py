@@ -115,7 +115,7 @@ async def run_all_countries(user_id, state, bot, get_current_account):
         get_exclude_filter,
         get_exclude_filter_enabled,
         get_individual_spam_filter,
-        get_user_location,
+        get_token_location,
     )
 
     token = await get_current_account(user_id)
@@ -132,7 +132,7 @@ async def run_all_countries(user_id, state, bot, get_current_account):
     already_sent_ids = await get_already_sent_ids(user_id, "request") if is_spam_enabled else set()
     blocked_ids = await get_blocked_users(user_id)
     client_exclude_codes = set(await get_exclude_filter(user_id)) if await get_exclude_filter_enabled(user_id) else set()
-    loc = await get_user_location(user_id, DEFAULT_LAT, DEFAULT_LNG)
+    loc = await get_token_location(user_id, token, DEFAULT_LAT, DEFAULT_LNG)
     user_lat, user_lng = loc["lat"], loc["lng"]
 
     active_countries = [c for c in countries if c not in client_exclude_codes]
@@ -145,7 +145,7 @@ async def run_all_countries(user_id, state, bot, get_current_account):
         )
         return
 
-    unreachable_ids = deque(maxlen=80)
+    unreachable_ids = deque(maxlen=150)
     async with create_meeff_session() as session:
         country_index = 0
         state["total_added_friends"] = 0

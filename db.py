@@ -564,7 +564,7 @@ async def get_user_location(telegram_user_id: int, default_lat: float = 29.62645
     return {"lat": float(default_lat), "lng": float(default_lng), "label": "Default"}
 
 async def set_user_location(telegram_user_id: int, lat: float, lng: float, label: str = "Custom"):
-    """Persist user's chosen GPS coordinates in settings."""
+    """Persist user's chosen global GPS coordinates in settings."""
     await _ensure_user_collection_exists(telegram_user_id)
     col = _get_user_collection(telegram_user_id)
     await col.update_one(
@@ -572,6 +572,54 @@ async def set_user_location(telegram_user_id: int, lat: float, lng: float, label
         {"$set": {"spoof_lat": float(lat), "spoof_lng": float(lng), "spoof_label": str(label)}},
         upsert=True
     )
+
+async def set_token_location(telegram_user_id: int, token: str, lat: float, lng: float, label: str = "Custom"):
+    """Persist explore GPS coordinates on a specific account token."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "tokens", "items.token": token},
+        {"$set": {
+            "items.$.lat": float(lat),
+            "items.$.lng": float(lng),
+            "items.$.loc_label": str(label),
+        }},
+    )
+
+async def clear_token_location(telegram_user_id: int, token: str):
+    """Remove per-account explore GPS override so account falls back to global location."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    await col.update_one(
+        {"type": "tokens", "items.token": token},
+        {"$unset": {"items.$.lat": "", "items.$.lng": "", "items.$.loc_label": ""}},
+    )
+
+async def get_token_location(
+    telegram_user_id: int,
+    token: str,
+    default_lat: float = 29.6264544,
+    default_lng: float = 71.9140141,
+) -> dict:
+    """Return explore GPS coordinates for a specific token, falling back to global user location."""
+    await _ensure_user_collection_exists(telegram_user_id)
+    col = _get_user_collection(telegram_user_id)
+    doc = await col.find_one({"type": "tokens", "items.token": token}, {"items.$": 1})
+    if doc and doc.get("items"):
+        item = doc["items"][0]
+        if "lat" in item and "lng" in item:
+            try:
+                return {
+                    "lat": float(item["lat"]),
+                    "lng": float(item["lng"]),
+                    "label": item.get("loc_label", "Custom"),
+                    "is_custom": True,
+                }
+            except (TypeError, ValueError):
+                pass
+    base = await get_user_location(telegram_user_id, default_lat, default_lng)
+    base["is_custom"] = False
+    return base
 
 async def get_spam_filter(telegram_user_id: int) -> bool:
     await _ensure_user_collection_exists(telegram_user_id)

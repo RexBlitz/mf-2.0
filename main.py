@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import random
 from datetime import datetime
 from typing import Dict, List, Optional, Tuple
 import aiohttp
@@ -40,7 +41,7 @@ from db import (
     add_token_to_auto_batch, block_user, get_blocked_users, clear_blocked_users,
     get_automation_settings, set_automation_enabled, set_automation_lounge_message,
     set_automation_chatroom_message, set_automation_accounts, add_automation_log, get_automation_log,
-    get_user_location, set_user_location,
+    get_user_location, set_user_location, set_token_location,
 )
 from lounge import send_lounge, send_lounge_all_tokens
 from chatroom import send_message_to_everyone, send_message_to_everyone_all_tokens
@@ -51,7 +52,7 @@ from filters import (
 )
 from allcountry import run_all_countries
 from signup import signup_command, signup_callback_handler, signup_message_handler, signup_settings_command, user_signup_states
-from friend_requests import run_requests, process_all_tokens, user_states, stop_markup
+from friend_requests import run_requests, process_all_tokens, user_states, stop_markup, DEFAULT_LAT, DEFAULT_LNG
 from automation import start_automation
 
 # --- Configuration & Setup ---
@@ -76,87 +77,52 @@ NATIONALITY_LIST = [
     ("AU", "🇦🇺 Australia"), ("IT", "🇮🇹 Italy"), ("ES", "🇪🇸 Spain"), ("ZA", "🇿🇦 South Africa"), ("TR", "🇹🇷 Turkey")
 ]
 
-LOCATION_PRESETS: List[Tuple[str, str, float, float]] = [
-    ("kr_seoul", "🇰🇷 Seoul", 37.5665, 126.9780),
-    ("jp_tokyo", "🇯🇵 Tokyo", 35.6762, 139.6503),
-    ("us_nyc", "🇺🇸 New York", 40.7128, -74.0060),
-    ("gb_london", "🇬🇧 London", 51.5074, -0.1278),
-    ("fr_paris", "🇫🇷 Paris", 48.8566, 2.3522),
-    ("de_berlin", "🇩🇪 Berlin", 52.5200, 13.4050),
-    ("ph_manila", "🇵🇭 Manila", 14.5995, 120.9842),
-    ("th_bangkok", "🇹🇭 Bangkok", 13.7563, 100.5018),
-    ("BR_sp", "🇧🇷 São Paulo", -23.5505, -46.6333),
-    ("tr_istanbul", "🇹🇷 Istanbul", 41.0082, 28.9784),
-    ("ru_moscow", "🇷🇺 Moscow", 55.7558, 37.6173),
-    ("pk_isb", "🇵🇰 Islamabad", 33.6844, 73.0479),
+USA_CITIES: List[Tuple[str, float, float]] = [
+    ("New York", 40.7128, -74.0060),
+    ("Los Angeles", 34.0522, -118.2437),
+    ("Chicago", 41.8781, -87.6298),
+    ("Houston", 29.7604, -95.3698),
+    ("Miami", 25.7617, -80.1918),
+    ("Seattle", 47.6062, -122.3321),
+    ("Dallas", 32.7767, -96.7970),
+    ("Atlanta", 33.7490, -84.3880),
+    ("Boston", 42.3601, -71.0589),
+    ("Phoenix", 33.4484, -112.0740),
+    ("San Diego", 32.7157, -117.1611),
+    ("Denver", 39.7392, -104.9903),
+    ("Austin", 30.2672, -97.7431),
+    ("Orlando", 28.5383, -81.3792),
+    ("Las Vegas", 36.1699, -115.1398),
 ]
-LOCATION_PRESET_MAP = {key: (label, lat, lng) for key, label, lat, lng in LOCATION_PRESETS}
 
 
-def get_spoof_location_keyboard() -> InlineKeyboardMarkup:
-    rows: List[List[InlineKeyboardButton]] = []
-    row: List[InlineKeyboardButton] = []
-    for key, label, _, _ in LOCATION_PRESETS:
-        row.append(InlineKeyboardButton(text=label, callback_data=f"spoof_preset:{key}"))
-        if len(row) == 3:
-            rows.append(row)
-            row = []
-    if row:
-        rows.append(row)
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-async def execute_spoof_location(user_id: int, lat: float, lng: float, label: str = "Custom") -> str:
-    """
-    Save GPS coordinates in DB (used by explore/v4) and push POST /user/updateLocation/v1
-    to all active accounts concurrently.
-    """
-    await set_user_location(user_id, lat, lng, label=label)
+async def assign_usa_locations(user_id: int) -> str:
     tokens = await get_active_tokens(user_id)
     if not tokens:
         tokens = await get_tokens(user_id)
 
+    cities = list(USA_CITIES)
+    random.shuffle(cities)
+
+    first_city, first_lat, first_lng = cities[0]
+    await set_user_location(user_id, first_lat, first_lng, label=f"🇺🇸 {first_city}")
+
     if not tokens:
-        return (
-            f"🌍 <b>GPS Location Saved ({html.escape(label)})</b>\n"
-            f"• <b>Coordinates:</b> <code>{lat:.5f}, {lng:.5f}</code>\n\n"
-            f"<i>No accounts found yet — new requests will use these coordinates automatically.</i>"
-        )
+        return f"🇺🇸 <b>Location Updated:</b> {html.escape(first_city)} (<code>{first_lat:.4f}, {first_lng:.4f}</code>)"
 
-    url = "https://api.meeff.com/user/updateLocation/v1"
-    payload = {"lat": float(lat), "lng": float(lng), "locale": MEEFF_DEFAULT_LOCALE}
-
-    async def _update_one(sess: aiohttp.ClientSession, tok_obj: dict) -> Tuple[str, bool, str]:
-        name = tok_obj.get("name", "Account")
-        headers = build_meeff_headers(token=tok_obj["token"], json_body=True)
-        try:
-            async with sess.post(url, json=payload, headers=headers, timeout=15) as resp:
-                body = {}
-                try:
-                    body = await resp.json(content_type=None) or {}
-                except Exception:
-                    pass
-                err = body.get("errorCode") or body.get("errorMessage")
-                if resp.status == 200 and not err:
-                    return name, True, "OK"
-                return name, False, str(err or f"HTTP {resp.status}")
-        except Exception as e:
-            return name, False, str(e)
-
-    async with create_meeff_session() as session:
-        results = await asyncio.gather(*(_update_one(session, t) for t in tokens))
-
-    ok_count = sum(1 for _, ok, _ in results if ok)
-    fail_list = [f"{html.escape(n)} ({html.escape(reason)})" for n, ok, reason in results if not ok]
-
-    lines = [
-        f"🌍 <b>GPS Location Updated — {html.escape(label)}</b>",
-        f"• <b>Coordinates:</b> <code>{lat:.5f}, {lng:.5f}</code>",
-        f"• <b>Accounts Updated:</b> <b>{ok_count}/{len(tokens)}</b>",
-        f"• <b>Explore / Requests GPS:</b> Synced ✅",
-    ]
-    if fail_list:
-        lines.append(f"• <b>Failed:</b> {', '.join(fail_list[:8])}")
+    lines = [f"🇺🇸 <b>USA Explore Locations Updated ({len(tokens)} accounts):</b>", ""]
+    for idx, tok in enumerate(tokens):
+        city_name, lat, lng = cities[idx % len(cities)]
+        cycle = idx // len(cities)
+        if cycle > 0:
+            lat = round(lat + (0.018 * cycle * (1 if idx % 2 == 0 else -1)), 5)
+            lng = round(lng + (0.018 * cycle * (1 if idx % 3 == 0 else -1)), 5)
+        await set_token_location(user_id, tok["token"], lat, lng, label=f"🇺🇸 {city_name}")
+        acc_name = tok.get("name") or f"Account {idx + 1}"
+        if idx < 30:
+            lines.append(f"{idx + 1}. <b>{html.escape(acc_name)}</b> → {html.escape(city_name)} (<code>{lat:.4f}, {lng:.4f}</code>)")
+    if len(tokens) > 30:
+        lines.append(f"<i>...and {len(tokens) - 30} more accounts</i>")
     return "\n".join(lines)
 
 
@@ -301,42 +267,10 @@ async def start_command(message: Message):
     state.update({"status_message_id": status.message_id, "pinned_message_id": None})
 
 
-@router.message(Command("spoof_loc"))
-async def spoof_loc_command(message: Message):
-    user_id = message.chat.id
-    parts = (message.text or "").strip().split()
-
-    # If user passed /spoof_loc <lat> <lng>
-    if len(parts) >= 3:
-        try:
-            lat = float(parts[1].replace(",", ""))
-            lng = float(parts[2].replace(",", ""))
-            if not (-90.0 <= lat <= 90.0 and -180.0 <= lng <= 180.0):
-                raise ValueError("Coordinates out of range")
-        except ValueError:
-            await message.reply(
-                "⚠️ <b>Invalid coordinates.</b>\n"
-                "Usage: <code>/spoof_loc 37.5665 126.9780</code>\n"
-                "Or run <code>/spoof_loc</code> to pick a city preset.",
-                parse_mode="HTML",
-            )
-            return
-
-        status_msg = await message.reply("🌍 <b>Updating GPS location across accounts...</b>", parse_mode="HTML")
-        summary = await execute_spoof_location(user_id, lat, lng, label="Custom GPS")
-        await status_msg.edit_text(summary, reply_markup=get_spoof_location_keyboard(), parse_mode="HTML")
-        return
-
-    # Otherwise show current saved coordinates + city preset buttons
-    cur = await get_user_location(user_id)
-    text = (
-        f"🌍 <b>GPS Location Spoofer</b>\n\n"
-        f"• <b>Current Saved GPS:</b> <code>{cur['lat']:.5f}, {cur['lng']:.5f}</code> ({html.escape(cur.get('label', 'Default'))})\n\n"
-        f"Select a city preset below to update all active accounts &amp; explore requests, "
-        f"or send custom coordinates:\n"
-        f"<code>/spoof_loc 37.5665 126.9780</code>"
-    )
-    await message.reply(text, reply_markup=get_spoof_location_keyboard(), parse_mode="HTML")
+@router.message(Command("update_loc"))
+async def update_loc_command(message: Message):
+    text = await assign_usa_locations(message.chat.id)
+    await message.reply(text, parse_mode="HTML")
 
 
 @router.message(Command("signup"))
@@ -829,25 +763,6 @@ async def show_batch_accounts_menu(callback_query: CallbackQuery, batch_name: st
 async def callback_handler(callback_query: CallbackQuery):
     user_id = callback_query.from_user.id
     data = callback_query.data
-
-    if data.startswith("spoof_preset:"):
-        preset_key = data.split(":", 1)[1]
-        preset = LOCATION_PRESET_MAP.get(preset_key)
-        if not preset:
-            await callback_query.answer("Unknown location preset.", show_alert=True)
-            return
-        label, lat, lng = preset
-        await callback_query.answer(f"Updating GPS to {label}...")
-        summary = await execute_spoof_location(user_id, lat, lng, label=label)
-        try:
-            await callback_query.message.edit_text(
-                summary,
-                reply_markup=get_spoof_location_keyboard(),
-                parse_mode="HTML",
-            )
-        except TelegramBadRequest:
-            pass
-        return
 
     page_idx = 0
     original_data = data
@@ -1342,7 +1257,7 @@ async def set_bot_commands():
         ("automation", "Automation settings"),
         ("block", "Block user from meeff"),
         ("refresh", "Refresh tokens for all active accounts"),
-        ("spoof_loc", "🌍 Update GPS location"),
+        ("update_loc", "🌍 Update explore location per account"),
     ]]
     await bot.set_my_commands(commands)
 
