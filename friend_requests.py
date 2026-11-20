@@ -39,14 +39,30 @@ MAX_UNREACHABLE_WINDOW = 80    # Rolling IDs sent in unreachableUserIds to avoid
 
 class AuthRequiredError(Exception):
     """Token expired or logged out (401 / errorCode AuthRequired)."""
+    def __init__(self, message: str = "AuthRequired", short_label: str = "AuthRequired"):
+        super().__init__(message)
+        self.short_label = short_label
 
 
 class LikeExceededError(Exception):
     """Daily like quota reached."""
+    def __init__(self, message: str = "LikeExceeded", short_label: str = "LikeExceeded"):
+        super().__init__(message)
+        self.short_label = short_label
 
 
 class RequestExceededError(Exception):
     """Server rate limit / RequestExceeded."""
+    def __init__(self, message: str = "RequestExceeded", short_label: str = "ReqExceeded"):
+        super().__init__(message)
+        self.short_label = short_label
+
+
+class ApiResponseError(Exception):
+    """Unexpected non-200 HTTP status or API errorCode."""
+    def __init__(self, message: str, short_label: str):
+        super().__init__(message)
+        self.short_label = short_label
 
 
 class NoMoreUsersError(Exception):
@@ -101,28 +117,36 @@ async def fetch_users(
     try:
         async with session.get(url, params=params, headers=headers, timeout=15) as response:
             if response.status == 401:
-                raise AuthRequiredError(f"Token {token[:10]}... is invalid or expired")
+                raise AuthRequiredError(f"HTTP 401 on explore/v4 ({token[:10]}...)", short_label="401 Unauth")
             if response.status == 429:
-                raise RequestExceededError("HTTP 429 rate limit on explore/v4")
+                raise RequestExceededError("HTTP 429 on explore/v4", short_label="429 Limit")
 
             body = await response.json(content_type=None)
             if not isinstance(body, dict):
+                if response.status != 200:
+                    raise ApiResponseError(f"HTTP {response.status} on explore/v4", short_label=f"HTTP {response.status}")
                 return []
 
             error_code = body.get("errorCode")
+            error_msg = body.get("errorMessage") or body.get("message") or ""
             if error_code == "AuthRequired":
-                raise AuthRequiredError("AuthRequired from API")
+                raise AuthRequiredError(error_msg or "AuthRequired", short_label="AuthReq")
             if error_code == "AuthInfoRequired":
                 await asyncio.sleep(1.0)
                 return []
             if error_code == "LikeExceeded":
-                raise LikeExceededError("LikeExceeded from explore")
+                raise LikeExceededError(error_msg or "LikeExceeded", short_label="LikeExceed")
             if error_code == "RequestExceeded":
-                raise RequestExceededError(body.get("errorMessage") or "RequestExceeded")
+                raise RequestExceededError(error_msg or "RequestExceeded", short_label="ReqExceed")
+            if error_code:
+                raise ApiResponseError(
+                    f"{error_code}: {error_msg}".strip(": "),
+                    short_label=str(error_code)[:12],
+                )
 
             if response.status != 200:
                 logging.error("Failed to fetch users (%s): %s", response.status, body)
-                return []
+                raise ApiResponseError(f"HTTP {response.status} on explore/v4", short_label=f"HTTP {response.status}")
 
             users = body.get("users", []) or []
             if not users and not body.get("hasMore", True):
@@ -132,11 +156,11 @@ async def fetch_users(
             users.sort(key=_recent_at_ts, reverse=True)
             return users
 
-    except (AuthRequiredError, NoMoreUsersError, LikeExceededError, RequestExceededError):
+    except (AuthRequiredError, NoMoreUsersError, LikeExceededError, RequestExceededError, ApiResponseError):
         raise
     except Exception as e:
         logging.error("Fetch users failed: %s", e)
-        return []
+        raise ApiResponseError(str(e) or type(e).__name__, short_label=type(e).__name__[:12]) from e
 
 
 def format_user(user):
@@ -281,26 +305,27 @@ async def process_users(
             async with session.get(url, params=params, headers=headers, timeout=15) as response:
                 if response.status == 401:
                     await _release_claim(cross_seen, cross_lock, user_id_to_check)
-                    raise AuthRequiredError("401 on undoableAnswer")
+                    raise AuthRequiredError("HTTP 401 on undoableAnswer", short_label="401 Unauth")
                 if response.status == 429:
                     await _release_claim(cross_seen, cross_lock, user_id_to_check)
-                    raise RequestExceededError("429 on undoableAnswer")
+                    raise RequestExceededError("HTTP 429 on undoableAnswer", short_label="429 Limit")
 
                 data = await response.json(content_type=None)
                 data = data if isinstance(data, dict) else {}
                 error_code = data.get("errorCode")
+                error_msg = data.get("errorMessage") or data.get("message") or ""
 
                 if error_code == "LikeExceeded":
                     await _release_claim(cross_seen, cross_lock, user_id_to_check)
                     logging.info("Daily like limit reached for %s.", token_name)
-                    raise LikeExceededError()
+                    raise LikeExceededError(error_msg or "LikeExceeded", short_label="LikeExceed")
                 if error_code == "RequestExceeded":
                     await _release_claim(cross_seen, cross_lock, user_id_to_check)
-                    logging.warning("RequestExceeded on %s: %s", token_name, data.get("errorMessage"))
-                    raise RequestExceededError(data.get("errorMessage") or "RequestExceeded")
+                    logging.warning("RequestExceeded on %s: %s", token_name, error_msg)
+                    raise RequestExceededError(error_msg or "RequestExceeded", short_label="ReqExceed")
                 if error_code == "AuthRequired":
                     await _release_claim(cross_seen, cross_lock, user_id_to_check)
-                    raise AuthRequiredError("AuthRequired on undoableAnswer")
+                    raise AuthRequiredError(error_msg or "AuthRequired", short_label="AuthReq")
                 if error_code in ("AlreadyAnswered", "ChatRoomExist"):
                     async with lock:
                         already_sent_ids.add(user_id_to_check)
@@ -310,11 +335,12 @@ async def process_users(
                     await asyncio.sleep(0.1)
                     continue
 
-                if response.status != 200:
+                if response.status != 200 or error_code:
                     await _release_claim(cross_seen, cross_lock, user_id_to_check)
+                    err_label = str(error_code)[:12] if error_code else f"HTTP {response.status}"
+                    err_detail = f"{error_code}: {error_msg}".strip(": ") if error_code else f"HTTP {response.status} on undoableAnswer"
                     logging.warning("Answer failed (%s) for %s: %s", response.status, token_name, data)
-                    await asyncio.sleep(PER_ERROR_DELAY)
-                    continue
+                    raise ApiResponseError(err_detail, short_label=err_label)
 
                 async with lock:
                     already_sent_ids.add(user_id_to_check)
@@ -326,7 +352,7 @@ async def process_users(
                 state["total_added_friends"] += 1
                 await asyncio.sleep(PER_USER_DELAY)
 
-        except (LikeExceededError, RequestExceededError, AuthRequiredError):
+        except (LikeExceededError, RequestExceededError, AuthRequiredError, ApiResponseError):
             if is_spam_filter_enabled and ids_to_persist:
                 await bulk_add_sent_ids(user_id, "request", ids_to_persist)
             if notify_tasks:
@@ -433,11 +459,11 @@ async def run_requests(user_id, bot, target_channel_id):
                 )
                 await asyncio.sleep(PER_BATCH_DELAY)
 
-            except AuthRequiredError:
+            except AuthRequiredError as e:
                 await bot.edit_message_text(
                     chat_id=user_id,
                     message_id=state["status_message_id"],
-                    text=f"🔒 <b>{html.escape(token_name)}: Token expired / logged out.</b>\n\nPlease re-sign in and update the token.",
+                    text=f"🔒 <b>{html.escape(token_name)}: {html.escape(str(e))}</b>\n\nPlease re-sign in and update the token.",
                     parse_mode="HTML",
                 )
                 state["running"] = False
@@ -453,19 +479,23 @@ async def run_requests(user_id, bot, target_channel_id):
                 state["running"] = False
                 break
 
-            except LikeExceededError:
+            except LikeExceededError as e:
                 await bot.edit_message_text(
                     chat_id=user_id,
                     message_id=state["status_message_id"],
-                    text=f"⏳ <b>{html.escape(token_name)}: Daily request quota reached.</b>\n\nTotal sent: {state['total_added_friends']}",
+                    text=f"⏳ <b>{html.escape(token_name)}: {html.escape(str(e))}</b>\n\nTotal sent: {state['total_added_friends']}",
                     parse_mode="HTML",
                 )
                 state["running"] = False
                 break
 
             except RequestExceededError as e:
-                logging.warning("%s hit RequestExceeded (%s) — cooling down %.0fs", token_name, e, REQUEST_EXCEEDED_BACKOFF)
+                logging.warning("%s hit %s — backing off %.0fs", token_name, e, REQUEST_EXCEEDED_BACKOFF)
                 await asyncio.sleep(REQUEST_EXCEEDED_BACKOFF)
+
+            except ApiResponseError as e:
+                logging.warning("%s API error: %s", token_name, e)
+                await asyncio.sleep(PER_ERROR_DELAY)
 
             except Exception as e:
                 logging.error("Error during processing: %s", e)
@@ -509,6 +539,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
             "added": 0,
             "filtered": 0,
             "status": "Queued",
+            "error": "",
         }
         for i, token_obj in enumerate(tokens)
     }
@@ -524,7 +555,10 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
     cross_account_seen = set()
     cross_lock = asyncio.Lock()
 
-    async def _worker(token_obj):
+    async def _worker(token_obj, worker_idx: int = 0):
+        if worker_idx > 0:
+            await asyncio.sleep(min(worker_idx * 0.4, 3.0))
+
         token = token_obj["token"]
         name = token_status[token]["name"]
         account_sent_ids = set()
@@ -555,6 +589,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
                         consecutive_empty += 1
                         if consecutive_empty > 5:
                             token_status[token]["status"] = "No Users"
+                            token_status[token]["error"] = ""
                             return
                         await asyncio.sleep(EMPTY_BATCH_DELAY)
                         continue
@@ -562,6 +597,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
                     consecutive_empty = 0
                     req_exceeded_hits = 0
                     token_status[token]["status"] = "Processing"
+                    token_status[token]["error"] = ""
 
                     batch_added, batch_filtered = await process_users(
                         session,
@@ -585,45 +621,66 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
                     token_status[token]["filtered"] += batch_filtered
                     await asyncio.sleep(PER_BATCH_DELAY)
 
-                except AuthRequiredError:
-                    logging.warning("%s: AuthRequiredError — token expired", name)
-                    token_status[token]["status"] = "Logged Out"
+                except AuthRequiredError as e:
+                    logging.warning("%s: AuthRequiredError — %s", name, e)
+                    token_status[token]["status"] = e.short_label
+                    token_status[token]["error"] = str(e)
                     return
 
                 except NoMoreUsersError:
                     token_status[token]["status"] = "No Users"
+                    token_status[token]["error"] = ""
                     return
 
-                except LikeExceededError:
-                    token_status[token]["status"] = "Limit Full"
+                except LikeExceededError as e:
+                    token_status[token]["status"] = e.short_label
+                    token_status[token]["error"] = str(e)
                     return
 
-                except RequestExceededError:
+                except RequestExceededError as e:
                     req_exceeded_hits += 1
+                    token_status[token]["status"] = e.short_label
+                    token_status[token]["error"] = str(e)
                     if req_exceeded_hits >= 3:
-                        token_status[token]["status"] = "RateLimit"
                         return
-                    token_status[token]["status"] = "Cooldown"
                     await asyncio.sleep(REQUEST_EXCEEDED_BACKOFF)
+
+                except ApiResponseError as e:
+                    logging.warning("API error on %s: %s", name, e)
+                    token_status[token]["status"] = e.short_label
+                    token_status[token]["error"] = str(e)
+                    await asyncio.sleep(PER_ERROR_DELAY)
 
                 except Exception as e:
                     logging.error("Error processing %s: %s", name, e)
-                    token_status[token]["status"] = "Retrying..."
+                    token_status[token]["status"] = type(e).__name__[:12]
+                    token_status[token]["error"] = str(e) or type(e).__name__
                     await asyncio.sleep(PER_ERROR_DELAY)
 
         token_status[token]["status"] = "Stopped"
+
+    def _build_card_text(header: str) -> str:
+        lines = [header, "", "<pre>Account   │Added │Filter│Status      </pre>"]
+        error_lines = []
+        for s in token_status.values():
+            name = s["name"]
+            display = name[:10] + "…" if len(name) > 10 else name.ljust(10)
+            status_col = str(s["status"])[:12].ljust(12)
+            lines.append(f"<pre>{display} │{s['added']:>5} │{s['filtered']:>6}│{status_col}</pre>")
+            if s.get("error"):
+                error_lines.append(f"• <b>{html.escape(name)}:</b> <code>{html.escape(s['error'][:120])}</code>")
+        if error_lines:
+            lines.append("")
+            lines.append("⚠️ <b>Error Details:</b>")
+            lines.extend(error_lines)
+        return "\n".join(lines)
 
     async def _refresh_ui():
         last_message = ""
         while state["running"]:
             total_added_now = sum(s["added"] for s in token_status.values())
             header = f"🔄 <b>AIO Requests</b> | <b>Added:</b> {total_added_now}"
-            lines = [header, "", "<pre>Account   │Added │Filter│Status      </pre>"]
-            for s in token_status.values():
-                name = s["name"]
-                display = name[:10] + "…" if len(name) > 10 else name.ljust(10)
-                lines.append(f"<pre>{display} │{s['added']:>5} │{s['filtered']:>6}│{s['status']:<10}</pre>")
-            current_message = "\n".join(lines)
+            current_message = _build_card_text(header)
             if current_message != last_message:
                 try:
                     await bot.edit_message_text(
@@ -640,7 +697,7 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
             await asyncio.sleep(1)
 
     ui_task = asyncio.create_task(_refresh_ui())
-    worker_tasks = [asyncio.create_task(_worker(token_obj)) for token_obj in tokens]
+    worker_tasks = [asyncio.create_task(_worker(token_obj, idx)) for idx, token_obj in enumerate(tokens)]
     await asyncio.gather(*worker_tasks, return_exceptions=True)
 
     state["running"] = False
@@ -657,15 +714,9 @@ async def process_all_tokens(user_id, tokens, bot, target_channel_id, initial_st
     completion_status = "⚠️ Process Stopped" if state.get("stopped") else "✅ AIO Requests Completed"
     final_header = f"<b>{completion_status}</b> | <b>Total Added:</b> {total_added}"
 
-    final_lines = [final_header, "", "<pre>Account   │Added │Filter│Status      </pre>"]
-    for s in token_status.values():
-        name = s["name"]
-        display = name[:10] + "…" if len(name) > 10 else name.ljust(10)
-        final_lines.append(f"<pre>{display} │{s['added']:>5} │{s['filtered']:>6}│{s['status']}</pre>")
-
     await bot.edit_message_text(
         chat_id=user_id,
         message_id=state["status_message_id"],
-        text="\n".join(final_lines),
+        text=_build_card_text(final_header),
         parse_mode="HTML",
     )
